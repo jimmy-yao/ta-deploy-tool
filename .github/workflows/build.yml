@@ -29,6 +29,9 @@ jobs:
             --standalone `
             --onefile `
             --plugin-enable=pyside6 `
+            --include-package=qasync `
+            --include-package=asyncssh `
+            --include-package=yaml `
             --include-data-files=config.template.yaml=config.template.yaml `
             --include-data-dir=assets=assets `
             --windows-console-mode=disable `

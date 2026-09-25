@@ -155,5 +155,33 @@ def main():
         loop.run_forever()
 
 
+def show_native_error(title: str, text: str):
+    """当程序崩溃或无法启动时写入 crash.log 并弹出原生 Windows 提示框。"""
+    try:
+        log_file = app_dir() / "crash.log"
+        log_file.write_text(f"{title}\n{text}\n", encoding="utf-8", errors="ignore")
+    except Exception:
+        pass
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(0, text, title, 0x10)
+            return
+        except Exception:
+            pass
+
+    try:
+        if QApplication.instance() is None:
+            _app = QApplication(sys.argv)
+        QMessageBox.critical(None, title, text)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        tb = traceback.format_exc()
+        show_native_error("TA-DEPLOY-TOOL 启动崩溃", f"程序启动失败：\n{e}\n\n详细堆栈：\n{tb}")
