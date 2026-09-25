@@ -29,9 +29,9 @@ jobs:
             --standalone `
             --onefile `
             --plugin-enable=pyside6 `
-            --include-data-files=config.template.yaml=. `
+            --include-data-files=config.template.yaml=config.template.yaml `
             --include-data-dir=assets=assets `
-            --windows-disable-console `
+            --windows-console-mode=disable `
             --assume-yes-for-downloads `
             --output-filename=TA-DEPLOY-TOOL.exe `
             main.py
