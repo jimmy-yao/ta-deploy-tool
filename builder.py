@@ -14,12 +14,17 @@ LogFn = Callable[[str], None]
 async def _run_git_process(cmd: List[str], cwd: str, log: LogFn, encoding: str):
     log(f"$ (cd {cwd}) {' '.join(cmd)}")
 
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
     if sys.platform == "win32":
         proc = await asyncio.create_subprocess_shell(
             subprocess.list2cmdline(cmd),
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            **kwargs,
         )
     else:
         proc = await asyncio.create_subprocess_exec(
@@ -31,7 +36,10 @@ async def _run_git_process(cmd: List[str], cwd: str, log: LogFn, encoding: str):
 
     assert proc.stdout is not None
     async for raw in proc.stdout:
-        text = raw.decode(encoding, errors="ignore").rstrip()
+        try:
+            text = raw.decode(encoding).rstrip()
+        except UnicodeDecodeError:
+            text = raw.decode("gbk", errors="ignore").rstrip()
         if text:
             log(text)
 
@@ -166,12 +174,16 @@ async def build_service(
     # ---------- 构造子进程环境变量 ----------
     env = os.environ.copy()
     if java_home:
-        env["JAVA_HOME"] = java_home
-        # 把 %JAVA_HOME%\bin 加到 PATH 前面，保证 mvn 用的是指定 JDK
-        bin_dir = os.path.join(java_home, "bin")
+        jh_norm = os.path.normpath(java_home) if sys.platform == "win32" else java_home
+        env["JAVA_HOME"] = jh_norm
+        bin_dir = os.path.join(jh_norm, "bin")
         old_path = env.get("PATH", "")
         env["PATH"] = bin_dir + os.pathsep + old_path
-        log(f"[env] JAVA_HOME = {java_home}")
+        log(f"[env] JAVA_HOME = {jh_norm}")
+        if sys.platform == "win32":
+            java_exe = os.path.join(bin_dir, "java.exe")
+            if not os.path.isfile(java_exe):
+                log(f"[警告] JAVA_HOME 路径下未找到 java.exe: {java_exe}")
     else:
         existing = env.get("JAVA_HOME", "")
         if existing:
@@ -179,7 +191,12 @@ async def build_service(
         else:
             log("[警告] 未配置 JAVA_HOME，Maven 可能启动失败")
 
-    args = [maven] + svc.build_args.split()
+    maven_cmd = os.path.normpath(maven) if sys.platform == "win32" else maven
+    args = [maven_cmd] + svc.build_args.split()
+
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -188,6 +205,7 @@ async def build_service(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=env,
+            **kwargs,
         )
     except (FileNotFoundError, OSError):
         proc = await asyncio.create_subprocess_shell(
@@ -196,13 +214,17 @@ async def build_service(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=env,
+            **kwargs,
         )
 
     assert proc.stdout is not None
     building_jars: List[str] = []
 
     async for raw in proc.stdout:
-        text = raw.decode(encoding, errors="ignore").rstrip()
+        try:
+            text = raw.decode(encoding).rstrip()
+        except UnicodeDecodeError:
+            text = raw.decode("gbk", errors="ignore").rstrip()
         if not text:
             continue
         log(text)
