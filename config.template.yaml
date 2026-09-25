@@ -1,0 +1,38 @@
+maven: D:/apache-maven-3.9.6/bin/mvn.cmd
+
+# JDK 根目录，用于 Maven 构建时注入 JAVA_HOME
+# 留空则使用系统环境变量里的 JAVA_HOME
+java_home: C:/Program Files/Java/jdk-17
+
+workspace: D:/work
+log_encoding: utf-8
+backup_keep: 5
+default_restart_script: start.sh
+auto_remote_name: false
+
+git:
+  enabled: true
+  branch_mode: iteration
+  default_branch: main
+  iteration_pattern: '^feature_(\d{8})_xc$'
+  remote: origin
+  strategy: reset
+  fetch_timeout: 180
+  ls_remote_timeout: 60
+
+environments:
+  test:
+    default_server:
+      host: 192.168.1.100
+      port: 22
+      user: deploy
+      password: 'your-password'
+    servers: {}
+    services:
+      example-service:
+        project_dir: ""
+        build_args: clean install -DskipTests
+        local_jar: ""
+        remote_dir: /opt/app/example-service
+        remote_name: ""
+        depends_on: []
