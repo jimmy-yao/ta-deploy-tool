@@ -18,12 +18,17 @@ async def _run_git(
     cmd = ["git"] + args
     log(f"$ (cd {cwd}) {' '.join(cmd)}")
 
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            **kwargs,
         )
     except FileNotFoundError:
         proc = await asyncio.create_subprocess_shell(
@@ -31,6 +36,7 @@ async def _run_git(
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            **kwargs,
         )
 
     assert proc.stdout is not None
@@ -38,7 +44,10 @@ async def _run_git(
 
     async def _consume():
         async for raw in proc.stdout:
-            text = raw.decode(encoding, errors="ignore").rstrip()
+            try:
+                text = raw.decode(encoding).rstrip()
+            except UnicodeDecodeError:
+                text = raw.decode("gbk", errors="ignore").rstrip()
             if text:
                 log(text)
                 lines.append(text)
