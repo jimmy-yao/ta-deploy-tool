@@ -1,4 +1,4 @@
-name: Build Windows EXE (Nuitka)
+name: Build Windows EXE
 
 'on':
   push:
@@ -7,7 +7,35 @@ name: Build Windows EXE (Nuitka)
   workflow_dispatch:
 
 jobs:
-  build:
+  build-pyinstaller:
+    name: Build with PyInstaller (Stable GUI)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PySide6 qasync asyncssh pyyaml pyinstaller
+
+      - name: Build EXE with PyInstaller
+        run: |
+          pyinstaller TA-DEPLOY-TOOL.spec
+
+      - name: Upload PyInstaller Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TA-DEPLOY-TOOL-PyInstaller
+          path: dist/TA-DEPLOY-TOOL.exe
+
+  build-nuitka:
+    name: Build with Nuitka
     runs-on: windows-latest
     steps:
       - name: Checkout code
@@ -29,6 +57,7 @@ jobs:
             --standalone `
             --onefile `
             --plugin-enable=pyside6 `
+            --include-qt-plugins=sensible,platforms `
             --include-package=qasync `
             --include-package=asyncssh `
             --include-package=yaml `
@@ -39,7 +68,7 @@ jobs:
             --output-filename=TA-DEPLOY-TOOL.exe `
             main.py
 
-      - name: Upload Artifact
+      - name: Upload Nuitka Artifact
         uses: actions/upload-artifact@v4
         with:
           name: TA-DEPLOY-TOOL-Nuitka
