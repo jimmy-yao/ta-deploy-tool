@@ -44,16 +44,20 @@ def resource_path(rel: str) -> Path:
 
 def find_app_icon() -> Path:
     candidates = []
-    if getattr(sys, "frozen", False) or hasattr(sys, "nuitka_binary"):
-        candidates.append(Path(sys.executable).parent / "assets" / APP_ICON_NAME)
+    if "NUITKA_ONEFILE_PARENT" in os.environ:
+        candidates.append(Path(os.environ["NUITKA_ONEFILE_PARENT"]).resolve().parent / "assets" / APP_ICON_NAME)
+        candidates.append(Path(__file__).resolve().parent / "assets" / APP_ICON_NAME)
+        candidates.append(Path(__file__).resolve().parent / "assets" / "app.png")
+    elif getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).resolve().parent / "assets" / APP_ICON_NAME)
         if hasattr(sys, "_MEIPASS"):
             candidates.append(Path(sys._MEIPASS) / "assets" / APP_ICON_NAME)
         else:
-            candidates.append(Path(__file__).parent / "assets" / APP_ICON_NAME)
-            candidates.append(Path(__file__).parent / "assets" / "app.png")
+            candidates.append(Path(__file__).resolve().parent / "assets" / APP_ICON_NAME)
+            candidates.append(Path(__file__).resolve().parent / "assets" / "app.png")
     else:
-        candidates.append(Path(__file__).parent / "assets" / APP_ICON_NAME)
-        candidates.append(Path(__file__).parent / "assets" / "app.png")
+        candidates.append(Path(__file__).resolve().parent / "assets" / APP_ICON_NAME)
+        candidates.append(Path(__file__).resolve().parent / "assets" / "app.png")
 
     for p in candidates:
         if p.exists():
