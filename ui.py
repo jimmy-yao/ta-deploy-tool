@@ -35,7 +35,7 @@ APP_ICON_NAME = "app.ico"
 # 资源
 # ============================================================
 def resource_path(rel: str) -> Path:
-    if getattr(sys, "frozen", False):
+    if hasattr(sys, "_MEIPASS"):
         base = Path(sys._MEIPASS)
     else:
         base = Path(__file__).parent
@@ -44,9 +44,13 @@ def resource_path(rel: str) -> Path:
 
 def find_app_icon() -> Path:
     candidates = []
-    if getattr(sys, "frozen", False):
+    if getattr(sys, "frozen", False) or hasattr(sys, "nuitka_binary"):
         candidates.append(Path(sys.executable).parent / "assets" / APP_ICON_NAME)
-        candidates.append(Path(sys._MEIPASS) / "assets" / APP_ICON_NAME)
+        if hasattr(sys, "_MEIPASS"):
+            candidates.append(Path(sys._MEIPASS) / "assets" / APP_ICON_NAME)
+        else:
+            candidates.append(Path(__file__).parent / "assets" / APP_ICON_NAME)
+            candidates.append(Path(__file__).parent / "assets" / "app.png")
     else:
         candidates.append(Path(__file__).parent / "assets" / APP_ICON_NAME)
         candidates.append(Path(__file__).parent / "assets" / "app.png")
