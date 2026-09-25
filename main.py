@@ -20,10 +20,12 @@ SETTINGS_APP = "deploy_tool"
 
 
 def app_dir() -> Path:
-    """exe 所在目录（打包后）或脚本目录（开发时）。"""
+    """获取用户双击运行的 .exe 真正的物理同级目录（支持 PyInstaller、Nuitka 及源码运行）。"""
+    if "NUITKA_ONEFILE_PARENT" in os.environ:
+        return Path(os.environ["NUITKA_ONEFILE_PARENT"]).resolve().parent
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).parent
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
 
 
 def user_config_dir(app_name: str) -> Path:
