@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 
 from config import (
     AppConfig, EnvironmentConfig, ServerConfig, ServiceConfig,
-    save_config, validate_config,
+    save_config, validate_config, detect_java_home, detect_maven_path,
 )
 
 
@@ -80,6 +80,11 @@ class ConfigEditorDialog(QDialog):
         row = QHBoxLayout()
         self.maven_edit = QLineEdit()
         row.addWidget(self.maven_edit, 1)
+        detect_m = QPushButton("🔍 自动检测")
+        detect_m.setMinimumWidth(85)
+        detect_m.setToolTip("自动扫描本地系统中的 Maven 可执行文件路径")
+        detect_m.clicked.connect(self._on_detect_maven)
+        row.addWidget(detect_m)
         browse = QPushButton("浏览...")
         browse.setMinimumWidth(80)
         browse.clicked.connect(self._on_browse_maven)
@@ -94,6 +99,11 @@ class ConfigEditorDialog(QDialog):
             "留空则使用系统 JAVA_HOME"
         )
         jh_row.addWidget(self.java_home_edit, 1)
+        detect_j = QPushButton("🔍 自动检测")
+        detect_j.setMinimumWidth(85)
+        detect_j.setToolTip("自动扫描本地系统中的 Java Home (JDK 根目录) 路径")
+        detect_j.clicked.connect(self._on_detect_java_home)
+        jh_row.addWidget(detect_j)
         jh_browse = QPushButton("浏览...")
         jh_browse.setMinimumWidth(80)
         jh_browse.clicked.connect(self._on_browse_java_home)
@@ -963,6 +973,34 @@ class ConfigEditorDialog(QDialog):
             return
 
         self.accept()
+
+    def _on_detect_maven(self):
+        detected = detect_maven_path()
+        if detected:
+            self.maven_edit.setText(detected)
+            QMessageBox.information(
+                self, "自动检测成功",
+                f"已检测到系统中的 Maven 路径：\n\n{detected}"
+            )
+        else:
+            QMessageBox.warning(
+                self, "未检测到",
+                "未能自动扫描到 Maven 路径。\n请点击「浏览...」手动指定 mvn 可执行文件。"
+            )
+
+    def _on_detect_java_home(self):
+        detected = detect_java_home()
+        if detected:
+            self.java_home_edit.setText(detected)
+            QMessageBox.information(
+                self, "自动检测成功",
+                f"已检测到系统中的 Java Home (JDK 根目录) 路径：\n\n{detected}"
+            )
+        else:
+            QMessageBox.warning(
+                self, "未检测到",
+                "未能自动扫描到 JDK 路径。\n请点击「浏览...」手动指定 JDK 根目录。"
+            )
 
     def _on_browse_maven(self):
         path, _ = QFileDialog.getOpenFileName(
