@@ -107,6 +107,168 @@ def _parse_restart_cmd(raw_value):
     return str(raw_value)
 
 
+import sys
+import shutil
+from pathlib import Path
+
+
+def detect_java_home() -> str:
+    """
+    自动扫描并推荐系统中的 Java Home (JDK 根目录) 路径。
+    支持 Windows、Linux 及 macOS。
+    """
+    # 1. 优先校验系统环境变量 JAVA_HOME
+    env_jh = os.environ.get("JAVA_HOME", "").strip()
+    if env_jh:
+        jh_path = Path(env_jh)
+        java_bin = jh_path / "bin" / ("java.exe" if sys.platform == "win32" else "java")
+        if java_bin.exists():
+            return str(jh_path).replace("\\", "/")
+
+    # 2. 从 PATH 中的 java 命令反推 JDK 目录
+    which_java = shutil.which("java.exe" if sys.platform == "win32" else "java")
+    if which_java:
+        java_p = Path(which_java).resolve()
+        candidate = java_p.parent.parent
+        if (candidate / "bin" / ("java.exe" if sys.platform == "win32" else "java")).exists():
+            return str(candidate).replace("\\", "/")
+
+    # 3. Windows 常见 JDK 安装路径扫描
+    if sys.platform == "win32":
+        candidates = [
+            r"C:\Program Files\Java",
+            r"C:\Program Files (x86)\Java",
+            r"C:\Program Files\Eclipse Adoptium",
+            r"C:\Program Files\Zulu",
+            r"C:\Program Files\Amazon Corretto",
+            r"C:\Program Files\LibericaJDK",
+            r"C:\Tools",
+            r"D:\Tools",
+            r"D:\Java",
+            r"D:\Program Files\Java",
+            r"D:\env",
+        ]
+        for base in candidates:
+            if not os.path.exists(base):
+                continue
+            try:
+                for root, dirs, _files in os.walk(base):
+                    depth = len(Path(root).relative_to(base).parts)
+                    if depth > 3:
+                        dirs.clear()
+                        continue
+                    if (Path(root) / "bin" / "java.exe").exists():
+                        return str(Path(root)).replace("\\", "/")
+            except Exception:
+                pass
+
+        # 注册表扫描 (Windows)
+        try:
+            import winreg
+            for key_path in (
+                r"SOFTWARE\JavaSoft\JDK",
+                r"SOFTWARE\JavaSoft\Java Development Kit",
+                r"SOFTWARE\JavaSoft\Java Runtime Environment",
+            ):
+                try:
+                    key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path)
+                    for i in range(winreg.QueryInfoKey(key)[0]):
+                        ver = winreg.EnumKey(key, i)
+                        sub_key = winreg.OpenKey(key, f"{key_path}\\{ver}")
+                        try:
+                            jh, _ = winreg.QueryValueEx(sub_key, "JavaHome")
+                            if jh and (Path(jh) / "bin" / "java.exe").exists():
+                                return str(Path(jh)).replace("\\", "/")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    else:
+        candidates = [
+            "/usr/lib/jvm/default-java",
+            "/usr/lib/jvm/java-17-openjdk-amd64",
+            "/usr/lib/jvm/java-11-openjdk-amd64",
+            "/usr/lib/jvm/java-8-openjdk-amd64",
+            "/Library/Java/JavaVirtualMachines",
+        ]
+        for p in candidates:
+            path = Path(p)
+            if path.exists():
+                if (path / "bin" / "java").exists():
+                    return str(path)
+                for sub in path.glob("*"):
+                    if (sub / "Contents/Home/bin/java").exists():
+                        return str(sub / "Contents/Home")
+                    if (sub / "bin/java").exists():
+                        return str(sub)
+
+    return ""
+
+
+def detect_maven_path() -> str:
+    """
+    自动扫描并推荐系统中的 Maven 可执行文件路径 (mvn / mvn.cmd)。
+    """
+    # 1. 校验 MAVEN_HOME / M2_HOME
+    for env_var in ("MAVEN_HOME", "M2_HOME"):
+        env_m = os.environ.get(env_var, "").strip()
+        if env_m:
+            m_path = Path(env_m)
+            for exe_name in ("mvn.cmd", "mvn.bat", "mvn"):
+                target = m_path / "bin" / exe_name
+                if target.exists():
+                    return str(target).replace("\\", "/")
+
+    # 2. 从 PATH 中的 mvn 查找
+    which_mvn = shutil.which("mvn.cmd" if sys.platform == "win32" else "mvn")
+    if not which_mvn and sys.platform == "win32":
+        which_mvn = shutil.which("mvn.bat") or shutil.which("mvn")
+    if which_mvn:
+        return str(Path(which_mvn).resolve()).replace("\\", "/")
+
+    # 3. Windows 常见 Maven 安装路径扫描
+    if sys.platform == "win32":
+        candidates = [
+            r"C:\apache-maven",
+            r"C:\Program Files\Apache\maven",
+            r"C:\Program Files\apache-maven",
+            r"C:\Tools",
+            r"D:\apache-maven",
+            r"D:\Tools",
+            r"D:\env",
+            r"D:\Program Files",
+        ]
+        for base in candidates:
+            if not os.path.exists(base):
+                continue
+            try:
+                for root, dirs, _files in os.walk(base):
+                    depth = len(Path(root).relative_to(base).parts)
+                    if depth > 3:
+                        dirs.clear()
+                        continue
+                    p = Path(root)
+                    for exe_name in ("mvn.cmd", "mvn.bat", "mvn"):
+                        target = p / "bin" / exe_name
+                        if target.exists():
+                            return str(target).replace("\\", "/")
+            except Exception:
+                pass
+    else:
+        candidates = [
+            "/usr/share/maven/bin/mvn",
+            "/usr/local/bin/mvn",
+            "/opt/maven/bin/mvn",
+        ]
+        for p in candidates:
+            if os.path.isfile(p):
+                return p
+
+    return ""
+
+
 def load_config(path: str) -> AppConfig:
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
@@ -125,9 +287,21 @@ def load_config(path: str) -> AppConfig:
         ls_remote_timeout=int(git_raw.get("ls_remote_timeout", 60)),
     )
 
+    maven_path = _expand(raw.get("maven", ""))
+    if not maven_path or not os.path.exists(maven_path):
+        detected_m = detect_maven_path()
+        if detected_m:
+            maven_path = detected_m
+
+    java_home_path = _expand(raw.get("java_home", ""))
+    if not java_home_path or not os.path.exists(java_home_path):
+        detected_j = detect_java_home()
+        if detected_j:
+            java_home_path = detected_j
+
     cfg = AppConfig(
-        maven=_expand(raw.get("maven", "")),
-        java_home=_expand(raw.get("java_home", "")),
+        maven=maven_path,
+        java_home=java_home_path,
         workspace=_expand(raw.get("workspace", "")),
         log_encoding=raw.get("log_encoding", "utf-8"),
         backup_keep=int(raw.get("backup_keep", 5)),
