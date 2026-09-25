@@ -43,8 +43,8 @@ FALLBACK_CONFIG_PATH = user_config_dir("deploy_tool") / "config.yaml"
 
 
 def resource_path(rel: str) -> Path:
-    """打包后从 _MEIPASS 读资源，开发时从脚本目录读。"""
-    if getattr(sys, "frozen", False):
+    """跨打包工具资源路径获取（支持 PyInstaller、Nuitka 及源码运行）。"""
+    if hasattr(sys, "_MEIPASS"):
         base = Path(sys._MEIPASS)
     else:
         base = Path(__file__).parent
