@@ -3,6 +3,7 @@ import asyncio
 import os
 import shutil
 import sys
+import traceback
 from pathlib import Path
 from typing import Optional
 
