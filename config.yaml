@@ -25,9 +25,9 @@ environments:
       spring-boot-web:
         project_dir: C:/WorkSpace/IdeaWork/spring-boot-web
         build_args: clean install -DskipTests
-        local_jar: target/spring-boot-web-0.0.1-SNAPSHOT.jar
+        local_jar: target/spring-boot-web-2.0.0.jar
         remote_dir: /root/spring-boot-web
-        remote_name: spring-boot-web-0.0.1-SNAPSHOT.jar
+        remote_name: spring-boot-web-2.0.0.jar
         depends_on: []
         server: US
       spring-boot-hello:
@@ -39,6 +39,7 @@ environments:
         depends_on: []
         server: US
         restart_cmd: '-'
+        log_path: /root/spring-boot-hello/logs/info.log
     servers:
       入口层:
         host: 172.253.171.2
@@ -54,4 +55,4 @@ environments:
         host: hapi.hejf.vip
         port: 22
         user: root
-        password: 0123456789
+        password: 9DJgTrprW3FjX3!
