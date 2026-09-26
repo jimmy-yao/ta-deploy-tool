@@ -506,7 +506,8 @@ class MainWindow(QMainWindow):
 
     def _on_open_config(self):
         dlg = ConfigEditorDialog(self.cfg, self.config_path, self)
-        if dlg.exec() == QDialog.Accepted:
+        dlg.exec()
+        if getattr(dlg, "saved", False):
             self._reload_config()
 
     # ============================================================

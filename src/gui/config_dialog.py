@@ -38,6 +38,7 @@ class ConfigEditorDialog(QDialog):
 
         self.cfg = copy.deepcopy(cfg)
         self.config_path = config_path
+        self.saved = False
         self._current_env_name = None
         self._current_svc_name = None
 
@@ -64,12 +65,18 @@ class ConfigEditorDialog(QDialog):
         save_btn.setObjectName("PrimaryButton")
         save_btn.setMinimumWidth(90)
         save_btn.clicked.connect(self._on_save)
-        cancel_btn = QPushButton("取消")
-        cancel_btn.setMinimumWidth(90)
-        cancel_btn.clicked.connect(self.reject)
+        close_btn = QPushButton("关闭")
+        close_btn.setMinimumWidth(90)
+        close_btn.clicked.connect(self._on_close)
         btn_row.addWidget(save_btn)
-        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
+
+    def _on_close(self):
+        if self.saved:
+            self.accept()
+        else:
+            self.reject()
 
     def _build_global_tab(self):
         w = QWidget()
@@ -981,11 +988,11 @@ class ConfigEditorDialog(QDialog):
 
         try:
             save_config(self.cfg, self.config_path)
+            self.saved = True
+            QMessageBox.information(self, "保存成功", "配置文件已成功保存！")
         except Exception as e:
             QMessageBox.critical(self, "保存失败", str(e))
             return
-
-        self.accept()
 
     def _on_detect_maven(self):
         detected = detect_maven_path()
