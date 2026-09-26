@@ -256,3 +256,42 @@ async def deploy_service(
         )
 
     log(f"=== [部署完成] {svc.name} ===")
+
+
+async def tail_remote_log(
+    server: ServerConfig,
+    svc: ServiceConfig,
+    log_cb: Callable[[str], None],
+    lines_count: int = 200,
+):
+    """通过 SSH 实时读取远程服务的日志 (tail -n lines_count -f)。"""
+    connect_kwargs = _make_connect_kwargs(server)
+
+    log_file = svc.log_path
+    if not log_file:
+        log_file = f"{svc.remote_dir}/logs/info.log"
+
+    # 若用户指定的路径或默认路径未用绝对路径，则根据 remote_dir 自动拼接
+    if not log_file.startswith("/") and not log_file.startswith("~"):
+        log_file = f"{svc.remote_dir}/{log_file}"
+
+    if "*" in log_file:
+        cmd = f"tail -n {lines_count} -f {log_file} 2>&1"
+    else:
+        cmd = f"tail -n {lines_count} -f '{log_file}' 2>&1"
+    log_cb(f"[SSH 连接中...] {server.name}@{server.host}:{server.port}")
+    log_cb(f"$ {cmd}")
+    log_cb("=" * 60)
+
+    try:
+        async with asyncssh.connect(**connect_kwargs) as conn:
+            async with conn.create_process(cmd) as proc:
+                assert proc.stdout is not None
+                async for line in proc.stdout:
+                    log_cb(line.rstrip("\r\n"))
+    except asyncio.CancelledError:
+        log_cb("\n[连接断开] 实时日志监听已停止")
+        raise
+    except Exception as e:
+        log_cb(f"\n[日志异常] {e}")
+        raise
