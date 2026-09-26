@@ -7,6 +7,7 @@ java_home: C:/Program Files/Java/jdk-17
 workspace: D:/work
 log_encoding: utf-8
 backup_keep: 5
+max_parallel_builds: 3
 default_restart_script: start.sh
 auto_remote_name: false
 
