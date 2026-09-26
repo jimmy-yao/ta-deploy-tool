@@ -34,7 +34,7 @@ jobs:
           pyinstaller TA_DEPLOY_TOOL.spec
 
       - name: Upload PyInstaller Artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: TA-DEPLOY-TOOL-PyInstaller
           path: dist/TA_DEPLOY_TOOL.exe
@@ -74,7 +74,7 @@ jobs:
             main.py
 
       - name: Upload Nuitka Artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: TA-DEPLOY-TOOL-Nuitka
           path: TA-DEPLOY-TOOL.exe
