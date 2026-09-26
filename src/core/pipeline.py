@@ -4,7 +4,7 @@ import os
 from typing import Callable, List, Dict, Optional
 
 from src.core.builder import build_service, prepare_repo, resolve_branch
-from src.models.config import AppConfig, topo_sort, save_config
+from src.models.config import AppConfig, topo_sort, topo_sort_layers, save_config
 from src.core.deployer import deploy_service
 from src.models.exceptions import DeployExecuteError
 
@@ -102,29 +102,52 @@ class DeployPipeline:
             discovered_jars: Dict[str, str] = {}
 
             if has_build:
-                for name in order:
+                layers = topo_sort_layers(env.services, self.selected)
+                max_concurrency = max(1, self.cfg.max_parallel_builds)
+                sem = asyncio.Semaphore(max_concurrency)
+
+                if len(layers) > 1 or any(len(layer) > 1 for layer in layers):
+                    self.log(
+                        f"[并行构建] 分为 {len(layers)} 个层级构建 "
+                        f"(最大并发数: {max_concurrency})"
+                    )
+                    for i, layer in enumerate(layers, 1):
+                        self.log(f"  - 层级 {i}: {', '.join(layer)}")
+
+                for layer_idx, layer in enumerate(layers, 1):
                     if self._cancelled:
                         self.log("已取消")
                         self._emit(step, total_units, "已取消")
                         return
-                    svc = env.services[name]
-                    self._emit(step, total_units, f"{name}: Maven 构建中")
 
-                    try:
-                        jar_abs = await build_service(
-                            self.cfg.maven, svc, self.log, self.cfg.log_encoding,
-                            java_home=self.cfg.java_home,
-                            is_cancelled=lambda: self._cancelled,
-                        )
-                        if jar_abs:
-                            discovered_jars[name] = jar_abs
-                    except Exception as e:
-                        if not isinstance(e, asyncio.CancelledError):
-                            self.log(f"[错误] {name} 构建失败: {e}")
-                        raise
+                    async def _build_single(name: str):
+                        nonlocal step
+                        async with sem:
+                            if self._cancelled:
+                                raise asyncio.CancelledError()
+                            svc = env.services[name]
+                            self._emit(step, total_units, f"{name}: Maven 构建中")
+                            try:
+                                jar_abs = await build_service(
+                                    self.cfg.maven, svc, self.log, self.cfg.log_encoding,
+                                    java_home=self.cfg.java_home,
+                                    is_cancelled=lambda: self._cancelled,
+                                )
+                                if jar_abs:
+                                    discovered_jars[name] = jar_abs
+                                step += UNITS_PER_STAGE
+                                self._emit(step, total_units, f"{name}: 构建完成")
+                            except Exception as e:
+                                if not isinstance(e, asyncio.CancelledError):
+                                    self.log(f"[错误] {name} 构建失败: {e}")
+                                raise
 
-                    step += UNITS_PER_STAGE
-                    self._emit(step, total_units, f"{name}: 构建完成")
+                    if len(layer) == 1 or max_concurrency == 1:
+                        for name in layer:
+                            await _build_single(name)
+                    else:
+                        self.log(f"[并行构建] 开始层级 {layer_idx} 并发构建 ({', '.join(layer)})...")
+                        await asyncio.gather(*[_build_single(name) for name in layer])
 
                 if discovered_jars:
                     self._persist_discovered_jars(env, discovered_jars)

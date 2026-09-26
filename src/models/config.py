@@ -76,6 +76,7 @@ class AppConfig:
     workspace: str = ""
     log_encoding: str = "utf-8"
     backup_keep: int = 5
+    max_parallel_builds: int = 3
     default_restart_script: str = "start.sh"
     auto_remote_name: bool = True
     git: GitConfig = field(default_factory=GitConfig)
@@ -292,6 +293,7 @@ def load_config(path: str) -> AppConfig:
         workspace=_expand(raw.get("workspace", "")),
         log_encoding=raw.get("log_encoding", "utf-8"),
         backup_keep=int(raw.get("backup_keep", 5)),
+        max_parallel_builds=int(raw.get("max_parallel_builds", 3)),
         default_restart_script=raw.get("default_restart_script", "start.sh"),
         auto_remote_name=bool(raw.get("auto_remote_name", True)),
         git=git_cfg,
@@ -360,6 +362,44 @@ def topo_sort(services: Dict[str, ServiceConfig], selected: List[str]) -> List[s
     return result
 
 
+def topo_sort_layers(services: Dict[str, ServiceConfig], selected: List[str]) -> List[List[str]]:
+    """
+    对已选服务进行拓扑分层，无依赖关系的服务将被归入同一层级，可进行并发构建。
+    返回: List[List[str]]，如 [["common"], ["user-service", "order-service"], ["gateway"]]
+    """
+    selected_set = set(selected)
+    in_degree: Dict[str, int] = {}
+    graph: Dict[str, List[str]] = {name: [] for name in selected_set}
+
+    for name in selected_set:
+        svc = services.get(name)
+        deps_in_selected = [d for d in (svc.depends_on if svc else []) if d in selected_set]
+        in_degree[name] = len(deps_in_selected)
+        for dep in deps_in_selected:
+            graph[dep].append(name)
+
+    layers: List[List[str]] = []
+    remaining = set(selected_set)
+
+    while remaining:
+        current_layer = [name for name in remaining if in_degree[name] == 0]
+        if not current_layer:
+            current_remaining = list(remaining)
+            current_remaining.sort(key=lambda x: selected.index(x) if x in selected else 0)
+            layers.append(current_remaining)
+            break
+
+        current_layer.sort(key=lambda x: selected.index(x) if x in selected else 0)
+        layers.append(current_layer)
+
+        for name in current_layer:
+            remaining.remove(name)
+            for neighbor in graph[name]:
+                in_degree[neighbor] -= 1
+
+    return layers
+
+
 def resolve_restart_cmd(svc: ServiceConfig, default_script: str) -> Optional[str]:
     if svc.restart_cmd is not None:
         cmd = svc.restart_cmd.strip()
@@ -392,6 +432,7 @@ def save_config(cfg: AppConfig, path: str):
         "workspace": cfg.workspace,
         "log_encoding": cfg.log_encoding,
         "backup_keep": cfg.backup_keep,
+        "max_parallel_builds": cfg.max_parallel_builds,
         "default_restart_script": cfg.default_restart_script,
         "auto_remote_name": cfg.auto_remote_name,
         "git": {

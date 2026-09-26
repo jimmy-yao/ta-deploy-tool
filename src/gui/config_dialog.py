@@ -130,6 +130,11 @@ class ConfigEditorDialog(QDialog):
         self.backup_keep_spin.setRange(0, 1000)
         form.addRow("备份保留数量:", self.backup_keep_spin)
 
+        self.max_parallel_builds_spin = QSpinBox()
+        self.max_parallel_builds_spin.setRange(1, 32)
+        self.max_parallel_builds_spin.setToolTip("并行构建 Maven 模块的最大并发数（设为 1 为串行）")
+        form.addRow("最大并行构建数:", self.max_parallel_builds_spin)
+
         self.restart_script_edit = QLineEdit()
         form.addRow("默认重启脚本:", self.restart_script_edit)
 
@@ -235,6 +240,7 @@ class ConfigEditorDialog(QDialog):
         self.workspace_edit.setText(self.cfg.workspace)
         self.log_encoding_edit.setText(self.cfg.log_encoding)
         self.backup_keep_spin.setValue(self.cfg.backup_keep)
+        self.max_parallel_builds_spin.setValue(self.cfg.max_parallel_builds)
         self.restart_script_edit.setText(self.cfg.default_restart_script)
         self.auto_remote_name_check.setChecked(self.cfg.auto_remote_name)
 
@@ -892,6 +898,7 @@ class ConfigEditorDialog(QDialog):
         self.cfg.workspace = self.workspace_edit.text().strip()
         self.cfg.log_encoding = self.log_encoding_edit.text().strip() or "utf-8"
         self.cfg.backup_keep = self.backup_keep_spin.value()
+        self.cfg.max_parallel_builds = self.max_parallel_builds_spin.value()
         self.cfg.default_restart_script = self.restart_script_edit.text().strip()
         self.cfg.auto_remote_name = self.auto_remote_name_check.isChecked()
 
