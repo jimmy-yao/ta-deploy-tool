@@ -17,10 +17,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.4.0
         with:
           python-version: '3.10'
 
@@ -34,7 +34,7 @@ jobs:
           pyinstaller TA_DEPLOY_TOOL.spec
 
       - name: Upload PyInstaller Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.1
         with:
           name: TA-DEPLOY-TOOL-PyInstaller
           path: dist/TA_DEPLOY_TOOL.exe
@@ -44,10 +44,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.4.0
         with:
           python-version: '3.10'
 
@@ -74,7 +74,7 @@ jobs:
             main.py
 
       - name: Upload Nuitka Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.1
         with:
           name: TA-DEPLOY-TOOL-Nuitka
           path: TA-DEPLOY-TOOL.exe
