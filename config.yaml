@@ -3,6 +3,7 @@ java_home: C:/Tools/DevSoft/jdks/openjdk-26
 workspace: C:/WorkSpace/IdeaWork
 log_encoding: utf-8
 backup_keep: 3
+max_parallel_builds: 3
 default_restart_script: start.sh
 auto_remote_name: true
 git:
