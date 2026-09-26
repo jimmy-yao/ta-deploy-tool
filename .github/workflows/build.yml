@@ -5,6 +5,8 @@ name: Build Windows EXE
     branches:
       - main
       - master
+      - refactor/modular-structure
+      - 'refactor/*'
     tags:
       - 'v*'
   workflow_dispatch:
