@@ -1,0 +1,23 @@
+# Python 编译缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# PyInstaller / Nuitka 打包产物与中间目录
+build/
+dist/
+*.spec.bak
+
+# 临时日志与缓存
+crash.log
+*.log
+scratch/
+.pytest_cache/
+
+# IDE 与环境配置
+.vscode/
+.idea/
+*.swp
+.DS_Store
