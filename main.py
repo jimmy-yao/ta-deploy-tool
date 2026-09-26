@@ -12,8 +12,9 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 from qasync import QEventLoop
 
-from ui import MainWindow, find_app_icon
-from theme import apply_theme
+from src.gui.main_window import MainWindow
+from src.gui.widgets import find_app_icon
+from src.gui.theme import apply_theme
 
 
 SETTINGS_ORG = "ta-deploy-tool"
