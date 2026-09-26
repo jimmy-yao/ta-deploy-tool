@@ -44,6 +44,7 @@ class ServiceConfig:
     build_args: str = "clean install -DskipTests"
     git_branch: Optional[str] = None
     server: Optional[str] = None
+    log_path: Optional[str] = None
 
 
 @dataclass
@@ -339,6 +340,7 @@ def load_config(path: str) -> AppConfig:
                 ),
                 git_branch=svc_raw.get("git_branch") or None,
                 server=svc_raw.get("server") or None,
+                log_path=svc_raw.get("log_path") or None,
             )
 
         cfg.environments[env_name] = EnvironmentConfig(
@@ -438,6 +440,8 @@ def save_config(cfg: AppConfig, path: str):
                 svc_data["restart_cmd"] = svc.restart_cmd
             if svc.git_branch:
                 svc_data["git_branch"] = svc.git_branch
+            if svc.log_path:
+                svc_data["log_path"] = svc.log_path
             services[svc_name] = svc_data
 
         env_data = {

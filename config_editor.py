@@ -546,6 +546,10 @@ class ConfigEditorDialog(QDialog):
         self.svc_git_branch.setPlaceholderText("留空 = 自动解析或默认分支")
         form.addRow("git_branch:", self.svc_git_branch)
 
+        self.svc_log_path = QLineEdit(svc.log_path or "")
+        self.svc_log_path.setPlaceholderText("远程日志路径，如: /opt/app/logs/sys.log；留空自动推导")
+        form.addRow("log_path:", self.svc_log_path)
+
         self.svc_detail_layout.addWidget(box)
 
     def _on_browse_project_dir(self):
@@ -602,6 +606,8 @@ class ConfigEditorDialog(QDialog):
             svc.depends_on = [s.strip() for s in raw.split(",") if s.strip()]
         if hasattr(self, "svc_git_branch"):
             svc.git_branch = self.svc_git_branch.text().strip() or None
+        if hasattr(self, "svc_log_path"):
+            svc.log_path = self.svc_log_path.text().strip() or None
 
     # ============================================================
     # 扫描 workspace
