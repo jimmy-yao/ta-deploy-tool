@@ -35,6 +35,9 @@ from src.gui.widgets import (
     ServiceItemWidget,
     ActionCardWidget,
     CurrentActionCard,
+    SETTINGS_ORG,
+    SETTINGS_APP,
+    APP_ICON_NAME,
 )
 from src.gui.log_dialog import RemoteLogDialog
 from src.gui.rollback_dialog import RollbackDialog, ManualBranchDialog
