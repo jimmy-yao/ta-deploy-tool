@@ -6,9 +6,28 @@ import sys
 from typing import Callable, List, Optional
 
 from config import ServiceConfig, GitConfig
+from exceptions import BuildError
 from git_ops import resolve_latest_iteration_branch, update_repo
 
 LogFn = Callable[[str], None]
+
+
+async def _kill_process_tree(proc: asyncio.subprocess.Process):
+    if proc.returncode is not None:
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            )
+        else:
+            proc.kill()
+        await proc.wait()
+    except Exception:
+        pass
 
 
 async def _run_git_process(cmd: List[str], cwd: str, log: LogFn, encoding: str):
@@ -35,16 +54,20 @@ async def _run_git_process(cmd: List[str], cwd: str, log: LogFn, encoding: str):
         )
 
     assert proc.stdout is not None
-    async for raw in proc.stdout:
-        try:
-            text = raw.decode(encoding).rstrip()
-        except UnicodeDecodeError:
-            text = raw.decode("gbk", errors="ignore").rstrip()
-        if text:
-            log(text)
+    try:
+        async for raw in proc.stdout:
+            try:
+                text = raw.decode(encoding).rstrip()
+            except UnicodeDecodeError:
+                text = raw.decode("gbk", errors="ignore").rstrip()
+            if text:
+                log(text)
 
-    code = await proc.wait()
-    return code
+        code = await proc.wait()
+        return code
+    except asyncio.CancelledError:
+        await _kill_process_tree(proc)
+        raise
 
 
 async def resolve_branch(
@@ -163,6 +186,7 @@ async def build_service(
     log: LogFn,
     encoding: str = "utf-8",
     java_home: str = "",
+    is_cancelled: Optional[Callable[[], bool]] = None,
 ) -> Optional[str]:
     """
     执行 Maven 构建。
@@ -220,27 +244,37 @@ async def build_service(
     assert proc.stdout is not None
     building_jars: List[str] = []
 
-    async for raw in proc.stdout:
-        try:
-            text = raw.decode(encoding).rstrip()
-        except UnicodeDecodeError:
-            text = raw.decode("gbk", errors="ignore").rstrip()
-        if not text:
-            continue
-        log(text)
+    try:
+        async for raw in proc.stdout:
+            if is_cancelled and is_cancelled():
+                await _kill_process_tree(proc)
+                raise asyncio.CancelledError()
 
-        marker = "Building jar:"
-        idx = text.find(marker)
-        if idx < 0:
-            continue
-        jar_path = text[idx + len(marker):].strip()
-        if not jar_path.endswith(".jar"):
-            continue
-        building_jars.append(jar_path)
+            try:
+                text = raw.decode(encoding).rstrip()
+            except UnicodeDecodeError:
+                text = raw.decode("gbk", errors="ignore").rstrip()
+            if not text:
+                continue
+            log(text)
 
-    code = await proc.wait()
+            marker = "Building jar:"
+            idx = text.find(marker)
+            if idx < 0:
+                continue
+            jar_path = text[idx + len(marker):].strip()
+            if not jar_path.endswith(".jar"):
+                continue
+            building_jars.append(jar_path)
+
+        code = await proc.wait()
+    except asyncio.CancelledError:
+        log(f"[取消] 终止服务 {svc.name} 的构建进程...")
+        await _kill_process_tree(proc)
+        raise
+
     if code != 0:
-        raise RuntimeError(f"{svc.name} 构建失败，退出码 {code}")
+        raise BuildError(f"{svc.name} 构建失败，退出码 {code}")
 
     log(f"=== [构建完成] {svc.name} ===")
 

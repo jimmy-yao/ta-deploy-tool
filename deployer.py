@@ -1,4 +1,5 @@
 # deployer.py
+import asyncio
 import os
 from datetime import datetime
 from typing import Callable, Optional
@@ -6,6 +7,7 @@ from typing import Callable, Optional
 import asyncssh
 
 from config import ServerConfig, ServiceConfig, resolve_restart_cmd
+from exceptions import DeployExecuteError
 
 LogFn = Callable[[str], None]
 ProgressCb = Callable[[int, int], None]
@@ -69,7 +71,7 @@ async def _upload_jar(
     backup_keep: int = 5,
 ):
     if not os.path.isfile(local_jar):
-        raise FileNotFoundError(f"本地 jar 不存在: {local_jar}")
+        raise DeployExecuteError(f"本地 jar 不存在: {local_jar}")
 
     async with conn.start_sftp_client() as sftp:
         await _ensure_remote_dir(sftp, remote_dir)
@@ -121,7 +123,7 @@ async def _run_remote_cmd(conn, cmd: str, log: LogFn):
             log(f"[stderr] {line}")
 
     if result.exit_status != 0:
-        raise RuntimeError(f"远程命令失败，退出码 {result.exit_status}: {cmd}")
+        raise DeployExecuteError(f"远程命令失败，退出码 {result.exit_status}: {cmd}")
 
 
 async def deploy_service(
@@ -138,7 +140,7 @@ async def deploy_service(
 
 def _make_connect_kwargs(server: ServerConfig) -> dict:
     if not server.key and not server.password:
-        raise ValueError(
+        raise DeployExecuteError(
             f"服务器 {server.name} ({server.host}) 未配置 key 或 password"
         )
     connect_kwargs = dict(
@@ -181,7 +183,7 @@ async def rollback_service(
     """回滚服务到指定的备份文件并重启服务。"""
     remote_name = svc.remote_name or (os.path.basename(svc.local_jar) if svc.local_jar else "")
     if not remote_name:
-        raise ValueError(f"服务 {svc.name} 未指定 remote_name，无法回滚")
+        raise DeployExecuteError(f"服务 {svc.name} 未指定 remote_name，无法回滚")
 
     log(f"=== [回滚] {svc.name} -> 使用备份: {backup_filename} ===")
     kwargs = _make_connect_kwargs(server)
@@ -247,7 +249,7 @@ async def deploy_service(
                     phase_cb("restart_done")
 
     except asyncssh.PermissionDenied as e:
-        raise RuntimeError(
+        raise DeployExecuteError(
             f"SSH 认证失败: user={server.user} "
             f"host={server.host}:{server.port} "
             f"auth={'key' if server.key else 'password'} 原因={e}"

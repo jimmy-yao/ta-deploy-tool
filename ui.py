@@ -23,8 +23,22 @@ from builder import resolve_branch
 from config import load_config
 from config_editor import ConfigEditorDialog
 from deployer import list_remote_backups, rollback_service
+from exceptions import DeployError
 from pipeline import DeployPipeline
 from theme import apply_theme
+
+
+def is_known_error(e: Exception) -> bool:
+    """判断是否为已知/预期的业务流程异常（UI 日志中不需要打 Python 追溯堆栈 Traceback）。"""
+    if isinstance(e, asyncio.CancelledError):
+        return True
+    if isinstance(e, DeployError):
+        return True
+    if isinstance(e, (RuntimeError, FileNotFoundError, ValueError, TimeoutError, OSError)):
+        return True
+    if type(e).__module__.startswith("asyncssh"):
+        return True
+    return False
 
 
 SETTINGS_ORG = "ta-deploy-tool"
@@ -932,13 +946,23 @@ class MainWindow(QMainWindow):
 
         self.action_card.finish(ok, msg)
 
+        is_cancel_msg = "已取消" in msg or "取消" in msg
+
         if ok:
             self._append_log(f"[结果] {msg}")
             for w in self._service_items.values():
                 if w.badge.text().lower() in ("building...", "deploying...", "rollbacking..."):
                     w.set_status("healthy", "Healthy")
+        elif is_cancel_msg:
+            self._append_log(f"[取消] {msg}")
+            for w in self._service_items.values():
+                if w.badge.text().lower() in ("building...", "deploying...", "rollbacking..."):
+                    w.set_status("idle", "Idle")
         else:
             self._append_log(f"[失败] {msg}")
+            for w in self._service_items.values():
+                if w.badge.text().lower() in ("building...", "deploying...", "rollbacking..."):
+                    w.set_status("critical", "Critical")
             QMessageBox.critical(self, "失败", msg)
 
     # ============================================================
@@ -1015,8 +1039,12 @@ class MainWindow(QMainWindow):
             try:
                 await self.pipeline.run()
                 self.done_signal.emit(True, "操作完成")
+            except asyncio.CancelledError:
+                self.log_signal.emit("[取消] 任务已被用户取消")
+                self.done_signal.emit(False, "操作已被用户取消")
             except Exception as e:
-                self.log_signal.emit(traceback.format_exc())
+                if not is_known_error(e):
+                    self.log_signal.emit(traceback.format_exc())
                 self.done_signal.emit(False, f"操作失败: {e}")
 
         self._task = asyncio.ensure_future(runner())
@@ -1030,8 +1058,10 @@ class MainWindow(QMainWindow):
     def _on_cancel_clicked(self):
         if self.pipeline:
             self.pipeline.cancel()
-            self.cancel_btn.setEnabled(False)
-            self.action_card.status_label.setText("已请求取消...")
+        if self._task and not self._task.done():
+            self._task.cancel()
+        self.cancel_btn.setEnabled(False)
+        self.action_card.status_label.setText("已请求取消...")
 
     # ============================================================
     # 一键回滚
@@ -1102,8 +1132,12 @@ class MainWindow(QMainWindow):
                     default_restart_script=self.cfg.default_restart_script
                 )
                 self.done_signal.emit(True, f"服务 {service_name} 回滚完成")
+            except asyncio.CancelledError:
+                self.log_signal.emit(f"[取消] 服务 {service_name} 回滚已被用户取消")
+                self.done_signal.emit(False, f"服务 {service_name} 回滚已取消")
             except Exception as e:
-                self.log_signal.emit(traceback.format_exc())
+                if not is_known_error(e):
+                    self.log_signal.emit(traceback.format_exc())
                 self.done_signal.emit(False, f"服务 {service_name} 回滚失败: {e}")
 
         self._task = asyncio.ensure_future(runner())

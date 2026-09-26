@@ -1,10 +1,12 @@
 # pipeline.py
+import asyncio
 import os
 from typing import Callable, List, Dict, Optional
 
 from builder import build_service, prepare_repo, resolve_branch
 from config import AppConfig, topo_sort, save_config
 from deployer import deploy_service
+from exceptions import DeployExecuteError
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int, str], None]
@@ -46,180 +48,198 @@ class DeployPipeline:
         self.on_progress(current, total, status)
 
     async def run(self):
-        env = self.cfg.environments[self.env_name]
+        try:
+            env = self.cfg.environments[self.env_name]
 
-        order = topo_sort(env.services, self.selected)
-        self.log(f"执行顺序: {' -> '.join(order)}")
+            order = topo_sort(env.services, self.selected)
+            self.log(f"执行顺序: {' -> '.join(order)}")
 
-        has_git = self.do_build and self.use_git
-        has_build = self.do_build
-        has_deploy = self.do_deploy
+            has_git = self.do_build and self.use_git
+            has_build = self.do_build
+            has_deploy = self.do_deploy
 
-        stages_per_svc = int(has_git) + int(has_build) + int(has_deploy)
-        if stages_per_svc == 0:
-            self.log("没有需要执行的任务")
-            return
+            stages_per_svc = int(has_git) + int(has_build) + int(has_deploy)
+            if stages_per_svc == 0:
+                self.log("没有需要执行的任务")
+                return
 
-        total_units = len(order) * stages_per_svc * UNITS_PER_STAGE
-        step = 0
-        self._emit(0, total_units, "准备中...")
+            total_units = len(order) * stages_per_svc * UNITS_PER_STAGE
+            step = 0
+            self._emit(0, total_units, "准备中...")
 
-        # ---------- 阶段一：git 更新 ----------
-        if has_git:
-            for name in order:
-                if self._cancelled:
-                    self.log("已取消")
-                    self._emit(step, total_units, "已取消")
-                    return
-                svc = env.services[name]
-                override = self.branch_overrides.get(name)
+            # ---------- 阶段一：git 更新 ----------
+            if has_git:
+                for name in order:
+                    if self._cancelled:
+                        self.log("已取消")
+                        self._emit(step, total_units, "已取消")
+                        return
+                    svc = env.services[name]
+                    override = self.branch_overrides.get(name)
 
-                try:
-                    branch = override or await resolve_branch(
-                        svc, self.cfg.git, self.log, self.cfg.log_encoding
-                    )
-                    self.log(f"[计划] {name} 将使用分支: {branch}")
-                    self._emit(step, total_units, f"{name}: 更新分支 {branch}")
-
-                    await prepare_repo(
-                        svc, self.cfg.git, self.log,
-                        self.cfg.log_encoding,
-                        enable_git=True,
-                        branch_override=override,
-                    )
-                except Exception as e:
-                    self.log(f"[错误] {name} 代码更新失败: {e}")
-                    raise
-
-                step += UNITS_PER_STAGE
-                self._emit(step, total_units, f"{name}: 分支 {branch} 更新完成")
-
-        # ---------- 阶段二：构建 ----------
-        discovered_jars: Dict[str, str] = {}
-
-        if has_build:
-            for name in order:
-                if self._cancelled:
-                    self.log("已取消")
-                    self._emit(step, total_units, "已取消")
-                    return
-                svc = env.services[name]
-                self._emit(step, total_units, f"{name}: Maven 构建中")
-
-                jar_abs = await build_service(
-                    self.cfg.maven, svc, self.log, self.cfg.log_encoding,
-                    java_home=self.cfg.java_home,
-                )
-                if jar_abs:
-                    discovered_jars[name] = jar_abs
-
-                step += UNITS_PER_STAGE
-                self._emit(step, total_units, f"{name}: 构建完成")
-
-            if discovered_jars:
-                self._persist_discovered_jars(env, discovered_jars)
-
-        # ---------- 阶段三：部署 ----------
-        if has_deploy:
-            missing = []
-            for name in order:
-                svc = env.services[name]
-                if not svc.local_jar:
-                    missing.append((name, "(未识别，请先打包)"))
-                    continue
-                local_jar = os.path.join(svc.project_dir, svc.local_jar)
-                if not os.path.isfile(local_jar):
-                    missing.append((name, local_jar))
-            if missing:
-                msg = "以下服务的本地 jar 不存在，请先打包：\n" + "\n".join(
-                    f"  - {n}: {p}" for n, p in missing
-                )
-                self.log(msg)
-                raise FileNotFoundError(msg)
-
-            self.log("--- 部署目标 ---")
-            for name in order:
-                svc = env.services[name]
-                server = env.resolve_server(svc)
-                self.log(
-                    f"  {name} -> {server.name}@{server.host}:{server.port}"
-                    f" ({svc.remote_dir}/{svc.remote_name})"
-                )
-            self.log("----------------")
-
-            for name in order:
-                if self._cancelled:
-                    self.log("已取消")
-                    self._emit(step, total_units, "已取消")
-                    return
-                svc = env.services[name]
-                server = env.resolve_server(svc)
-                local_jar = os.path.join(svc.project_dir, svc.local_jar)
-
-                base_units = step
-                last_reported = {"v": 0}
-
-                def _make_progress_cb(base_val, last_ref, svc_name, file_name):
-                    def cb(copied: int, total_bytes: int):
-                        if total_bytes > 0:
-                            frac = min(copied / total_bytes, 1.0)
-                        else:
-                            frac = 1.0
-                        uploaded_units = int(frac * UPLOAD_SHARE)
-                        if uploaded_units <= last_ref["v"] and frac < 1.0:
-                            return
-                        last_ref["v"] = uploaded_units
-                        mb_copied = copied / 1024 / 1024
-                        mb_total = total_bytes / 1024 / 1024
-                        status = (
-                            f"{svc_name}: 上传 {file_name} "
-                            f"{mb_copied:.1f}/{mb_total:.1f} MB"
+                    try:
+                        branch = override or await resolve_branch(
+                            svc, self.cfg.git, self.log, self.cfg.log_encoding
                         )
-                        self._emit(base_val + uploaded_units, total_units, status)
-                    return cb
+                        self.log(f"[计划] {name} 将使用分支: {branch}")
+                        self._emit(step, total_units, f"{name}: 更新分支 {branch}")
 
-                def _make_phase_cb(base_val, svc_name, file_name):
-                    def cb(phase: str):
-                        if phase == "upload_start":
-                            self._emit(
-                                base_val, total_units,
-                                f"{svc_name}: 上传 {file_name}",
+                        await prepare_repo(
+                            svc, self.cfg.git, self.log,
+                            self.cfg.log_encoding,
+                            enable_git=True,
+                            branch_override=override,
+                        )
+                    except Exception as e:
+                        if not isinstance(e, asyncio.CancelledError):
+                            self.log(f"[错误] {name} 代码更新失败: {e}")
+                        raise
+
+                    step += UNITS_PER_STAGE
+                    self._emit(step, total_units, f"{name}: 分支 {branch} 更新完成")
+
+            # ---------- 阶段二：构建 ----------
+            discovered_jars: Dict[str, str] = {}
+
+            if has_build:
+                for name in order:
+                    if self._cancelled:
+                        self.log("已取消")
+                        self._emit(step, total_units, "已取消")
+                        return
+                    svc = env.services[name]
+                    self._emit(step, total_units, f"{name}: Maven 构建中")
+
+                    try:
+                        jar_abs = await build_service(
+                            self.cfg.maven, svc, self.log, self.cfg.log_encoding,
+                            java_home=self.cfg.java_home,
+                            is_cancelled=lambda: self._cancelled,
+                        )
+                        if jar_abs:
+                            discovered_jars[name] = jar_abs
+                    except Exception as e:
+                        if not isinstance(e, asyncio.CancelledError):
+                            self.log(f"[错误] {name} 构建失败: {e}")
+                        raise
+
+                    step += UNITS_PER_STAGE
+                    self._emit(step, total_units, f"{name}: 构建完成")
+
+                if discovered_jars:
+                    self._persist_discovered_jars(env, discovered_jars)
+
+            # ---------- 阶段三：部署 ----------
+            if has_deploy:
+                missing = []
+                for name in order:
+                    svc = env.services[name]
+                    if not svc.local_jar:
+                        missing.append((name, "(未识别，请先打包)"))
+                        continue
+                    local_jar = os.path.join(svc.project_dir, svc.local_jar)
+                    if not os.path.isfile(local_jar):
+                        missing.append((name, local_jar))
+                if missing:
+                    msg = "以下服务的本地 jar 不存在，请先打包：\n" + "\n".join(
+                        f"  - {n}: {p}" for n, p in missing
+                    )
+                    self.log(msg)
+                    raise DeployExecuteError(msg)
+
+                self.log("--- 部署目标 ---")
+                for name in order:
+                    svc = env.services[name]
+                    server = env.resolve_server(svc)
+                    self.log(
+                        f"  {name} -> {server.name}@{server.host}:{server.port}"
+                        f" ({svc.remote_dir}/{svc.remote_name})"
+                    )
+                self.log("----------------")
+
+                for name in order:
+                    if self._cancelled:
+                        self.log("已取消")
+                        self._emit(step, total_units, "已取消")
+                        return
+                    svc = env.services[name]
+                    server = env.resolve_server(svc)
+                    local_jar = os.path.join(svc.project_dir, svc.local_jar)
+
+                    base_units = step
+                    last_reported = {"v": 0}
+
+                    def _make_progress_cb(base_val, last_ref, svc_name, file_name):
+                        def cb(copied: int, total_bytes: int):
+                            if total_bytes > 0:
+                                frac = min(copied / total_bytes, 1.0)
+                            else:
+                                frac = 1.0
+                            uploaded_units = int(frac * UPLOAD_SHARE)
+                            if uploaded_units <= last_ref["v"] and frac < 1.0:
+                                return
+                            last_ref["v"] = uploaded_units
+                            mb_copied = copied / 1024 / 1024
+                            mb_total = total_bytes / 1024 / 1024
+                            status = (
+                                f"{svc_name}: 上传 {file_name} "
+                                f"{mb_copied:.1f}/{mb_total:.1f} MB"
                             )
-                        elif phase == "upload_done":
-                            self._emit(
-                                base_val + UPLOAD_SHARE, total_units,
-                                f"{svc_name}: 上传完成",
-                            )
-                        elif phase == "restart_start":
-                            self._emit(
-                                base_val + UPLOAD_SHARE, total_units,
-                                f"{svc_name}: 执行重启命令",
-                            )
-                        elif phase == "restart_done":
-                            self._emit(
-                                base_val + UPLOAD_SHARE, total_units,
-                                f"{svc_name}: 重启完成",
-                            )
-                    return cb
+                            self._emit(base_val + uploaded_units, total_units, status)
+                        return cb
 
-                progress_cb = _make_progress_cb(
-                    base_units, last_reported, name, svc.remote_name
-                )
-                phase_cb = _make_phase_cb(base_units, name, svc.remote_name)
+                    def _make_phase_cb(base_val, svc_name, file_name):
+                        def cb(phase: str):
+                            if phase == "upload_start":
+                                self._emit(
+                                    base_val, total_units,
+                                    f"{svc_name}: 上传 {file_name}",
+                                )
+                            elif phase == "upload_done":
+                                self._emit(
+                                    base_val + UPLOAD_SHARE, total_units,
+                                    f"{svc_name}: 上传完成",
+                                )
+                            elif phase == "restart_start":
+                                self._emit(
+                                    base_val + UPLOAD_SHARE, total_units,
+                                    f"{svc_name}: 执行重启命令",
+                                )
+                            elif phase == "restart_done":
+                                self._emit(
+                                    base_val + UPLOAD_SHARE, total_units,
+                                    f"{svc_name}: 重启完成",
+                                )
+                        return cb
 
-                await deploy_service(
-                    server, svc, local_jar, self.log,
-                    progress_cb=progress_cb,
-                    phase_cb=phase_cb,
-                    backup_keep=self.cfg.backup_keep,
-                    default_restart_script=self.cfg.default_restart_script,
-                )
+                    progress_cb = _make_progress_cb(
+                        base_units, last_reported, name, svc.remote_name
+                    )
+                    phase_cb = _make_phase_cb(base_units, name, svc.remote_name)
 
-                step += UNITS_PER_STAGE
-                self._emit(step, total_units, f"{name}: 部署完成")
+                    try:
+                        await deploy_service(
+                            server, svc, local_jar, self.log,
+                            progress_cb=progress_cb,
+                            phase_cb=phase_cb,
+                            backup_keep=self.cfg.backup_keep,
+                            default_restart_script=self.cfg.default_restart_script,
+                        )
+                    except Exception as e:
+                        if not isinstance(e, asyncio.CancelledError):
+                            self.log(f"[错误] {name} 部署失败: {e}")
+                        raise
 
-        self._emit(total_units, total_units, "全部完成")
-        self.log("=== 全部完成 ===")
+                    step += UNITS_PER_STAGE
+                    self._emit(step, total_units, f"{name}: 部署完成")
+
+            self._emit(total_units, total_units, "全部完成")
+            self.log("=== 全部完成 ===")
+        except asyncio.CancelledError:
+            self._cancelled = True
+            self.log("[取消] 任务已停止并取消")
+            self._emit(step, total_units, "已取消")
+            raise
 
     # ============================================================
     # 自动识别结果回写
