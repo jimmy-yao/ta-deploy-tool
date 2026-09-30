@@ -22,7 +22,8 @@ from src.models.config import (
 class ConfigEditorDialog(QDialog):
     """可视化编辑 config.yaml。样式跟随全局主题。"""
 
-    def __init__(self, cfg: AppConfig, config_path: str, parent=None):
+    def __init__(self, cfg: AppConfig, config_path: str, parent=None,
+                 focus_env=None, focus_service=None):
         super().__init__(parent)
         self.setWindowTitle("配置编辑")
 
@@ -41,9 +42,13 @@ class ConfigEditorDialog(QDialog):
         self.saved = False
         self._current_env_name = None
         self._current_svc_name = None
+        # 右键「编辑服务配置」直达目标：UI 构建完后选中该环境/服务
+        self._focus_env = focus_env
+        self._focus_service = focus_service
 
         self._build_ui()
         self._load_all()
+        self._apply_focus()
 
     # ============================================================
     # UI 构建
@@ -265,6 +270,27 @@ class ConfigEditorDialog(QDialog):
             self.env_list.addItem(name)
         if self.env_list.count() > 0:
             self.env_list.setCurrentRow(0)
+
+    def _apply_focus(self):
+        """右键「编辑服务配置」直达：切到环境页并选中目标环境/服务。"""
+        if not self._focus_env:
+            return
+        self.tabs.setCurrentIndex(2)  # 环境页
+        for i in range(self.env_list.count()):
+            if self.env_list.item(i).text() == self._focus_env:
+                if self.env_list.currentRow() != i:
+                    self.env_list.setCurrentRow(i)  # 触发 _on_env_selected → 重建详情
+                break
+        else:
+            return  # 环境不存在：保持默认选中，不跳转
+        if not self._focus_service:
+            return
+        for i in range(self.services_list.count()):
+            item = self.services_list.item(i)
+            if item is not None and item.text() == self._focus_service:
+                if self.services_list.currentRow() != i:
+                    self.services_list.setCurrentRow(i)
+                break
 
     # ============================================================
     # 环境切换

@@ -609,10 +609,23 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "错误", f"加载配置失败: {e}")
 
     def _on_open_config(self):
-        dlg = ConfigEditorDialog(self.cfg, self.config_path, self)
+        self._open_config()
+
+    def _open_config(self, focus_env=None, focus_service=None):
+        dlg = ConfigEditorDialog(
+            self.cfg, self.config_path, self,
+            focus_env=focus_env, focus_service=focus_service,
+        )
         dlg.exec()
         if getattr(dlg, "saved", False):
             self._reload_config()
+
+    def _on_edit_service(self, service_name: str):
+        """右键「编辑服务配置」：直达该环境该服务的配置编辑页。"""
+        self._open_config(
+            focus_env=self.env_combo.currentText(),
+            focus_service=service_name,
+        )
 
     # ============================================================
     # 分支解析
@@ -853,12 +866,15 @@ class MainWindow(QMainWindow):
         })
         return overrides
 
-    def _start_task(self, do_build: bool, do_deploy: bool):
+    def _start_task(self, do_build: bool, do_deploy: bool, services=None):
+        """启动任务。services 传入显式服务列表（右键单服务任务），
+        为 None 时按侧边栏勾选状态执行。"""
         if self._task and not self._task.done():
+            self._append_log("[任务] 已有任务进行中，忽略本次请求")
             return
 
         env_name = self.env_combo.currentText()
-        selected = self._selected_services()
+        selected = list(services) if services is not None else self._selected_services()
         if not selected:
             QMessageBox.warning(self, "提示", "请至少选择一个服务")
             return
@@ -880,12 +896,13 @@ class MainWindow(QMainWindow):
         self.deploy_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
 
+        scope = ", ".join(selected) if services is not None else "selected services"
         if do_build and do_deploy:
-            title = "Building & Deploying selected services"
+            title = f"Building & Deploying {scope}"
         elif do_build:
-            title = "Building selected services"
+            title = f"Building {scope}"
         else:
-            title = "Deploying selected services"
+            title = f"Deploying {scope}"
         self.action_card.start(title)
 
         for name in selected:
@@ -935,6 +952,14 @@ class MainWindow(QMainWindow):
     def _on_deploy_clicked(self):
         self._start_task(do_build=False, do_deploy=True)
 
+    def _on_build_service(self, service_name: str):
+        """右键：仅打包该服务（不受侧边栏勾选状态影响）。"""
+        self._start_task(do_build=True, do_deploy=False, services=[service_name])
+
+    def _on_deploy_service(self, service_name: str):
+        """右键：仅部署该服务（不受侧边栏勾选状态影响）。"""
+        self._start_task(do_build=False, do_deploy=True, services=[service_name])
+
     def _on_cancel_clicked(self):
         if self.pipeline:
             self.pipeline.cancel()
@@ -960,20 +985,44 @@ class MainWindow(QMainWindow):
             return
 
         svc_name = w.name()
+        self._service_context_menu(svc_name).exec(
+            self.service_list.mapToGlobal(pos)
+        )
 
+    def _service_context_menu(self, svc_name: str) -> QMenu:
+        """服务行右键菜单：任务 / 日常操作 / 维护 三组语义分组。
+
+        「打包此服务 / 部署此服务」使用显式服务列表执行，
+        不受侧边栏勾选状态影响。
+        """
         menu = QMenu(self)
+
+        # —— 组 1：任务 ——
+        act_build = menu.addAction("📦 打包此服务")
+        act_build.triggered.connect(lambda: self._on_build_service(svc_name))
+        act_deploy = menu.addAction("🚀 部署此服务")
+        act_deploy.triggered.connect(lambda: self._on_deploy_service(svc_name))
+
+        menu.addSeparator()
+
+        # —— 组 2：日常操作 ——
         pinned = self._service_branch_overrides.get(svc_name)
         act_branch = menu.addAction(
-            f"🌿 手动指定分支 ({svc_name})" + (f" — 当前: {pinned}" if pinned else "")
+            "🌿 手动指定分支" + (f" — 当前: {pinned}" if pinned else "")
         )
         act_branch.triggered.connect(lambda: self._on_manual_branch(svc_name))
-        menu.addSeparator()
-        act_log = menu.addAction(f"📖 查看远程实时日志 ({svc_name})")
+        act_log = menu.addAction("📖 查看远程实时日志")
         act_log.triggered.connect(lambda: self._on_view_remote_log(svc_name))
+
         menu.addSeparator()
-        act_rollback = menu.addAction(f"↺ 一键回滚 ({svc_name})")
+
+        # —— 组 3：维护 ——
+        act_rollback = menu.addAction("↺ 一键回滚")
         act_rollback.triggered.connect(lambda: self._on_rollback_service(svc_name))
-        menu.exec(self.service_list.mapToGlobal(pos))
+        act_edit = menu.addAction("⚙ 编辑服务配置")
+        act_edit.triggered.connect(lambda: self._on_edit_service(svc_name))
+
+        return menu
 
     def _on_group_context_menu(self, pos, item, gw: ServerGroupWidget):
         """组头右键：整组勾选 + 展开/折叠。"""
