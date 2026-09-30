@@ -146,12 +146,12 @@ class MainWindow(QMainWindow):
         # 主题切换
         self.theme_combo = LabeledCombo("主题:")
         self.theme_combo.setFixedWidth(140)
-        self.theme_combo.addItem("深色", "dark")
+        self.theme_combo.addItem("护眼 (豆沙绿)", "care")
         self.theme_combo.addItem("浅色", "light")
-        self.theme_combo.addItem("青蓝 (护眼)", "oceanic")
+        self.theme_combo.addItem("青蓝", "oceanic")
 
         settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        saved_mode = settings.value("theme", "dark")
+        saved_mode = settings.value("theme", "care")
         idx = self.theme_combo.findData(saved_mode)
         if idx >= 0:
             self.theme_combo.setCurrentIndex(idx)
@@ -522,17 +522,17 @@ class MainWindow(QMainWindow):
     # 主题切换
     # ============================================================
     def _on_theme_changed(self, _):
-        mode = self.theme_combo.currentData() or "dark"
+        mode = self.theme_combo.currentData() or "care"
         app = QApplication.instance()
         if app is not None:
             apply_theme(app, mode=mode)
         QSettings(SETTINGS_ORG, SETTINGS_APP).setValue("theme", mode)
         theme_names = {
-            "dark": "深色",
+            "care": "护眼 (豆沙绿)",
             "light": "浅色",
-            "oceanic": "青蓝 (护眼)",
+            "oceanic": "青蓝",
         }
-        mode_label = theme_names.get(mode, "深色")
+        mode_label = theme_names.get(mode, "护眼 (豆沙绿)")
         self._append_log(
             f"[主题] 已切换为 {mode_label}"
         )
