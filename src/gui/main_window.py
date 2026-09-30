@@ -811,9 +811,16 @@ class MainWindow(QMainWindow):
 
         if "失败" in status or "错误" in status:
             w.set_status("critical", "Critical")
-        elif "构建完成" in status or "部署完成" in status or "重启完成" in status or "上传完成" in status or "回滚完成" in status:
+        elif ("构建完成" in status or "部署完成" in status or "重启完成" in status
+              or "上传完成" in status or "回滚完成" in status):
             w.set_status("healthy", "Healthy")
-        elif "上传" in status or "构建" in status or "更新分支" in status or "回滚" in status:
+        elif "回滚" in status:
+            w.set_status("deploying", "Rollbacking...")
+        elif "上传" in status or "重启" in status:
+            # 部署阶段（上传 jar / 执行重启命令）：标为部署中，
+            # 此前误落到「构建」分支显示 Building，单服务部署时尤其明显
+            w.set_status("deploying", "Deploying...")
+        elif "构建" in status or "更新分支" in status or "更新完成" in status:
             w.set_status("building", "Building...")
 
     # ============================================================
