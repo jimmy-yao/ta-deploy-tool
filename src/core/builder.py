@@ -3,13 +3,41 @@ import asyncio
 import os
 import subprocess
 import sys
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from src.models.config import ServiceConfig, GitConfig
 from src.models.exceptions import BuildError
 from src.core.git_ops import resolve_latest_iteration_branch, update_repo
 
 LogFn = Callable[[str], None]
+
+# 取消标志的轮询间隔（秒）：Maven 下载依赖 / 注解处理时可能长时间不产生
+# 任何 stdout，取消检查不能只挂在“读到一行输出”上，否则点“停止”毫无反应。
+CANCEL_POLL_INTERVAL = 0.2
+
+
+async def _await_with_cancel_poll(fut: "asyncio.Future", is_cancelled: Optional[Callable[[], bool]]):
+    """等待 `fut` 完成，期间周期性检查取消标志。
+
+    命中取消时先取消 `fut` 再抛 CancelledError，由调用方统一收尾（杀进程树等）。
+    `is_cancelled` 为空则退化为普通等待。
+    """
+    if not is_cancelled:
+        return await fut
+
+    while not fut.done():
+        await asyncio.wait({fut}, timeout=CANCEL_POLL_INTERVAL)
+        if is_cancelled():
+            fut.cancel()
+            if not fut.done():
+                # Task 的取消要再调度一轮才真正落地（cancelled() 才变 True），
+                # 等它落地再抛，调用方拿到的 future 状态才是确定的。
+                try:
+                    await fut
+                except asyncio.CancelledError:
+                    pass
+            raise asyncio.CancelledError()
+    return fut.result()
 
 
 async def _kill_process_tree(proc: asyncio.subprocess.Process):
@@ -28,46 +56,6 @@ async def _kill_process_tree(proc: asyncio.subprocess.Process):
         await proc.wait()
     except Exception:
         pass
-
-
-async def _run_git_process(cmd: List[str], cwd: str, log: LogFn, encoding: str):
-    log(f"$ (cd {cwd}) {' '.join(cmd)}")
-
-    kwargs = {}
-    if sys.platform == "win32":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-    if sys.platform == "win32":
-        proc = await asyncio.create_subprocess_shell(
-            subprocess.list2cmdline(cmd),
-            cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            **kwargs,
-        )
-    else:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-
-    assert proc.stdout is not None
-    try:
-        async for raw in proc.stdout:
-            try:
-                text = raw.decode(encoding).rstrip()
-            except UnicodeDecodeError:
-                text = raw.decode("gbk", errors="ignore").rstrip()
-            if text:
-                log(text)
-
-        code = await proc.wait()
-        return code
-    except asyncio.CancelledError:
-        await _kill_process_tree(proc)
-        raise
 
 
 async def resolve_branch(
@@ -100,11 +88,19 @@ async def prepare_repo(
     encoding: str = "utf-8",
     enable_git: Optional[bool] = None,
     branch_override: Optional[str] = None,
-) -> Optional[str]:
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    更新本地仓库到目标分支的最新提交。
+
+    分支解析在此处“现算”：branch_override（用户显式指定）优先，
+    否则按 git 配置实时解析（iteration 模式会现查远程最新迭代分支）。
+
+    返回: (branch, commit)，跳过 git 时为 (None, None)。
+    """
     use_git = git_cfg.enabled if enable_git is None else enable_git
     if not use_git:
         log(f"[git] 已跳过 {svc.name} 的代码更新")
-        return None
+        return None, None
 
     if branch_override:
         branch = branch_override
@@ -123,7 +119,7 @@ async def prepare_repo(
         encoding=encoding,
         fetch_timeout=git_cfg.fetch_timeout,
     )
-    return commit
+    return branch, commit
 
 
 def _pick_deployable_jar(
@@ -229,12 +225,10 @@ async def build_service(
     assert proc.stdout is not None
     building_jars: List[str] = []
 
-    try:
+    async def _drain_stdout():
+        # 消费 stdout 放在独立任务里，主流程才能一边等输出一边轮询取消标志。
+        assert proc.stdout is not None
         async for raw in proc.stdout:
-            if is_cancelled and is_cancelled():
-                await _kill_process_tree(proc)
-                raise asyncio.CancelledError()
-
             try:
                 text = raw.decode(encoding).rstrip()
             except UnicodeDecodeError:
@@ -252,9 +246,28 @@ async def build_service(
                 continue
             building_jars.append(jar_path)
 
-        code = await proc.wait()
+    reader: Optional[asyncio.Future] = None
+    waiter: Optional[asyncio.Future] = None
+
+    def _discard(fut):
+        if fut is not None and not fut.done():
+            fut.cancel()
+
+    try:
+        reader = asyncio.ensure_future(_drain_stdout())
+        await _await_with_cancel_poll(reader, is_cancelled)
+        waiter = asyncio.ensure_future(proc.wait())
+        code = await _await_with_cancel_poll(waiter, is_cancelled)
     except asyncio.CancelledError:
         log(f"[取消] 终止服务 {svc.name} 的构建进程...")
+        _discard(reader)
+        _discard(waiter)
+        await _kill_process_tree(proc)
+        raise
+    except BaseException:
+        # 读取 / 等待阶段的其它异常也要收掉子进程，避免 Maven 变成孤儿进程。
+        _discard(reader)
+        _discard(waiter)
         await _kill_process_tree(proc)
         raise
 

@@ -22,7 +22,7 @@ git:
   ls_remote_timeout: 60
 
 environments:
-  test:
+  dev:
     default_server:
       host: 192.168.1.100
       port: 22
@@ -31,9 +31,9 @@ environments:
     servers: {}
     services:
       example-service:
-        project_dir: ""
+        project_dir: D:/work/example-service
         build_args: clean install -DskipTests
         local_jar: ""
-        remote_dir: /opt/app/example-service
+        remote_dir: /data/deploy/envs/tgfw-xc/example-service
         remote_name: ""
         depends_on: []

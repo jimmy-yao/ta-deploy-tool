@@ -14,6 +14,11 @@ class GitError(DeployError):
     pass
 
 
+class ConfigError(DeployError):
+    """配置错误（循环依赖、选中了不存在的服务等）。"""
+    pass
+
+
 class DeployExecuteError(DeployError):
     """部署执行阶段异常（SSH/SFTP 失败、本地 jar 不存在等）。"""
     pass

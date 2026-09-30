@@ -182,19 +182,6 @@ QPushButton#DangerButton:hover {
     background: #7F1D1D;
     color: #FFFFFF;
 }
-
-QPushButton#IconButton {
-    background: transparent;
-    border: 1px solid transparent;
-    color: #9CA3AF;
-    padding: 6px 10px;
-    font-size: 16px;
-}
-QPushButton#IconButton:hover {
-    background: #1F2937;
-    color: #E5E7EB;
-}
-
 QPushButton#PrimaryButton {
     background: #2563EB;
     color: #FFFFFF;
@@ -214,25 +201,50 @@ QPushButton#PrimaryButton:hover {
     border-right: 1px solid #1F2937;
 }
 
-QListWidget#SidebarList {
+QTreeWidget#SidebarList {
     background: transparent;
     border: none;
     outline: none;
     padding: 4px;
 }
-QListWidget#SidebarList::item {
+QTreeWidget#SidebarList::item {
     background: transparent;
     border: none;
     margin: 2px 4px;
     border-radius: 8px;
     padding: 0;
 }
-QListWidget#SidebarList::item:hover {
+QTreeWidget#SidebarList::item:hover {
     background: #111827;
 }
-QListWidget#SidebarList::item:selected {
+QTreeWidget#SidebarList::item:selected {
     background: #111827;
     border: 1px solid #1F2937;
+}
+
+/* 侧边栏分组头（按服务器分组） */
+#ServerGroup {
+    background: transparent;
+    border-radius: 8px;
+}
+#ServerGroup:hover {
+    background: #111827;
+}
+#ServerGroupTitle {
+    background: transparent;
+    color: #E5E7EB;
+    font-size: 12px;
+    font-weight: bold;
+}
+#ServerGroupDetail {
+    background: transparent;
+    color: #6B7280;
+    font-size: 11px;
+}
+#ServerGroupCount {
+    background: transparent;
+    color: #6B7280;
+    font-size: 11px;
 }
 
 /* ============================================================
@@ -771,19 +783,6 @@ QPushButton#DangerButton:hover {
     background: #FEE2E2;
     color: #B91C1C;
 }
-
-QPushButton#IconButton {
-    background: transparent;
-    border: 1px solid transparent;
-    color: #6B7280;
-    padding: 6px 10px;
-    font-size: 16px;
-}
-QPushButton#IconButton:hover {
-    background: #F3F4F6;
-    color: #111827;
-}
-
 QPushButton#PrimaryButton {
     background: #2563EB;
     color: #FFFFFF;
@@ -803,25 +802,50 @@ QPushButton#PrimaryButton:hover {
     border-right: 1px solid #E5E7EB;
 }
 
-QListWidget#SidebarList {
+QTreeWidget#SidebarList {
     background: transparent;
     border: none;
     outline: none;
     padding: 4px;
 }
-QListWidget#SidebarList::item {
+QTreeWidget#SidebarList::item {
     background: transparent;
     border: none;
     margin: 2px 4px;
     border-radius: 8px;
     padding: 0;
 }
-QListWidget#SidebarList::item:hover {
+QTreeWidget#SidebarList::item:hover {
     background: #F3F4F6;
 }
-QListWidget#SidebarList::item:selected {
+QTreeWidget#SidebarList::item:selected {
     background: #EFF6FF;
     border: 1px solid #BFDBFE;
+}
+
+/* 侧边栏分组头（按服务器分组） */
+#ServerGroup {
+    background: transparent;
+    border-radius: 8px;
+}
+#ServerGroup:hover {
+    background: #F3F4F6;
+}
+#ServerGroupTitle {
+    background: transparent;
+    color: #111827;
+    font-size: 12px;
+    font-weight: bold;
+}
+#ServerGroupDetail {
+    background: transparent;
+    color: #6B7280;
+    font-size: 11px;
+}
+#ServerGroupCount {
+    background: transparent;
+    color: #6B7280;
+    font-size: 11px;
 }
 
 /* ============================================================
@@ -1361,19 +1385,6 @@ QPushButton#DangerButton:hover {
     background: #881337;
     color: #FFFFFF;
 }
-
-QPushButton#IconButton {
-    background: transparent;
-    border: 1px solid transparent;
-    color: #94A3B8;
-    padding: 6px 10px;
-    font-size: 16px;
-}
-QPushButton#IconButton:hover {
-    background: #253349;
-    color: #E2E8F0;
-}
-
 QPushButton#PrimaryButton {
     background: #0284C7;
     color: #FFFFFF;
@@ -1393,25 +1404,50 @@ QPushButton#PrimaryButton:hover {
     border-right: 1px solid #2D3D54;
 }
 
-QListWidget#SidebarList {
+QTreeWidget#SidebarList {
     background: transparent;
     border: none;
     outline: none;
     padding: 4px;
 }
-QListWidget#SidebarList::item {
+QTreeWidget#SidebarList::item {
     background: transparent;
     border: none;
     margin: 2px 4px;
     border-radius: 8px;
     padding: 0;
 }
-QListWidget#SidebarList::item:hover {
+QTreeWidget#SidebarList::item:hover {
     background: #1F2B3E;
 }
-QListWidget#SidebarList::item:selected {
+QTreeWidget#SidebarList::item:selected {
     background: #1F2B3E;
     border: 1px solid #0284C7;
+}
+
+/* 侧边栏分组头（按服务器分组） */
+#ServerGroup {
+    background: transparent;
+    border-radius: 8px;
+}
+#ServerGroup:hover {
+    background: #1F2B3E;
+}
+#ServerGroupTitle {
+    background: transparent;
+    color: #E2E8F0;
+    font-size: 12px;
+    font-weight: bold;
+}
+#ServerGroupDetail {
+    background: transparent;
+    color: #9CA3AF;
+    font-size: 11px;
+}
+#ServerGroupCount {
+    background: transparent;
+    color: #9CA3AF;
+    font-size: 11px;
 }
 
 /* ============================================================

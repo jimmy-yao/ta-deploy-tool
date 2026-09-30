@@ -3,10 +3,10 @@ import asyncio
 import os
 from typing import Callable, List, Dict, Optional
 
-from src.core.builder import build_service, prepare_repo, resolve_branch
+from src.core.builder import build_service, prepare_repo
 from src.models.config import AppConfig, topo_sort, topo_sort_layers, save_config
 from src.core.deployer import deploy_service
-from src.models.exceptions import DeployExecuteError
+from src.models.exceptions import BuildError, DeployExecuteError
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int, str], None]
@@ -54,7 +54,8 @@ class DeployPipeline:
             order = topo_sort(env.services, self.selected)
             self.log(f"执行顺序: {' -> '.join(order)}")
 
-            has_git = self.do_build and self.use_git
+            # git.enabled=false 时整体跳过 Git 阶段
+            has_git = self.do_build and self.use_git and self.cfg.git.enabled
             has_build = self.do_build
             has_deploy = self.do_deploy
 
@@ -77,17 +78,15 @@ class DeployPipeline:
                     svc = env.services[name]
                     override = self.branch_overrides.get(name)
 
-                    try:
-                        branch = override or await resolve_branch(
-                            svc, self.cfg.git, self.log, self.cfg.log_encoding
-                        )
-                        self.log(f"[计划] {name} 将使用分支: {branch}")
-                        self._emit(step, total_units, f"{name}: 更新分支 {branch}")
+                    self._emit(step, total_units, f"{name}: 更新分支中")
 
-                        await prepare_repo(
+                    try:
+                        # 分支在此处实时解析（iteration 模式现查远程最新分支），
+                        # 不使用界面上的预解析缓存，保证拿到打包瞬间的最新分支。
+                        branch, _commit = await prepare_repo(
                             svc, self.cfg.git, self.log,
                             self.cfg.log_encoding,
-                            enable_git=True,
+                            enable_git=self.cfg.git.enabled,
                             branch_override=override,
                         )
                     except Exception as e:
@@ -102,6 +101,21 @@ class DeployPipeline:
             discovered_jars: Dict[str, str] = {}
 
             if has_build:
+                # 构建用的路径以“配置值优先、检测值兜底”为准，
+                # 检测值只在本次运行生效，不回写配置文件。
+                maven = self.cfg.effective_maven
+                java_home = self.cfg.effective_java_home
+                if self.cfg.maven and maven != self.cfg.maven:
+                    self.log(
+                        f"[提示] 配置的 maven 路径不存在({self.cfg.maven})，"
+                        f"本次构建使用自动检测值: {maven}"
+                    )
+                if self.cfg.java_home and java_home != self.cfg.java_home:
+                    self.log(
+                        f"[提示] 配置的 java_home 不存在({self.cfg.java_home})，"
+                        f"本次构建使用自动检测值: {java_home}"
+                    )
+
                 layers = topo_sort_layers(env.services, self.selected)
                 max_concurrency = max(1, self.cfg.max_parallel_builds)
                 sem = asyncio.Semaphore(max_concurrency)
@@ -114,6 +128,7 @@ class DeployPipeline:
                     for i, layer in enumerate(layers, 1):
                         self.log(f"  - 层级 {i}: {', '.join(layer)}")
 
+                build_failure: Optional[BaseException] = None
                 for layer_idx, layer in enumerate(layers, 1):
                     if self._cancelled:
                         self.log("已取消")
@@ -129,8 +144,8 @@ class DeployPipeline:
                             self._emit(step, total_units, f"{name}: Maven 构建中")
                             try:
                                 jar_abs = await build_service(
-                                    self.cfg.maven, svc, self.log, self.cfg.log_encoding,
-                                    java_home=self.cfg.java_home,
+                                    maven, svc, self.log, self.cfg.log_encoding,
+                                    java_home=java_home,
                                     is_cancelled=lambda: self._cancelled,
                                 )
                                 if jar_abs:
@@ -142,12 +157,45 @@ class DeployPipeline:
                                     self.log(f"[错误] {name} 构建失败: {e}")
                                 raise
 
-                    if len(layer) == 1 or max_concurrency == 1:
-                        for name in layer:
-                            await _build_single(name)
-                    else:
-                        self.log(f"[并行构建] 开始层级 {layer_idx} 并发构建 ({', '.join(layer)})...")
-                        await asyncio.gather(*[_build_single(name) for name in layer])
+                    try:
+                        if len(layer) == 1 or max_concurrency == 1:
+                            for name in layer:
+                                await _build_single(name)
+                        else:
+                            self.log(f"[并行构建] 开始层级 {layer_idx} 并发构建 ({', '.join(layer)})...")
+                            # return_exceptions=True：一个服务失败不取消同层其它并发构建，
+                            # 收齐结果后统一判定（失败详情已在 _build_single 里逐条打印）。
+                            results = await asyncio.gather(
+                                *[_build_single(name) for name in layer],
+                                return_exceptions=True,
+                            )
+                            failures = []
+                            for name, res in zip(layer, results):
+                                if isinstance(res, asyncio.CancelledError):
+                                    # 外部取消 / 用户点停止：优先按取消处理，不当作构建失败
+                                    raise res
+                                if isinstance(res, BaseException):
+                                    failures.append((name, res))
+                            if failures:
+                                # 层内失败即停止：该层服务可能被后续层依赖，
+                                # 继续构建只会产出与本次失败状态不一致的产物。
+                                raise BuildError(
+                                    f"层级 {layer_idx} 有 {len(failures)} 个服务构建失败: "
+                                    f"{', '.join(n for n, _ in failures)}"
+                                    f"（详见上方错误日志）"
+                                ) from failures[0][1]
+                    except asyncio.CancelledError:
+                        raise
+                    except BaseException as e:
+                        build_failure = e
+                        break
+
+                if build_failure is not None:
+                    # 写回策略（明确约定）：本轮**全部**构建成功才把识别到的 jar
+                    # 持久化进配置；部分成功一律不写回，避免配置里出现
+                    # “新 jar 路径 + 失败服务的旧 jar 路径”这种混合状态被后续部署误用。
+                    self.log("[配置] 存在构建失败，本次识别到的 jar 不写回配置")
+                    raise build_failure
 
                 if discovered_jars:
                     self._persist_discovered_jars(env, discovered_jars)

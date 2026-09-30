@@ -560,7 +560,7 @@ class ConfigEditorDialog(QDialog):
         form.addRow("git_branch:", self.svc_git_branch)
 
         self.svc_log_path = QLineEdit(svc.log_path or "")
-        self.svc_log_path.setPlaceholderText("远程日志路径，如: /opt/app/logs/sys.log；留空自动推导")
+        self.svc_log_path.setPlaceholderText("远程日志路径，如: /data/deploy/envs/tgfw-xc/logs/sys.log；留空自动推导")
         form.addRow("log_path:", self.svc_log_path)
 
         self.svc_detail_layout.addWidget(box)
@@ -716,7 +716,7 @@ class ConfigEditorDialog(QDialog):
                 name=dir_name,
                 project_dir=dir_norm,
                 local_jar="",
-                remote_dir=f"/opt/app/{dir_name}",
+                remote_dir=f"/data/deploy/envs/tgfw-xc/{dir_name}",
                 remote_name="",
                 build_args="clean install -DskipTests",
             )
@@ -834,7 +834,7 @@ class ConfigEditorDialog(QDialog):
             name=name,
             project_dir="",
             local_jar="",
-            remote_dir=f"/opt/app/{name}",
+            remote_dir=f"/data/deploy/envs/tgfw-xc/{name}",
             remote_name="",
             build_args="clean install -DskipTests",
         )

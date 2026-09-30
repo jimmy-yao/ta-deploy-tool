@@ -209,37 +209,68 @@ class ServiceItemWidget(QWidget):
         return self.name_label.text()
 
 
-class ActionCardWidget(QFrame):
-    """卡片组件：显示当前任务与日志大区块。"""
-    def __init__(self, parent=None):
+class ServerGroupWidget(QFrame):
+    """侧边栏分组头：三态勾选 + 服务器名 + host:port + 勾选计数。
+
+    复选框语义由本控件显式定义（不依赖 Qt 三态的点击循环）：
+      全选 → 点击变全不选；半选/全不选 → 点击变全选。
+    分支展开/折叠交给 QTreeWidget 原生箭头与双击，本控件不接管。
+    """
+    toggled = Signal(bool)
+
+    def __init__(self, name: str, detail: str = "", parent=None):
         super().__init__(parent)
-        self.setObjectName("ActionCard")
+        self.setObjectName("ServerGroup")
+        self.setMinimumHeight(38)
+        self._name = name
+        self._state = Qt.Unchecked
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 4, 10, 4)
+        layout.setSpacing(8)
 
-        self.title_label = QLabel("Ready")
-        self.title_label.setStyleSheet(
-            "font-size: 15px; font-weight: bold;"
-        )
-        layout.addWidget(self.title_label)
+        self.checkbox = QCheckBox()
+        self.checkbox.setTristate(True)
+        # 只连 clicked：程序化 set_check_state 不会触发 toggled 回环
+        self.checkbox.clicked.connect(self._on_clicked)
+        layout.addWidget(self.checkbox)
 
-        self.status_label = QLabel("选择服务后点击「构建选中的服务」或「一键构建并部署」")
-        self.status_label.setStyleSheet("color: #9CA3AF; font-size: 12px;")
-        layout.addWidget(self.status_label)
+        self.name_label = QLabel(name)
+        self.name_label.setObjectName("ServerGroupTitle")
+        layout.addWidget(self.name_label)
 
-    def start(self, title: str):
-        self.title_label.setText(title)
-        self.status_label.setText("执行中...")
+        self.detail_label = QLabel(detail)
+        self.detail_label.setObjectName("ServerGroupDetail")
+        layout.addWidget(self.detail_label, 1)
 
-    def finish(self, ok: bool, msg: str):
-        if ok:
-            self.title_label.setText("操作成功")
-            self.status_label.setText(msg)
-        else:
-            self.title_label.setText("操作失败")
-            self.status_label.setText(msg)
+        self.count_label = QLabel("")
+        self.count_label.setObjectName("ServerGroupCount")
+        self.count_label.setMinimumWidth(34)
+        self.count_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        layout.addWidget(self.count_label)
+
+    def group_name(self) -> str:
+        return self._name
+
+    def set_detail(self, detail: str):
+        self.detail_label.setText(detail)
+
+    def set_count(self, checked: int, total: int):
+        self.count_label.setText(f"{checked}/{total}")
+
+    def check_state(self) -> "Qt.CheckState":
+        return self._state
+
+    def set_check_state(self, state):
+        self._state = state
+        self.checkbox.blockSignals(True)
+        self.checkbox.setCheckState(state)
+        self.checkbox.blockSignals(False)
+
+    def _on_clicked(self):
+        want = Qt.Unchecked if self._state == Qt.Checked else Qt.Checked
+        self.set_check_state(want)
+        self.toggled.emit(want == Qt.Checked)
 
 
 import time
