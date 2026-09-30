@@ -1,5 +1,5 @@
-maven: C:/Tools/DevSoft/apache-maven-3.9.14/bin/mvn.cmd
-java_home: C:/Tools/DevSoft/jdks/openjdk-26
+maven: D:/DevSoft/apache-maven-3.9.16/bin/mvn.cmd
+java_home: D:/DevSoft/Jdk/Jdk1.8
 workspace: C:/WorkSpace/IdeaWork
 log_encoding: utf-8
 backup_keep: 3
