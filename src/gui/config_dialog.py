@@ -148,6 +148,9 @@ class ConfigEditorDialog(QDialog):
         form.addRow("最大并行构建数:", self.max_parallel_builds_spin)
 
         self.restart_script_edit = QLineEdit()
+        self.restart_script_edit.setPlaceholderText(
+            "相对 remote_dir 的路径，如 bin/start.sh；留空 = 不执行重启"
+        )
         form.addRow("默认重启脚本:", self.restart_script_edit)
 
         self.auto_remote_name_check = QCheckBox(

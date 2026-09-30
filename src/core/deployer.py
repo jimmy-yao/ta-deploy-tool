@@ -323,7 +323,7 @@ async def rollback_service(
     svc: ServiceConfig,
     backup_filename: str,
     log: LogFn,
-    default_restart_script: str = "start.sh",
+    default_restart_script: str = "bin/start.sh",
 ):
     remote_name = svc.remote_name or (os.path.basename(svc.local_jar) if svc.local_jar else "")
     if not remote_name:
@@ -374,7 +374,7 @@ async def deploy_service(
     progress_cb: Optional[ProgressCb] = None,
     phase_cb: Optional[PhaseCb] = None,
     backup_keep: int = 5,
-    default_restart_script: str = "start.sh",
+    default_restart_script: str = "bin/start.sh",
 ):
     log(f"=== [部署] {svc.name} -> {server.name}@{server.host}:{server.port} ===")
     connect_kwargs = _make_connect_kwargs(server)

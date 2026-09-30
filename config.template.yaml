@@ -8,7 +8,7 @@ workspace: D:/work
 log_encoding: utf-8
 backup_keep: 5
 max_parallel_builds: 3
-default_restart_script: start.sh
+default_restart_script: bin/start.sh
 auto_remote_name: false
 
 git:

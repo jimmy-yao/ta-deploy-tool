@@ -104,7 +104,7 @@ class AppConfig:
     log_encoding: str = "utf-8"
     backup_keep: int = 5
     max_parallel_builds: int = 3
-    default_restart_script: str = "start.sh"
+    default_restart_script: str = "bin/start.sh"
     auto_remote_name: bool = True
     git: GitConfig = field(default_factory=GitConfig)
     environments: Dict[str, EnvironmentConfig] = field(default_factory=dict)
@@ -339,7 +339,7 @@ def load_config(path: str) -> AppConfig:
         log_encoding=raw.get("log_encoding", "utf-8"),
         backup_keep=int(raw.get("backup_keep", 5)),
         max_parallel_builds=int(raw.get("max_parallel_builds", 3)),
-        default_restart_script=raw.get("default_restart_script", "start.sh"),
+        default_restart_script=raw.get("default_restart_script", "bin/start.sh"),
         auto_remote_name=bool(raw.get("auto_remote_name", True)),
         git=git_cfg,
         detected_maven=detected_maven,

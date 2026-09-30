@@ -110,7 +110,7 @@ build.bat
 - `maven`: Maven 可执行文件路径（Windows 下为 `.cmd` 文件）。
 - `git.branch_mode`: 分支模式，可选 `iteration`（动态迭代分支）或 `fixed`（固定分支）。
 - `git.iteration_pattern`: 迭代分支匹配正则，正则表达式的最后一个捕获组用于版本比较排序。
-- `default_restart_script`: 默认远程重启脚本路径（相对于 `remote_dir`）。
+- `default_restart_script`: 默认远程重启脚本路径（相对于 `remote_dir`，模板默认 `bin/start.sh`）。
 - `backup_keep`: 历史备份保留份数，设为 `0` 表示不清理历史备份。
 - `environments.<env>.servers`: 命名服务器节点集合。
 - 服务节点通过 `server: <服务器名>` 引用指定服务器；若未指定则使用 `default_server`。
