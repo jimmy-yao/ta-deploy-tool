@@ -13,6 +13,7 @@ dist/
 # 临时日志与缓存
 crash.log
 *.log
+*.tmp
 scratch/
 .pytest_cache/
 
