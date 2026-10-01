@@ -162,6 +162,16 @@ class ConfigEditorDialog(QDialog):
         )
         form.addRow("remote_name:", self.auto_remote_name_check)
 
+        self.auto_rollback_check = QCheckBox(
+            "重启失败时自动回滚到部署前版本"
+        )
+        self.auto_rollback_check.setToolTip(
+            "重启命令返回非 0 时：把刚上传的新 jar 挪到 .failed.<时间戳> 留证，\n"
+            "将 .bak.<时间戳> 放回原位，再重新执行一次重启脚本。\n"
+            "关闭时：只报错，线上文件保持新版本不动。"
+        )
+        form.addRow("自动回滚:", self.auto_rollback_check)
+
         return w
 
     def _build_git_tab(self):
@@ -258,6 +268,7 @@ class ConfigEditorDialog(QDialog):
         self.max_parallel_builds_spin.setValue(self.cfg.max_parallel_builds)
         self.restart_script_edit.setText(self.cfg.default_restart_script)
         self.auto_remote_name_check.setChecked(self.cfg.auto_remote_name)
+        self.auto_rollback_check.setChecked(self.cfg.auto_rollback)
 
         self.git_enabled_check.setChecked(self.cfg.git.enabled)
         self.branch_mode_combo.setCurrentText(self.cfg.git.branch_mode)
@@ -937,6 +948,7 @@ class ConfigEditorDialog(QDialog):
         self.cfg.max_parallel_builds = self.max_parallel_builds_spin.value()
         self.cfg.default_restart_script = self.restart_script_edit.text().strip()
         self.cfg.auto_remote_name = self.auto_remote_name_check.isChecked()
+        self.cfg.auto_rollback = self.auto_rollback_check.isChecked()
 
         self.cfg.git.enabled = self.git_enabled_check.isChecked()
         self.cfg.git.branch_mode = self.branch_mode_combo.currentText()

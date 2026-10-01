@@ -11,6 +11,11 @@ max_parallel_builds: 3
 default_restart_script: bin/start.sh
 auto_remote_name: false
 
+# 重启命令执行失败时，自动把部署前的版本放回原位并重新重启一次
+#   true  = 失败即回滚，服务尽量回到部署前状态（默认）
+#   false = 只报错，线上文件保持新版本不动，由人工处理
+auto_rollback: true
+
 git:
   enabled: true
   branch_mode: iteration

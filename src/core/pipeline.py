@@ -281,6 +281,16 @@ class DeployPipeline:
                                     base_val + UPLOAD_SHARE, total_units,
                                     f"{svc_name}: 重启完成",
                                 )
+                            elif phase == "rollback_start":
+                                self._emit(
+                                    base_val + UPLOAD_SHARE, total_units,
+                                    f"{svc_name}: 重启失败，自动回滚中",
+                                )
+                            elif phase == "rollback_done":
+                                self._emit(
+                                    base_val + UPLOAD_SHARE, total_units,
+                                    f"{svc_name}: 已回滚到部署前版本",
+                                )
                         return cb
 
                     progress_cb = _make_progress_cb(
@@ -295,6 +305,7 @@ class DeployPipeline:
                             phase_cb=phase_cb,
                             backup_keep=self.cfg.backup_keep,
                             default_restart_script=self.cfg.default_restart_script,
+                            auto_rollback=self.cfg.auto_rollback,
                         )
                     except Exception as e:
                         if not isinstance(e, asyncio.CancelledError):

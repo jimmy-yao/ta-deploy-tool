@@ -2,6 +2,7 @@
 import asyncio
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Optional
 
@@ -134,13 +135,22 @@ async def _ensure_remote_dir(sftp, remote_dir: str) -> str:
     return path
 
 
-async def _cleanup_old_backups(
+async def _cleanup_old_files(
     sftp,
     remote_dir: str,
     remote_name: str,
+    marker: str,
     keep: int,
     log: LogFn,
 ):
+    """按 `<remote_name>.<marker>.<时间戳>` 前缀清理历史文件，每类最多保留 keep 份。
+
+    marker 取值：
+    - ``bak``    部署前的旧版本备份（回滚的来源），由 ``_upload_jar`` 生成
+    - ``failed`` 重启失败后被隔离的新版本，由 ``_restore_backup`` 生成，留证用
+
+    两类文件名同带时间戳，倒序即按新旧排序，与原先只清 ``bak`` 的行为一致。
+    """
     if keep <= 0:
         return
 
@@ -149,19 +159,29 @@ async def _cleanup_old_backups(
     except asyncssh.SFTPError:
         return
 
-    prefix = remote_name + ".bak."
-    backups = [name for name in entries if name.startswith(prefix)]
-    if len(backups) <= keep:
+    prefix = f"{remote_name}.{marker}."
+    names = [name for name in entries if name.startswith(prefix)]
+    if len(names) <= keep:
         return
 
-    backups.sort(reverse=True)
-    for name in backups[keep:]:
+    names.sort(reverse=True)
+    label = "备份" if marker == "bak" else "失败残留"
+    for name in names[keep:]:
         path = f"{remote_dir}/{name}"
         try:
             await sftp.remove(path)
-            log(f"清理旧备份: {name}")
+            log(f"清理旧{label}: {name}")
         except asyncssh.SFTPError as e:
-            log(f"清理旧备份失败 {name}: {e}")
+            log(f"清理旧{label}失败 {name}: {e}")
+
+
+@dataclass(frozen=True)
+class _UploadOutcome:
+    """一次上传的落点信息，供部署失败时精确回滚。"""
+
+    remote_dir: str              # 已规范化、已展开 ~ 的实际远端目录
+    remote_name: str             # 实际使用的远端文件名
+    backup_path: Optional[str]   # 被替换下来的部署前版本；首次部署为 None
 
 
 async def _upload_jar(
@@ -172,7 +192,7 @@ async def _upload_jar(
     log: LogFn,
     progress_cb: Optional[ProgressCb] = None,
     backup_keep: int = 5,
-):
+) -> _UploadOutcome:
     if not os.path.isfile(local_jar):
         raise DeployExecuteError(f"本地 jar 不存在: {local_jar}")
 
@@ -226,9 +246,68 @@ async def _upload_jar(
 
         log(f"上传完成: {remote_final}")
 
-        await _cleanup_old_backups(
-            sftp, remote_dir, remote_name, backup_keep, log
+        await _cleanup_old_files(
+            sftp, remote_dir, remote_name, "bak", backup_keep, log
         )
+        # 失败残留同样按 backup_keep 封顶，避免多次回滚后在远端越积越多
+        await _cleanup_old_files(
+            sftp, remote_dir, remote_name, "failed", backup_keep, log
+        )
+
+        return _UploadOutcome(
+            remote_dir=remote_dir,
+            remote_name=remote_name,
+            backup_path=backup_path,
+        )
+
+
+async def _restore_backup(
+    conn,
+    remote_dir: str,
+    remote_name: str,
+    backup_path: str,
+    log: LogFn,
+) -> str:
+    """把部署前的版本放回原位，返回被隔离留证的新版本路径。
+
+    两步 rename，与 ``_upload_jar`` 里“替换失败恢复原文件”是同一套路：
+      1. 新版本挪到 ``<name>.failed.<时间戳>`` —— 让出目标名，同时保留现场
+      2. 部署前版本放回目标名
+
+    第 2 步失败时会把第 1 步挪走的新版本放回去，确保远端始终存在
+    ``name`` 这个文件，不留下“jar 缺失”的中间态。
+    """
+    remote_final = f"{remote_dir}/{remote_name}"
+    failed_path = f"{remote_dir}/{remote_name}.failed.{_timestamp_ms()}"
+
+    async with conn.start_sftp_client() as sftp:
+        try:
+            await sftp.rename(remote_final, failed_path)
+            log(f"[回滚] 已隔离本次上传的新版本: {failed_path}")
+        except Exception as e:
+            raise DeployExecuteError(
+                f"[回滚] 隔离新版本失败，部署前版本未恢复: {e}"
+            ) from e
+
+        try:
+            await sftp.rename(backup_path, remote_final)
+        except Exception as e:
+            try:
+                await sftp.rename(failed_path, remote_final)
+            except Exception as e2:
+                raise DeployExecuteError(
+                    f"[回滚] 恢复部署前版本失败: {e}；把新版本放回原位也失败: {e2}；"
+                    f"远端 {remote_final} 当前缺失，部署前版本仍在 {backup_path}，"
+                    f"请立即手动处理"
+                ) from e
+            raise DeployExecuteError(
+                f"[回滚] 恢复部署前版本失败: {e}；已把新版本放回原位 {remote_final}；"
+                f"部署前版本仍在 {backup_path}，请立即手动处理"
+            ) from e
+
+        log(f"[回滚] 已恢复部署前版本: {remote_final}")
+
+    return failed_path
 
 
 async def _run_remote_cmd(
@@ -358,12 +437,102 @@ async def rollback_service(
         restart_cmd = resolve_restart_cmd(svc, default_restart_script)
         if restart_cmd:
             log(f"[重启] 将执行: {restart_cmd}")
-            await _run_remote_cmd(conn, restart_cmd, log)
+            try:
+                await _run_remote_cmd(conn, restart_cmd, log)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # 文件已经恢复成功了，只是没起来 —— 必须讲清楚，
+                # 否则操作者看到“回滚失败”会以为文件没回过去，又去手工覆盖一次。
+                raise DeployExecuteError(
+                    f"回滚的文件恢复已成功: {backup_filename} -> {remote_name}\n"
+                    f"  但重启命令失败: {restart_cmd}\n"
+                    f"  原因: {e}\n"
+                    f"  服务当前很可能处于停止状态，请立即手动执行重启脚本"
+                ) from e
             log(f"[重启] 命令执行完成: {restart_cmd}")
         else:
             log(f"[重启] {svc.name} 禁用重启或未配置重启脚本，跳过")
 
     log(f"=== [回滚完成] {svc.name} ===")
+
+
+async def _rollback_after_restart_failure(
+    conn,
+    service_name: str,
+    outcome: _UploadOutcome,
+    restart_cmd: str,
+    restart_err: BaseException,
+    log: LogFn,
+    phase_cb: Optional[PhaseCb],
+    auto_rollback: bool,
+):
+    """重启失败后的兜底：恢复部署前版本并重新重启，最后统一抛出失败。
+
+    无论回滚是否成功，本函数都以异常结束 —— 部署本身已经失败，
+    绝不能因为“回滚做完了”就让调用方把它当成部署成功。
+    """
+    remote_final = f"{outcome.remote_dir}/{outcome.remote_name}"
+    backup_path = outcome.backup_path
+
+    detail = (
+        f"重启命令失败: {restart_cmd}\n"
+        f"  原因: {restart_err}\n"
+        f"  新版本已就位: {remote_final}\n"
+        f"  部署前版本: {backup_path or '(无，首次部署)'}"
+    )
+
+    if not auto_rollback:
+        raise DeployExecuteError(
+            detail + "\n  自动回滚已关闭：线上文件保持新版本不动，"
+                     "服务未重启成功，请人工处理。"
+        ) from restart_err
+
+    if not outcome.remote_name or not backup_path:
+        raise DeployExecuteError(
+            detail + "\n  没有可回滚的部署前版本（首次部署或 remote_name 为空）："
+                     "线上文件保持新版本不动，服务未重启成功。"
+        ) from restart_err
+
+    log(f"=== [重启失败] {service_name}: {restart_err} ===")
+    log(f"=== [自动回滚] {service_name} -> 恢复部署前版本 ===")
+
+    if phase_cb:
+        phase_cb("rollback_start")
+
+    failed_path = await _restore_backup(
+        conn, outcome.remote_dir, outcome.remote_name, backup_path, log
+    )
+
+    log(f"[回滚] 重新执行重启命令: {restart_cmd}")
+    rollback_restart_err = None
+    try:
+        await _run_remote_cmd(conn, restart_cmd, log)
+    except asyncio.CancelledError:
+        log("[警告] 回滚后的重启被取消，服务可能尚未启动，请手动执行重启脚本")
+        raise
+    except Exception as e2:
+        rollback_restart_err = e2
+        log(f"[警告] 回滚后的重启仍失败: {e2}")
+
+    if phase_cb:
+        phase_cb("rollback_done")
+
+    if rollback_restart_err is None:
+        raise DeployExecuteError(
+            detail
+            + f"\n  [已自动回滚] 部署前版本已恢复并重启成功: {outcome.remote_name}"
+            + f"\n  本次失败的新版本已隔离留存: {failed_path}"
+            + "\n  部署结果: 失败（请修复重启脚本或服务问题后重试）"
+        ) from restart_err
+
+    raise DeployExecuteError(
+        detail
+        + f"\n  [回滚部分完成] 部署前版本已恢复: {backup_path}"
+        + f"\n  但回滚后的重启仍失败: {rollback_restart_err}"
+        + f"\n  本次失败的新版本已隔离留存: {failed_path}"
+        + f"\n  服务当前很可能处于停止状态，请立即手动执行: {restart_cmd}"
+    ) from restart_err
 
 
 async def deploy_service(
@@ -375,6 +544,7 @@ async def deploy_service(
     phase_cb: Optional[PhaseCb] = None,
     backup_keep: int = 5,
     default_restart_script: str = "bin/start.sh",
+    auto_rollback: bool = True,
 ):
     log(f"=== [部署] {svc.name} -> {server.name}@{server.host}:{server.port} ===")
     connect_kwargs = _make_connect_kwargs(server)
@@ -390,7 +560,7 @@ async def deploy_service(
             if phase_cb:
                 phase_cb("upload_start")
 
-            await _upload_jar(
+            outcome = await _upload_jar(
                 conn, local_jar, svc.remote_dir, svc.remote_name, log,
                 progress_cb=progress_cb,
                 backup_keep=backup_keep,
@@ -402,7 +572,17 @@ async def deploy_service(
             if restart_cmd:
                 if phase_cb:
                     phase_cb("restart_start")
-                await _run_remote_cmd(conn, restart_cmd, log)
+                try:
+                    await _run_remote_cmd(conn, restart_cmd, log)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as restart_err:
+                    # 此刻新版本已覆盖线上、部署前版本在 .bak 里，
+                    # 不兜底的话服务会一直起不来 —— 交给回滚逻辑收尾。
+                    await _rollback_after_restart_failure(
+                        conn, svc.name, outcome, restart_cmd, restart_err,
+                        log, phase_cb, auto_rollback,
+                    )
                 if phase_cb:
                     phase_cb("restart_done")
 
