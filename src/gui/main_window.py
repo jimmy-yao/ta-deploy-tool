@@ -1,49 +1,38 @@
 # ui.py
 import asyncio
 import html as _html
-import os
-import sys
-import time
 import traceback
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal, QSettings, QTimer, QSize
+from PySide6.QtCore import Qt, Signal, QSettings, QSize
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QComboBox, QLabel, QPushButton, QTableWidget,
-    QTableWidgetItem, QPlainTextEdit, QProgressBar,
-    QMessageBox, QHeaderView, QCheckBox, QLineEdit,
-    QDialog, QDialogButtonBox, QSplitter, QSizePolicy,
-    QApplication, QMenu, QListWidget, QListWidgetItem,
-    QFrame, QScrollArea,
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QPlainTextEdit,
+    QMessageBox, QCheckBox, QLineEdit,
+    QDialog, QSplitter,
+    QApplication, QMenu, QTreeWidget, QTreeWidgetItem,
+    QFrame,
 )
 
 from src.core.builder import resolve_branch
-from src.models.config import load_config
+from src.models.config import load_config, group_services_by_server
 from src.gui.config_dialog import ConfigEditorDialog
-from src.core.deployer import list_remote_backups, rollback_service, tail_remote_log
-from src.models.exceptions import DeployError
+from src.core.deployer import rollback_service
 from src.core.pipeline import DeployPipeline
 from src.gui.theme import apply_theme
 from src.gui.widgets import (
     is_known_error,
     find_app_icon,
-    resource_path,
-    StatusBadge,
     LabeledCombo,
     ServiceItemWidget,
-    ActionCardWidget,
+    ServerGroupWidget,
     CurrentActionCard,
     SETTINGS_ORG,
     SETTINGS_APP,
-    APP_ICON_NAME,
 )
 from src.gui.log_dialog import RemoteLogDialog
 from src.gui.rollback_dialog import RollbackDialog, ManualBranchDialog
-
-
-
 
 
 # ============================================================
@@ -82,8 +71,13 @@ class MainWindow(QMainWindow):
         self._branch_task = None
         self._resolved_branches = {}
         self._service_items = {}
+        # 侧边栏分组：组名 -> ServerGroup（配置数据） / 组名 -> ServerGroupWidget（组头）
+        self._groups = {}
+        self._group_widgets = {}
         self.service_check_states = {}
         self._global_branch_override = None
+        # 服务级「手动指定分支」：{服务名: 分支/commit}，仅本次会话生效，不写入配置文件
+        self._service_branch_overrides = {}
 
         self._build_ui()
         self._load_services()
@@ -149,28 +143,33 @@ class MainWindow(QMainWindow):
         self.branch_combo.currentIndexChanged.connect(self._on_branch_combo_changed)
         layout.addWidget(self.branch_combo)
 
-        # 更多
-        more_btn = QPushButton("⋯")
-        more_btn.setObjectName("IconButton")
-        more_btn.setFixedWidth(36)
-        more_btn.setToolTip("更多操作")
-        more_btn.clicked.connect(self._on_more_menu)
-        layout.addWidget(more_btn)
-
         # 主题切换
         self.theme_combo = LabeledCombo("主题:")
         self.theme_combo.setFixedWidth(140)
-        self.theme_combo.addItem("深色", "dark")
+        self.theme_combo.addItem("护眼 (豆沙绿)", "care")
         self.theme_combo.addItem("浅色", "light")
-        self.theme_combo.addItem("青蓝 (护眼)", "oceanic")
+        self.theme_combo.addItem("青蓝", "oceanic")
 
         settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        saved_mode = settings.value("theme", "dark")
+        saved_mode = settings.value("theme", "care")
         idx = self.theme_combo.findData(saved_mode)
         if idx >= 0:
             self.theme_combo.setCurrentIndex(idx)
         self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
         layout.addWidget(self.theme_combo)
+
+        # 刷新分支 / 重新加载配置（独立入口）
+        refresh_btn = QPushButton("↻  刷新分支")
+        refresh_btn.setObjectName("GhostButton")
+        refresh_btn.setToolTip("重新解析各服务的最新分支（Ctrl+R）")
+        refresh_btn.clicked.connect(self._on_refresh_branches)
+        layout.addWidget(refresh_btn)
+
+        reload_btn = QPushButton("⟳  重新加载配置")
+        reload_btn.setObjectName("GhostButton")
+        reload_btn.setToolTip("重新读取 config.yaml 并刷新服务列表")
+        reload_btn.clicked.connect(self._reload_config)
+        layout.addWidget(reload_btn)
 
         layout.addStretch()
 
@@ -215,9 +214,13 @@ class MainWindow(QMainWindow):
         self.filter_edit.textChanged.connect(self._on_filter_changed)
         layout.addWidget(self.filter_edit)
 
-        self.service_list = QListWidget()
+        self.service_list = QTreeWidget()
         self.service_list.setObjectName("SidebarList")
-        self.service_list.setSelectionMode(QListWidget.SingleSelection)
+        self.service_list.setColumnCount(1)
+        self.service_list.setHeaderHidden(True)
+        self.service_list.setRootIsDecorated(True)
+        self.service_list.setIndentation(18)
+        self.service_list.setSelectionMode(QTreeWidget.SingleSelection)
         self.service_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.service_list.customContextMenuRequested.connect(self._on_service_context_menu)
         layout.addWidget(self.service_list, 1)
@@ -325,33 +328,126 @@ class MainWindow(QMainWindow):
             if name not in self.service_check_states:
                 self.service_check_states[name] = True
 
-        self.service_list.clear()
-        self._service_items.clear()
+        self._clear_service_list()
 
-        for name, svc in env.services.items():
-            if keyword and keyword not in name.lower():
+        for group in group_services_by_server(env):
+            # 筛选同时匹配服务名与服务器名：输入服务器名可直接列出该服务器全部服务
+            server_hit = bool(keyword) and keyword in group.name.lower()
+            visible = [
+                n for n in group.services
+                if not keyword or server_hit or keyword in n.lower()
+            ]
+            if not visible:
+                # 没有可见服务的组不渲染（筛选过滤 / 该服务器本就没有服务）
                 continue
 
-            status = "idle"
-            w = ServiceItemWidget(
-                name=name,
-                status=status,
-                build_no=None,
-                deploy_no=None,
-            )
-            w.set_checked(self.service_check_states.get(name, True))
-            w.toggled.connect(
-                lambda checked, n=name: self._on_service_toggled(n, checked)
+            gw = ServerGroupWidget(group.name, group.detail)
+            if group.server is None:
+                if group.detail:
+                    gw.setToolTip(f"配置错误：服务引用了未定义的服务器 {group.detail}")
+            elif group.server.host:
+                gw.setToolTip(
+                    f"{group.server.user}@{group.server.host}:{group.server.port}"
+                    if group.server.user
+                    else f"{group.server.host}:{group.server.port}"
+                )
+            gw.toggled.connect(
+                lambda checked, g=group.name: self._on_group_toggled(g, checked)
             )
 
-            item = QListWidgetItem(self.service_list)
-            item.setSizeHint(QSize(0, 60))
-            self.service_list.addItem(item)
-            self.service_list.setItemWidget(item, w)
-            self._service_items[name] = w
+            top = QTreeWidgetItem(self.service_list)
+            # 不要给 item 设文本：delegate 会把它画在透明的自定义控件（组头/服务行）
+            # 底下，导致名称显示两遍。名称的逻辑取值统一走 UserRole。
+            top.setData(0, Qt.UserRole, group.name)
+            top.setSizeHint(0, QSize(0, 40))
+            self.service_list.setItemWidget(top, 0, gw)
+            self._groups[group.name] = group
+            self._group_widgets[group.name] = gw
+
+            for name in visible:
+                w = ServiceItemWidget(
+                    name=name,
+                    status="idle",
+                    build_no=None,
+                    deploy_no=None,
+                )
+                w.set_checked(self.service_check_states.get(name, True))
+                w.toggled.connect(
+                    lambda checked, n=name: self._on_service_toggled(n, checked)
+                )
+
+                child = QTreeWidgetItem(top)
+                # 同上：不设 item 文本，避免与 ServiceItemWidget 的名称标签重影
+                child.setData(0, Qt.UserRole, name)
+                child.setSizeHint(0, QSize(0, 60))
+                self.service_list.setItemWidget(child, 0, w)
+                self._service_items[name] = w
+
+        self.service_list.expandAll()
+        self._refresh_group_headers()
+
+    def _clear_service_list(self):
+        """清空侧边栏并销毁 item widget。
+
+        Qt 的 QListWidget/QTreeWidget.clear() 实测**不会**销毁 setItemWidget
+        挂上去的部件：不清掉的话，每次筛选输入都会泄漏一个旧部件并残留幽灵行。
+        必须先 setParent(None)（立即从 viewport 摘除并隐藏）再 deleteLater。
+        """
+        stale = list(self._service_items.values()) + list(self._group_widgets.values())
+        for w in stale:
+            w.setParent(None)
+            w.deleteLater()
+        self._service_items.clear()
+        self._group_widgets.clear()
+        self._groups.clear()
+        self.service_list.clear()
+
+    def _refresh_group_headers(self):
+        """回填组头三态与计数。
+
+        只统计筛选后**可见**的服务，与组勾选的作用范围保持一致，
+        否则点了组勾选却看不到组头变化。
+        """
+        for group_name, gw in self._group_widgets.items():
+            group = self._groups.get(group_name)
+            if group is None:
+                continue
+            total = 0
+            checked = 0
+            for svc_name in group.services:
+                if svc_name not in self._service_items:
+                    continue          # 被筛选隐藏的服务不参与统计
+                total += 1
+                if self.service_check_states.get(svc_name, True):
+                    checked += 1
+
+            if total and checked == total:
+                state = Qt.Checked
+            elif checked:
+                state = Qt.PartiallyChecked
+            else:
+                state = Qt.Unchecked
+            gw.set_check_state(state)
+            gw.set_count(checked, total)
+
+    def _on_group_toggled(self, group_name: str, checked: bool):
+        """组头勾选：只作用于当前可见（未被筛选隐藏）的服务。"""
+        group = self._groups.get(group_name)
+        if group is None:
+            return
+        for name in group.services:
+            if name not in self._service_items:
+                continue              # 被筛选隐藏的服务保持原状
+            self.service_check_states[name] = checked
+            w = self._service_items[name]
+            w.blockSignals(True)
+            w.set_checked(checked)
+            w.blockSignals(False)
+        self._refresh_group_headers()
 
     def _on_service_toggled(self, name: str, checked: bool):
         self.service_check_states[name] = checked
+        self._refresh_group_headers()
 
     # ============================================================
     # 服务勾选操作
@@ -384,6 +480,8 @@ class MainWindow(QMainWindow):
                 for name in env.services.keys():
                     self.service_check_states[name] = False
 
+        self._refresh_group_headers()
+
     def _set_only_current(self):
         env_name = self.env_combo.currentText()
         env = self.cfg.environments.get(env_name)
@@ -400,6 +498,8 @@ class MainWindow(QMainWindow):
                 w.set_checked(is_checked)
                 w.blockSignals(False)
 
+        self._refresh_group_headers()
+
     def _selected_services(self):
         env_name = self.env_combo.currentText()
         env = self.cfg.environments.get(env_name)
@@ -414,44 +514,6 @@ class MainWindow(QMainWindow):
     def _on_filter_changed(self, _):
         self._load_services()
 
-    # ============================================================
-    # 更多菜单 / 关于
-    # ============================================================
-    def _on_more_menu(self):
-        menu = QMenu(self)
-
-        act_refresh = menu.addAction("刷新分支")
-        act_refresh.setShortcut(QKeySequence("Ctrl+R"))
-        act_refresh.triggered.connect(self._on_refresh_branches)
-
-        act_reload = menu.addAction("重新加载配置")
-        act_reload.triggered.connect(self._reload_config)
-
-        act_clear = menu.addAction("清空日志")
-        act_clear.setShortcut(QKeySequence("Ctrl+L"))
-        act_clear.triggered.connect(self._on_clear_log)
-
-        menu.addSeparator()
-
-        act_rollback = menu.addAction("一键回滚选中的服务")
-        act_rollback.triggered.connect(self._on_rollback_current_service)
-
-        menu.addSeparator()
-
-        act_about = menu.addAction("关于")
-        act_about.triggered.connect(self._on_about)
-
-        sender = self.sender()
-        if sender is not None:
-            menu.exec(sender.mapToGlobal(sender.rect().bottomLeft()))
-
-    def _on_about(self):
-        QMessageBox.information(
-            self, "关于",
-            "TA-DEPLOY-TOOL\n\n"
-            "基于 PySide6 + asyncssh + qasync 的桌面部署工具"
-        )
-
     def _on_branch_combo_changed(self, _):
         data = self.branch_combo.currentData()
         self._global_branch_override = data or None
@@ -460,17 +522,17 @@ class MainWindow(QMainWindow):
     # 主题切换
     # ============================================================
     def _on_theme_changed(self, _):
-        mode = self.theme_combo.currentData() or "dark"
+        mode = self.theme_combo.currentData() or "care"
         app = QApplication.instance()
         if app is not None:
             apply_theme(app, mode=mode)
         QSettings(SETTINGS_ORG, SETTINGS_APP).setValue("theme", mode)
         theme_names = {
-            "dark": "深色",
+            "care": "护眼 (豆沙绿)",
             "light": "浅色",
-            "oceanic": "青蓝 (护眼)",
+            "oceanic": "青蓝",
         }
-        mode_label = theme_names.get(mode, "深色")
+        mode_label = theme_names.get(mode, "护眼 (豆沙绿)")
         self._append_log(
             f"[主题] 已切换为 {mode_label}"
         )
@@ -483,10 +545,34 @@ class MainWindow(QMainWindow):
             self._branch_task.cancel()
         self.service_check_states = {}
         self._global_branch_override = None
+        # 环境切换：清空服务级手动指定，避免不同环境的同名服务互相串味
+        self._service_branch_overrides = {}
         self._load_services()
         self._on_refresh_branches()
+        # 缓存已清空，同步重建下拉，避免残留上一个环境的分支选项
+        self._rebuild_branch_combo()
+
+    @staticmethod
+    def _branch_state(cfg, env_name):
+        """分支解析结果只取决于：git 段 + 当前环境下服务的集合/project_dir/git_branch。
+
+        服务器地址、部署路径、构建参数、日志路径等其余配置怎么改都不影响分支，
+        _reload_config 用它对比新旧配置，决定要不要全量刷新分支。
+        """
+        env = cfg.environments.get(env_name)
+        services = ()
+        if env is not None:
+            services = tuple(sorted(
+                (name, svc.project_dir or "", svc.git_branch or "")
+                for name, svc in env.services.items()
+            ))
+        return (env_name, cfg.git, services)
 
     def _reload_config(self):
+        # 只有「分支相关配置」变化才全量刷新分支：iteration 模式下全量刷新
+        # = 每个服务一次 git ls-remote（N 次网络往返 + 日志刷屏），改个服务器
+        # 地址/部署路径没必要付这个代价；没变则连同下拉候选与已选分支一并保留。
+        old_state = self._branch_state(self.cfg, self.env_combo.currentText())
         try:
             self.cfg = load_config(self.config_path)
             current = self.env_combo.currentText()
@@ -496,19 +582,50 @@ class MainWindow(QMainWindow):
             if current in self.cfg.environments:
                 self.env_combo.setCurrentText(current)
             self.env_combo.blockSignals(False)
-            self._resolved_branches.clear()
-            self.service_check_states = {}
+            branch_changed = old_state != self._branch_state(
+                self.cfg, self.env_combo.currentText()
+            )
+            if branch_changed:
+                self._resolved_branches.clear()
+                # 重建下拉并同步 _global_branch_override（分支配置变了 = 选择回到「(自动)」）
+                self._rebuild_branch_combo()
+            # 保留用户的勾选状态，仅移除配置中已不存在的服务
+            valid = {
+                n for env in self.cfg.environments.values() for n in env.services
+            }
+            self.service_check_states = {
+                n: c for n, c in self.service_check_states.items() if n in valid
+            }
+            self._service_branch_overrides = {
+                n: b for n, b in self._service_branch_overrides.items() if n in valid
+            }
             self._load_services()
-            self._on_refresh_branches()
-            self._append_log("配置已重新加载")
+            if branch_changed:
+                self._on_refresh_branches()
+                self._append_log("配置已重新加载")
+            else:
+                self._append_log("配置已重新加载（分支相关配置未变，跳过分支刷新）")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"加载配置失败: {e}")
 
     def _on_open_config(self):
-        dlg = ConfigEditorDialog(self.cfg, self.config_path, self)
+        self._open_config()
+
+    def _open_config(self, focus_env=None, focus_service=None):
+        dlg = ConfigEditorDialog(
+            self.cfg, self.config_path, self,
+            focus_env=focus_env, focus_service=focus_service,
+        )
         dlg.exec()
         if getattr(dlg, "saved", False):
             self._reload_config()
+
+    def _on_edit_service(self, service_name: str):
+        """右键「编辑服务配置」：直达该环境该服务的配置编辑页。"""
+        self._open_config(
+            focus_env=self.env_combo.currentText(),
+            focus_service=service_name,
+        )
 
     # ============================================================
     # 分支解析
@@ -524,31 +641,73 @@ class MainWindow(QMainWindow):
 
         services = list(env.services.items())
         total = len(services)
+        ok = skipped = failed = 0
+        # name -> 最终分支（或跳过/失败说明），解析完成后统一输出清单
+        results = {}
 
-        for idx, (name, svc) in enumerate(services, 1):
+        log(f"=== [分支] 解析 {env_name} 环境 {total} 个服务的远程分支 ===")
+
+        for name, svc in services:
             if asyncio.current_task().cancelled():
                 return
 
+            # 服务级手动指定优先：不查远程，展示与打包使用同一份值
+            pinned = self._service_branch_overrides.get(name)
+            if pinned:
+                self.branch_signal.emit(name, pinned)
+                log(f"[分支] {name} -> {pinned}（手动指定，跳过远程查询）")
+                results[name] = pinned
+                skipped += 1
+                continue
             if svc.git_branch:
                 self.branch_signal.emit(name, svc.git_branch)
+                log(f"[分支] {name} -> {svc.git_branch}（配置指定）")
+                results[name] = svc.git_branch
+                skipped += 1
                 continue
             if not svc.project_dir:
                 self.branch_signal.emit(name, "(未配置 project_dir)")
+                log(f"[WARN] [分支] {name} 跳过：未配置 project_dir")
+                results[name] = "(跳过: 未配置 project_dir)"
+                skipped += 1
+                continue
+            if not Path(svc.project_dir).is_dir():
+                self.branch_signal.emit(
+                    name, f"(project_dir 不存在: {svc.project_dir})"
+                )
+                log(f"[WARN] [分支] {name} 跳过：project_dir 不存在 {svc.project_dir}")
+                results[name] = "(跳过: project_dir 不存在)"
+                skipped += 1
                 continue
 
             try:
                 branch = await resolve_branch(
                     svc, self.cfg.git, log, self.cfg.log_encoding
                 )
-                self.branch_signal.emit(name, branch)
             except Exception as e:
+                failed += 1
                 self.branch_signal.emit(name, f"解析失败: {e}")
+                log(f"[ERROR] [分支] {name} 解析失败: {e}")
+                results[name] = f"(解析失败: {e})"
+                continue
+
+            self.branch_signal.emit(name, branch)
+            log(f"[分支] {name} -> {branch}")
+            results[name] = branch
+            ok += 1
+
+        log(f"=== [分支] 解析完成：成功 {ok}，跳过 {skipped}，失败 {failed} ===")
+        if results:
+            width = max(len(n) for n in results)
+            for name, val in results.items():
+                log(f"[最新分支] {name.ljust(width)} -> {val}")
 
     def _on_refresh_branches(self):
         if self._branch_task and not self._branch_task.done():
             self._branch_task.cancel()
         self._resolved_branches.clear()
-        self._rebuild_branch_combo()
+        # 不在这里立刻重建下拉：先保留用户当前选择，
+        # 等解析结果回来（_on_branch_resolved）再重建。
         self._branch_task = asyncio.ensure_future(self._refresh_branches_async())
 
     def _rebuild_branch_combo(self):
@@ -564,6 +723,9 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 self.branch_combo.setCurrentIndex(idx)
         self.branch_combo.blockSignals(False)
+        # 信号被 block 期间下拉的当前项可能已变化（例如刷新后只剩「(自动)」），
+        # 手动回写，确保 _global_branch_override 与界面显示永远一致。
+        self._global_branch_override = self.branch_combo.currentData() or None
 
     def _on_branch_resolved(self, name: str, branch: str):
         self._resolved_branches[name] = branch
@@ -601,6 +763,7 @@ class MainWindow(QMainWindow):
             ("[更新]",     "#22D3EE"),
             ("[保留]",     "#F59E0B"),
             ("[识别]",     "#22D3EE"),
+            ("[最新分支]", "#22D3EE"),
             ("[计划]",     "#8B5CF6"),
             ("[git]",      "#A78BFA"),
             ("[env]",      "#6B7280"),
@@ -648,9 +811,16 @@ class MainWindow(QMainWindow):
 
         if "失败" in status or "错误" in status:
             w.set_status("critical", "Critical")
-        elif "构建完成" in status or "部署完成" in status or "重启完成" in status or "上传完成" in status or "回滚完成" in status:
+        elif ("构建完成" in status or "部署完成" in status or "重启完成" in status
+              or "上传完成" in status or "回滚完成" in status):
             w.set_status("healthy", "Healthy")
-        elif "上传" in status or "构建" in status or "更新分支" in status or "回滚" in status:
+        elif "回滚" in status:
+            w.set_status("deploying", "Rollbacking...")
+        elif "上传" in status or "重启" in status:
+            # 部署阶段（上传 jar / 执行重启命令）：标为部署中，
+            # 此前误落到「构建」分支显示 Building，单服务部署时尤其明显
+            w.set_status("deploying", "Deploying...")
+        elif "构建" in status or "更新分支" in status or "更新完成" in status:
             w.set_status("building", "Building...")
 
     # ============================================================
@@ -685,12 +855,33 @@ class MainWindow(QMainWindow):
     # ============================================================
     # 任务启动
     # ============================================================
-    def _start_task(self, do_build: bool, do_deploy: bool):
+    def _build_branch_overrides(self, selected) -> dict:
+        """构造传给打包管线的分支覆盖表。
+
+        优先级：服务级手动指定 > 顶部分支下拉（对所有选中服务生效）。
+        未覆盖到的服务交给管线实时解析（iteration 模式现查远程最新分支）。
+        """
+        overrides = {}
+        if self._global_branch_override:
+            overrides.update(
+                {name: self._global_branch_override for name in selected}
+            )
+        overrides.update({
+            name: branch
+            for name, branch in self._service_branch_overrides.items()
+            if name in selected and branch
+        })
+        return overrides
+
+    def _start_task(self, do_build: bool, do_deploy: bool, services=None):
+        """启动任务。services 传入显式服务列表（右键单服务任务），
+        为 None 时按侧边栏勾选状态执行。"""
         if self._task and not self._task.done():
+            self._append_log("[任务] 已有任务进行中，忽略本次请求")
             return
 
         env_name = self.env_combo.currentText()
-        selected = self._selected_services()
+        selected = list(services) if services is not None else self._selected_services()
         if not selected:
             QMessageBox.warning(self, "提示", "请至少选择一个服务")
             return
@@ -712,12 +903,13 @@ class MainWindow(QMainWindow):
         self.deploy_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
 
+        scope = ", ".join(selected) if services is not None else "selected services"
         if do_build and do_deploy:
-            title = "Building & Deploying selected services"
+            title = f"Building & Deploying {scope}"
         elif do_build:
-            title = "Building selected services"
+            title = f"Building {scope}"
         else:
-            title = "Deploying selected services"
+            title = f"Deploying {scope}"
         self.action_card.start(title)
 
         for name in selected:
@@ -728,14 +920,9 @@ class MainWindow(QMainWindow):
                     "Building..." if do_build else "Deploying..."
                 )
 
-        overrides = {
-            name: self._resolved_branches[name]
-            for name in selected
-            if name in self._resolved_branches
-        }
-        if self._global_branch_override:
-            for name in selected:
-                overrides[name] = self._global_branch_override
+        # 分支决策：服务级手动指定 > 顶部分支下拉 > 无（打包阶段实时解析最新分支）
+        # _resolved_branches 仅用于界面展示，不参与决策
+        overrides = self._build_branch_overrides(selected)
 
         def log(text):
             self.log_signal.emit(text)
@@ -772,6 +959,14 @@ class MainWindow(QMainWindow):
     def _on_deploy_clicked(self):
         self._start_task(do_build=False, do_deploy=True)
 
+    def _on_build_service(self, service_name: str):
+        """右键：仅打包该服务（不受侧边栏勾选状态影响）。"""
+        self._start_task(do_build=True, do_deploy=False, services=[service_name])
+
+    def _on_deploy_service(self, service_name: str):
+        """右键：仅部署该服务（不受侧边栏勾选状态影响）。"""
+        self._start_task(do_build=False, do_deploy=True, services=[service_name])
+
     def _on_cancel_clicked(self):
         if self.pipeline:
             self.pipeline.cancel()
@@ -787,30 +982,95 @@ class MainWindow(QMainWindow):
         item = self.service_list.itemAt(pos)
         if not item:
             return
-        w = self.service_list.itemWidget(item)
+        # QTreeWidget.itemWidget 需要 (item, column) 两个参数（QListWidget 才是单参）
+        w = self.service_list.itemWidget(item, 0)
         if not w:
             return
-        svc_name = w.name()
 
+        if isinstance(w, ServerGroupWidget):
+            self._on_group_context_menu(pos, item, w)
+            return
+
+        svc_name = w.name()
+        self._service_context_menu(svc_name).exec(
+            self.service_list.mapToGlobal(pos)
+        )
+
+    def _service_context_menu(self, svc_name: str) -> QMenu:
+        """服务行右键菜单：任务 / 日常操作 / 维护 三组语义分组。
+
+        「打包此服务 / 部署此服务」使用显式服务列表执行，
+        不受侧边栏勾选状态影响。
+        """
         menu = QMenu(self)
-        act_log = menu.addAction(f"📖 查看远程实时日志 ({svc_name})")
-        act_log.triggered.connect(lambda: self._on_view_remote_log(svc_name))
+
+        # —— 组 1：任务 ——
+        act_build = menu.addAction("📦 打包此服务")
+        act_build.triggered.connect(lambda: self._on_build_service(svc_name))
+        act_deploy = menu.addAction("🚀 部署此服务")
+        act_deploy.triggered.connect(lambda: self._on_deploy_service(svc_name))
+
         menu.addSeparator()
-        act_rollback = menu.addAction(f"↺ 一键回滚 ({svc_name})")
+
+        # —— 组 2：日常操作 ——
+        pinned = self._service_branch_overrides.get(svc_name)
+        act_branch = menu.addAction(
+            "🌿 手动指定分支" + (f" — 当前: {pinned}" if pinned else "")
+        )
+        act_branch.triggered.connect(lambda: self._on_manual_branch(svc_name))
+        act_log = menu.addAction("📖 查看远程实时日志")
+        act_log.triggered.connect(lambda: self._on_view_remote_log(svc_name))
+
+        menu.addSeparator()
+
+        # —— 组 3：维护 ——
+        act_rollback = menu.addAction("↺ 一键回滚")
         act_rollback.triggered.connect(lambda: self._on_rollback_service(svc_name))
+        act_edit = menu.addAction("⚙ 编辑服务配置")
+        act_edit.triggered.connect(lambda: self._on_edit_service(svc_name))
+
+        return menu
+
+    def _on_group_context_menu(self, pos, item, gw: ServerGroupWidget):
+        """组头右键：整组勾选 + 展开/折叠。"""
+        group_name = gw.group_name()
+        menu = QMenu(self)
+
+        act_all = menu.addAction(f"✅ 勾选整组 ({group_name})")
+        act_all.triggered.connect(lambda: self._on_group_toggled(group_name, True))
+        act_none = menu.addAction(f"❎ 取消整组 ({group_name})")
+        act_none.triggered.connect(lambda: self._on_group_toggled(group_name, False))
+        menu.addSeparator()
+
+        expanded = item.isExpanded()
+        act_exp = menu.addAction("📁 折叠该组" if expanded else "📂 展开该组")
+        act_exp.triggered.connect(lambda: item.setExpanded(not expanded))
         menu.exec(self.service_list.mapToGlobal(pos))
+
+    def _on_manual_branch(self, service_name: str):
+        """为单个服务手动指定分支/commit；输入留空并确定则清除指定，恢复自动解析。"""
+        current = (
+            self._service_branch_overrides.get(service_name)
+            or self._resolved_branches.get(service_name, "")
+        )
+        dlg = ManualBranchDialog(self, service_name, current=current)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        branch = dlg.branch().strip()
+        if branch:
+            self._service_branch_overrides[service_name] = branch
+            self._resolved_branches[service_name] = branch
+            self._rebuild_branch_combo()
+            self._append_log(f"[分支] {service_name} 手动指定为: {branch}（打包时使用）")
+        elif self._service_branch_overrides.pop(service_name, None):
+            self._append_log(f"[分支] {service_name} 已清除手动指定，恢复自动解析")
+            self._on_refresh_branches()
 
     def _on_view_remote_log(self, service_name: str):
         env_name = self.env_combo.currentText()
         dlg = RemoteLogDialog(self.cfg, env_name, service_name, self)
         dlg.show()
-
-    def _on_rollback_current_service(self):
-        selected = self._selected_services()
-        if not selected:
-            QMessageBox.warning(self, "提示", "请先在侧边栏选中一个服务")
-            return
-        self._on_rollback_service(selected[0])
 
     def _on_rollback_service(self, service_name: str):
         if self._task and not self._task.done():
@@ -876,254 +1136,4 @@ class MainWindow(QMainWindow):
             self._task.cancel()
         if self._branch_task and not self._branch_task.done():
             self._branch_task.cancel()
-        super().closeEvent(event)
-
-
-class ManualBranchDialog(QDialog):
-    def __init__(self, parent, service_name: str, current: str = ""):
-        super().__init__(parent)
-        self.setWindowTitle(f"手动指定分支 - {service_name}")
-        self.resize(420, 140)
-
-        if parent is not None:
-            icon = parent.windowIcon()
-            if not icon.isNull():
-                self.setWindowIcon(icon)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
-        layout.addWidget(QLabel(f"服务: {service_name}"))
-        layout.addWidget(QLabel("输入分支名（留空表示恢复自动解析）:"))
-        self.edit = QLineEdit(current)
-        layout.addWidget(self.edit)
-
-        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        box.accepted.connect(self.accept)
-        box.rejected.connect(self.reject)
-        layout.addWidget(box)
-
-    def branch(self) -> str:
-        return self.edit.text()
-
-
-class RollbackDialog(QDialog):
-    def __init__(self, cfg, env_name: str, service_name: str, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"一键回滚 - {service_name}")
-        self.resize(520, 360)
-
-        if parent is not None:
-            icon = parent.windowIcon()
-            if not icon.isNull():
-                self.setWindowIcon(icon)
-
-        self.cfg = cfg
-        self.env_name = env_name
-        self.service_name = service_name
-        self.selected_backup = None
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
-
-        layout.addWidget(QLabel(f"服务名称: <b>{service_name}</b> (环境: {env_name})"))
-        layout.addWidget(QLabel("请选择要恢复的远程历史备份版本:"))
-
-        self.status_label = QLabel("正在查询远程服务器历史备份包...")
-        self.status_label.setStyleSheet("color: #6B7280; font-style: italic;")
-        layout.addWidget(self.status_label)
-
-        self.backup_list = QListWidget()
-        layout.addWidget(self.backup_list, 1)
-
-        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.ok_btn = box.button(QDialogButtonBox.Ok)
-        self.ok_btn.setText("确定回滚")
-        self.ok_btn.setEnabled(False)
-        box.accepted.connect(self._on_accept)
-        box.rejected.connect(self.reject)
-        layout.addWidget(box)
-
-        asyncio.ensure_future(self._load_backups_async())
-
-    async def _load_backups_async(self):
-        env = self.cfg.environments.get(self.env_name)
-        if not env:
-            self.status_label.setText("未找到对应环境")
-            return
-        svc = env.services.get(self.service_name)
-        if not svc:
-            self.status_label.setText("未找到对应服务")
-            return
-        try:
-            server = env.resolve_server(svc)
-            backups = await list_remote_backups(server, svc)
-            self.backup_list.clear()
-            if not backups:
-                self.status_label.setText("远程服务器上未找到任何历史备份包 (.bak.*)")
-            else:
-                self.status_label.setText(f"共获取到 {len(backups)} 个历史备份，请选择要恢复的目标版本:")
-                for b in backups:
-                    self.backup_list.addItem(b)
-                self.backup_list.setCurrentRow(0)
-                self.ok_btn.setEnabled(True)
-        except Exception as e:
-            self.status_label.setText(f"获取备份失败: {e}")
-
-    def _on_accept(self):
-        item = self.backup_list.currentItem()
-        if item:
-            self.selected_backup = item.text()
-            self.accept()
-
-
-class RemoteLogDialog(QDialog):
-    log_signal = Signal(str)
-
-    def __init__(self, cfg, env_name: str, service_name: str, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"📖 远程实时日志 - {service_name} [{env_name}]")
-        self.resize(850, 550)
-
-        if parent is not None:
-            icon = parent.windowIcon()
-            if not icon.isNull():
-                self.setWindowIcon(icon)
-
-        self.cfg = cfg
-        self.env_name = env_name
-        self.service_name = service_name
-        self._task = None
-        self._is_paused = False
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
-
-        # 顶部控制栏
-        top_bar = QHBoxLayout()
-        top_bar.setSpacing(8)
-
-        env = self.cfg.environments.get(env_name)
-        svc = env.services.get(service_name) if env else None
-        server = env.resolve_server(svc) if (env and svc) else None
-
-        info_str = f"服务: <b>{service_name}</b> | 服务器: <b>{server.host if server else '未知'}</b>"
-        top_bar.addWidget(QLabel(info_str))
-
-        top_bar.addStretch()
-
-        default_log = (svc.log_path if (svc and svc.log_path) else f"{svc.remote_dir}/logs/info.log") if svc else ""
-
-        # 快捷日志切换下拉框
-        self.preset_combo = QComboBox()
-        self.preset_combo.setToolTip("快捷选择常用日志文件")
-        remote_base = svc.remote_dir if svc else ""
-        self.preset_combo.addItem("📄 info.log", f"{remote_base}/logs/info.log")
-        self.preset_combo.addItem("⚠️ error.log", f"{remote_base}/logs/error.log")
-        self.preset_combo.addItem("📂 所有日志 (*.log)", f"{remote_base}/logs/*.log")
-        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
-        top_bar.addWidget(self.preset_combo)
-
-        self.path_edit = QLineEdit(default_log)
-        self.path_edit.setPlaceholderText("日志相对或绝对路径")
-        self.path_edit.setToolTip("修改路径后点击【重新连接】即可实时查看")
-        self.path_edit.setFixedWidth(220)
-        top_bar.addWidget(self.path_edit)
-
-        reconnect_btn = QPushButton("↻ 重新连接")
-        reconnect_btn.clicked.connect(self._start_tail)
-        top_bar.addWidget(reconnect_btn)
-
-        self.pause_btn = QPushButton("⏸ 暂停")
-        self.pause_btn.clicked.connect(self._toggle_pause)
-        top_bar.addWidget(self.pause_btn)
-
-        clear_btn = QPushButton("🗑 清空")
-        clear_btn.clicked.connect(self._clear_log)
-        top_bar.addWidget(clear_btn)
-
-        self.auto_scroll_check = QCheckBox("自动滚底")
-        self.auto_scroll_check.setChecked(True)
-        top_bar.addWidget(self.auto_scroll_check)
-
-        layout.addLayout(top_bar)
-
-        # 日志文本区域
-        self.log_text = QPlainTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setMaximumBlockCount(3000)
-        self.log_text.setStyleSheet(
-            "QPlainTextEdit {"
-            "background-color: #1E1E1E;"
-            "color: #D4D4D4;"
-            "font-family: 'Consolas', 'Courier New', monospace;"
-            "font-size: 12px;"
-            "border: 1px solid #333333;"
-            "border-radius: 4px;"
-            "padding: 6px;"
-            "}"
-        )
-        layout.addWidget(self.log_text, 1)
-
-        self.log_signal.connect(self._append_log)
-        self._start_tail()
-
-    def _on_preset_changed(self, index: int):
-        target_path = self.preset_combo.currentData()
-        if target_path:
-            self.path_edit.setText(target_path)
-            self._start_tail()
-
-    def _toggle_pause(self):
-        self._is_paused = not self._is_paused
-        self.pause_btn.setText("▶ 恢复" if self._is_paused else "⏸ 暂停")
-
-    def _clear_log(self):
-        self.log_text.clear()
-
-    def _append_log(self, line: str):
-        if self._is_paused:
-            return
-        self.log_text.appendPlainText(line)
-        if self.auto_scroll_check.isChecked():
-            sb = self.log_text.verticalScrollBar()
-            sb.setValue(sb.maximum())
-
-    def _start_tail(self):
-        if self._task and not self._task.done():
-            self._task.cancel()
-
-        env = self.cfg.environments.get(self.env_name)
-        if not env:
-            self._append_log("[错误] 未找到环境配置")
-            return
-        svc = env.services.get(self.service_name)
-        if not svc:
-            self._append_log("[错误] 未找到服务配置")
-            return
-        server = env.resolve_server(svc)
-
-        # 临时更新使用的 log_path
-        custom_path = self.path_edit.text().strip()
-        if custom_path:
-            svc.log_path = custom_path
-
-        def cb(line):
-            self.log_signal.emit(line)
-
-        async def runner():
-            try:
-                await tail_remote_log(server, svc, cb)
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                cb(f"\n[错误] SSH 实时日志接收中断: {e}")
-
-        self._task = asyncio.ensure_future(runner())
-
-    def closeEvent(self, event):
-        if self._task and not self._task.done():
-            self._task.cancel()
         super().closeEvent(event)

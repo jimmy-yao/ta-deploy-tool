@@ -135,7 +135,8 @@ def main():
 
     # ---------- 主题 ----------
     settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
-    saved_mode = settings.value("theme", "light")
+    # 旧值 "dark" 主题已删除：apply_theme 对 "dark"/未知值统一回退到 care
+    saved_mode = settings.value("theme", "care")
     apply_theme(app, mode=saved_mode)
 
     # ---------- 事件循环 ----------

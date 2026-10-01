@@ -13,6 +13,7 @@ dist/
 # 临时日志与缓存
 crash.log
 *.log
+*.tmp
 scratch/
 .pytest_cache/
 
@@ -21,12 +22,3 @@ scratch/
 .idea/
 *.swp
 .DS_Store
-
-# 本地机密配置（含服务器明文口令，严禁提交）
-config.yaml
-config.local.yaml
-*.secret.yaml
-.env
-.env.*
-secrets/
-bootstrap.py

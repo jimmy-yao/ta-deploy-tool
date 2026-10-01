@@ -129,28 +129,55 @@ async def resolve_latest_iteration_branch(
     encoding: str = "utf-8",
     timeout: int = 60,
 ) -> str:
+    # 正则先校验、再发起网络请求：手改 config.yaml 带进来的非法正则
+    # 只能抛 GitError（DeployError 一族），否则 re.error 不被 is_known_error
+    # 识别，界面会直接把一堆堆栈糊给用户。
+    try:
+        regex = re.compile(pattern)
+    except re.error as e:
+        raise GitError(
+            f"iteration_pattern 正则非法: '{pattern}'（{e}）"
+            f"，请修正后重试"
+        ) from e
+
     branches = await list_remote_branches(
         project_dir, remote, log, encoding, timeout
     )
 
-    regex = re.compile(pattern)
     candidates = []
     for b in branches:
         m = regex.match(b)
         if not m:
             continue
-        num_str = m.group(1)
+        if regex.groups >= 1:
+            num_str = m.group(1)
+        else:
+            # 正则没有捕获组（validate_config 在保存配置时已拦截，这里为
+            # 手改 config.yaml 的旧配置兜底）：退化为取匹配文本里的第一段数字，
+            # 避免 m.group(1) 抛 IndexError 让构建阶段崩在一个看不懂的堆栈上。
+            digit = re.search(r"\d+", m.group(0))
+            if digit is None:
+                continue
+            num_str = digit.group(0)
         try:
             num = int(num_str)
-        except ValueError:
+        except (TypeError, ValueError):
+            # 捕获组没参与匹配（可选组返回 None）或捕获的不是纯数字
             continue
         candidates.append((num, b))
 
     if not candidates:
-        raise GitError(
+        msg = (
             f"远程仓库 ({remote}) 未找到匹配模式 '{pattern}' 的迭代分支。"
             f"已有分支: {branches[:5]}..."
         )
+        if regex.groups < 1:
+            msg += (
+                f"；且该模式没有捕获组，无法从中解析迭代号，"
+                f"请把要比较的数字放进一对圆括号，"
+                f"例如 ^feature_(\\d{{8}})_xc$"
+            )
+        raise GitError(msg)
 
     candidates.sort(key=lambda x: x[0])
     latest_branch = candidates[-1][1]

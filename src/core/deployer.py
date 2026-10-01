@@ -1,32 +1,137 @@
 # deployer.py
 import asyncio
 import os
+import re
 from datetime import datetime
 from typing import Callable, Optional
 
 import asyncssh
 
-from src.models.config import ServerConfig, ServiceConfig, resolve_restart_cmd
+from src.models.config import (
+    ServerConfig,
+    ServiceConfig,
+    quote_remote_path,
+    resolve_restart_cmd,
+)
 from src.models.exceptions import DeployExecuteError
 
 LogFn = Callable[[str], None]
 ProgressCb = Callable[[int, int], None]
 PhaseCb = Callable[[str], None]
 
+# 超时控制（秒），避免网络半开 / 远程脚本等待输入导致任务永久挂起
+CONNECT_TIMEOUT = 30    # TCP 建连超时
+LOGIN_TIMEOUT = 60      # SSH 握手与认证超时（asyncssh 默认 120，这里收紧）
+REMOTE_CMD_TIMEOUT = 300  # 单条远程命令（如重启脚本）最长执行时间
+
+# 含通配符的日志路径必须原样交给 shell 展开，无法整体加引号，
+# 因此只放行无需转义的字符（空格、引号、; & | $ ` 等一律拒绝）。
+# 结尾用 \Z 而不是 $：Python 的 $ 会放行“单个尾换行”，换行在 shell 里
+# 是命令分隔符，会把命令切出一行（虽然后面只剩固定的 2>&1，仍不该放行）。
+_GLOB_SAFE_PATH = re.compile(r"^[A-Za-z0-9_./*?\[\]~-]+\Z")
+
 
 def _timestamp_ms() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S.%f")[:-3]
 
 
-async def _ensure_remote_dir(sftp, remote_dir: str):
-    parts = remote_dir.strip("/").split("/")
-    current = ""
-    for part in parts:
-        current += "/" + part
+def _normalize_remote_dir(remote_dir: str) -> str:
+    """规范化远端目录路径。
+
+    - 统一按 '/' 切分（反斜杠也当分隔符，避免 Windows 风格路径原样落到远端）
+    - 折叠重复斜杠、丢弃空段与 '.'，并向上消化 '..'
+    - **保留绝对 / 相对语义**：原本相对的路径仍然相对 SFTP 家目录，与 shell 里
+      `cd remote_dir` 的行为一致（旧实现一律拼成绝对路径，相对配置会出现
+      “目录建在 /xxx、部署写进家目录”的错位）
+    - 空路径直接报错，绝不落到 `mkdir /` 这种危险操作上
+    """
+    raw = (remote_dir or "").strip().replace("\\", "/")
+    if not raw:
+        raise DeployExecuteError("remote_dir 为空，无法确定远端目录")
+
+    absolute = raw.startswith("/")
+    segs = []
+    for seg in raw.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if segs and segs[-1] != "..":
+                segs.pop()
+            elif not absolute:
+                # 相对路径可以合法地以 .. 开头，保留
+                segs.append(seg)
+            continue
+        segs.append(seg)
+
+    if not segs:
+        if absolute:
+            return "/"
+        raise DeployExecuteError(f"远端目录无效: {remote_dir!r}")
+
+    return ("/" if absolute else "") + "/".join(segs)
+
+
+async def _expand_remote_home(sftp, path: str) -> str:
+    """把 `~/xxx` 解析成真实的远端家目录。
+
+    SFTP 协议本身不展开 `~`：旧实现会把 `~/app` 当成普通路径段，建出 `/~`
+    这种目录，而 shell 侧的重启命令却真的展开到家目录，两边指向完全不同的位置。
+    """
+    if not path.startswith("~"):
+        return path
+    if path.split("/", 1)[0] != "~":
+        raise DeployExecuteError(
+            f"远端目录不支持 ~其他用户 的写法: {path!r}"
+            f"（SFTP 无法确定该用户的家目录，请改用绝对路径）"
+        )
+    try:
+        home = await sftp.realpath(".")
+    except Exception as e:
+        raise DeployExecuteError(
+            f"无法解析远端家目录，路径 {path!r} 请改写为绝对路径（{e}）"
+        ) from e
+
+    base = str(home).rstrip("/")
+    rest = path[1:].lstrip("/")
+    if not rest:
+        return base or "/"
+    return f"{base}/{rest}"
+
+
+async def _ensure_remote_dir(sftp, remote_dir: str) -> str:
+    """逐级创建远端目录，返回规范化后的路径。可安全并发调用。"""
+    path = await _expand_remote_home(sftp, _normalize_remote_dir(remote_dir))
+    if path == "/":
+        return path
+
+    current = "/" if path.startswith("/") else ""
+    for seg in path.strip("/").split("/"):
+        if not current:
+            current = seg
+        elif current == "/":
+            current = "/" + seg
+        else:
+            current = current + "/" + seg
+
         try:
             await sftp.stat(current)
+            continue
         except asyncssh.SFTPError:
+            pass
+
+        try:
             await sftp.mkdir(current)
+        except asyncssh.SFTPError as e:
+            # TOCTOU：stat 与 mkdir 之间该层可能已被并发部署的连接创建，
+            # 复查一次存在即可；仍不存在才把失败明确抛出去。
+            try:
+                await sftp.stat(current)
+            except asyncssh.SFTPError:
+                raise DeployExecuteError(
+                    f"创建远端目录失败: {current} ({e})"
+                ) from e
+
+    return path
 
 
 async def _cleanup_old_backups(
@@ -72,7 +177,8 @@ async def _upload_jar(
         raise DeployExecuteError(f"本地 jar 不存在: {local_jar}")
 
     async with conn.start_sftp_client() as sftp:
-        await _ensure_remote_dir(sftp, remote_dir)
+        # 用规范化后的路径，保证备份 / 临时文件 / 目录创建指向同一处
+        remote_dir = await _ensure_remote_dir(sftp, remote_dir)
 
         remote_final = f"{remote_dir}/{remote_name}"
         remote_tmp = remote_final + ".tmp"
@@ -91,6 +197,7 @@ async def _upload_jar(
         else:
             await sftp.put(local_jar, remote_tmp)
 
+        backup_path = None
         try:
             await sftp.stat(remote_final)
             ts = _timestamp_ms()
@@ -99,9 +206,24 @@ async def _upload_jar(
             await sftp.rename(remote_final, backup_path)
             log(f"已备份旧文件: {backup_path}")
         except asyncssh.SFTPError:
-            pass
+            backup_path = None
 
-        await sftp.rename(remote_tmp, remote_final)
+        try:
+            await sftp.rename(remote_tmp, remote_final)
+        except Exception:
+            # 旧文件已被改名为备份、新文件却未能就位时，
+            # 把备份恢复回原名，避免线上 jar 缺失导致服务无法启动。
+            if backup_path:
+                try:
+                    await sftp.rename(backup_path, remote_final)
+                    log(f"[回滚] 新文件替换失败，已恢复原文件: {remote_final}")
+                except Exception as e2:
+                    log(
+                        f"[严重] 新文件替换失败且恢复原文件失败: {e2}。"
+                        f"线上 {remote_final} 当前缺失，请手动处理备份: {backup_path}"
+                    )
+            raise
+
         log(f"上传完成: {remote_final}")
 
         await _cleanup_old_backups(
@@ -109,9 +231,26 @@ async def _upload_jar(
         )
 
 
-async def _run_remote_cmd(conn, cmd: str, log: LogFn):
+async def _run_remote_cmd(
+    conn, cmd: str, log: LogFn, timeout: int = REMOTE_CMD_TIMEOUT
+):
     log(f"$ {cmd}")
-    result = await conn.run(cmd, check=False)
+    try:
+        result = await conn.run(cmd, check=False, timeout=timeout)
+    except asyncio.TimeoutError as e:
+        # asyncssh 的 TimeoutError 继承自 asyncio.TimeoutError，
+        # 并携带超时前已收集到的 stdout/stderr，先回显便于定位卡在哪一步。
+        stdout = getattr(e, "stdout", None)
+        stderr = getattr(e, "stderr", None)
+        if stdout:
+            for line in str(stdout).splitlines():
+                log(line)
+        if stderr:
+            for line in str(stderr).splitlines():
+                log(f"[stderr] {line}")
+        raise DeployExecuteError(
+            f"远程命令超时（超过 {timeout}s 未退出，已中断）: {cmd}"
+        ) from e
 
     if result.stdout:
         for line in str(result.stdout).splitlines():
@@ -134,6 +273,8 @@ def _make_connect_kwargs(server: ServerConfig) -> dict:
         port=server.port,
         username=server.user,
         known_hosts=None,
+        connect_timeout=CONNECT_TIMEOUT,
+        login_timeout=LOGIN_TIMEOUT,
     )
     if server.key:
         connect_kwargs["client_keys"] = [os.path.expanduser(server.key)]
@@ -145,15 +286,34 @@ def _make_connect_kwargs(server: ServerConfig) -> dict:
 async def list_remote_backups(server: ServerConfig, svc: ServiceConfig) -> list:
     kwargs = _make_connect_kwargs(server)
     remote_name = svc.remote_name or (os.path.basename(svc.local_jar) if svc.local_jar else "")
-    prefix = (remote_name + ".bak.") if remote_name else ".bak."
+    if not remote_name:
+        # 前缀无法确定时不能回退成宽松匹配，否则会把同目录下
+        # 其它服务的备份也列出来，回滚时可能选错文件覆盖线上 jar。
+        return []
+    prefix = remote_name + ".bak."
+
+    try:
+        remote_dir = _normalize_remote_dir(svc.remote_dir)
+    except DeployExecuteError:
+        # 目录无效时按“没有备份”处理，弹窗不该因为路径配置问题直接抛异常
+        return []
 
     async with asyncssh.connect(**kwargs) as conn:
         async with conn.start_sftp_client() as sftp:
             try:
-                entries = await sftp.listdir(svc.remote_dir)
+                # SFTP 协议不展开 ~：不先解析的话，`~/app` 会按字面路径查，
+                # 出现“部署/重启正常、回滚弹窗却列不出备份”的不一致。
+                # 解析失败（如 ~other 写法）按“没有备份”处理，不打断弹窗。
+                remote_dir = await _expand_remote_home(sftp, remote_dir)
+                entries = await sftp.listdir(remote_dir)
+            except DeployExecuteError:
+                return []
             except asyncssh.SFTPError:
                 return []
-            backups = [n for n in entries if n.startswith(prefix) or ".bak." in n]
+            backups = [
+                n for n in entries
+                if n.startswith(prefix) and n not in (".", "..")
+            ]
             backups.sort(reverse=True)
             return backups
 
@@ -163,20 +323,35 @@ async def rollback_service(
     svc: ServiceConfig,
     backup_filename: str,
     log: LogFn,
-    default_restart_script: str = "start.sh",
+    default_restart_script: str = "bin/start.sh",
 ):
     remote_name = svc.remote_name or (os.path.basename(svc.local_jar) if svc.local_jar else "")
     if not remote_name:
         raise DeployExecuteError(f"服务 {svc.name} 未指定 remote_name，无法回滚")
 
+    # 备份文件名必须属于本服务，且不允许携带路径分隔符（防穿越 / 防误选其它服务的备份）
+    if any(sep in backup_filename for sep in ("/", "\\")) or backup_filename in (".", ".."):
+        raise DeployExecuteError(
+            f"非法的备份文件名: {backup_filename!r}，已拒绝回滚"
+        )
+    prefix = remote_name + ".bak."
+    if not backup_filename.startswith(prefix):
+        raise DeployExecuteError(
+            f"备份文件名校验失败: {backup_filename!r} 不是服务 {svc.name} 的备份"
+            f"（应以 {prefix} 开头），已拒绝回滚"
+        )
+
     log(f"=== [回滚] {svc.name} -> 使用备份: {backup_filename} ===")
     kwargs = _make_connect_kwargs(server)
 
     async with asyncssh.connect(**kwargs) as conn:
-        src_path = f"{svc.remote_dir}/{backup_filename}"
-        dst_path = f"{svc.remote_dir}/{remote_name}"
-        
-        cp_cmd = f"cp '{src_path}' '{dst_path}'"
+        remote_dir = _normalize_remote_dir(svc.remote_dir)
+        src_path = f"{remote_dir}/{backup_filename}"
+        dst_path = f"{remote_dir}/{remote_name}"
+
+        # 路径里可能有空格 / 引号等字符，直接用单引号包裹会被截断或破裂，
+        # 统一交给 quote_remote_path 做逐段 POSIX 转义。
+        cp_cmd = f"cp {quote_remote_path(src_path)} {quote_remote_path(dst_path)}"
         await _run_remote_cmd(conn, cp_cmd, log)
         log(f"[回滚] 已恢复文件: {backup_filename} -> {remote_name}")
 
@@ -199,7 +374,7 @@ async def deploy_service(
     progress_cb: Optional[ProgressCb] = None,
     phase_cb: Optional[PhaseCb] = None,
     backup_keep: int = 5,
-    default_restart_script: str = "start.sh",
+    default_restart_script: str = "bin/start.sh",
 ):
     log(f"=== [部署] {svc.name} -> {server.name}@{server.host}:{server.port} ===")
     connect_kwargs = _make_connect_kwargs(server)
@@ -246,20 +421,41 @@ async def tail_remote_log(
     svc: ServiceConfig,
     log_cb: Callable[[str], None],
     lines_count: int = 200,
+    log_file: Optional[str] = None,
 ):
+    """查看远程日志。
+
+    `log_file` 为临时覆盖用的路径（例如用户在弹窗里临时输入的路径），
+    不传则回退到 `svc.log_path`，再回退到默认日志路径。
+    传入该参数**不会**修改 `svc`，避免临时路径污染共享配置对象。
+    """
     connect_kwargs = _make_connect_kwargs(server)
 
-    log_file = svc.log_path
+    if not log_file:
+        log_file = svc.log_path
     if not log_file:
         log_file = f"{svc.remote_dir}/logs/info.log"
 
     if not log_file.startswith("/") and not log_file.startswith("~"):
         log_file = f"{svc.remote_dir}/{log_file}"
 
-    if "*" in log_file:
+    try:
+        lines_count = int(lines_count)
+    except (TypeError, ValueError):
+        raise DeployExecuteError(f"非法的行数参数: {lines_count!r}")
+
+    if any(ch in log_file for ch in "*?["):
+        # 通配符需要 shell 展开，因此不能整体加引号；这里只放行本身
+        # 无需转义的字符，遇到空格 / 引号 / ; 等元字符直接拒绝，
+        # 否则命令会被截断或被当成多条命令执行。
+        if not _GLOB_SAFE_PATH.match(log_file):
+            raise DeployExecuteError(
+                f"日志路径含空格或 shell 特殊字符，无法用于通配符匹配: {log_file!r}"
+                f"（请改用不含空格的路径，或填写具体的日志文件名）"
+            )
         cmd = f"tail -n {lines_count} -f {log_file} 2>&1"
     else:
-        cmd = f"tail -n {lines_count} -f '{log_file}' 2>&1"
+        cmd = f"tail -n {lines_count} -f {quote_remote_path(log_file)} 2>&1"
     log_cb(f"[SSH 连接中...] {server.name}@{server.host}:{server.port}")
     log_cb(f"$ {cmd}")
     log_cb("=" * 60)

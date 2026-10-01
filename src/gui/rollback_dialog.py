@@ -23,7 +23,10 @@ class ManualBranchDialog(QDialog):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
 
-        layout.addWidget(QLabel(f"为服务 <b>{service_name}</b> 手动输入 Git 分支 / Commit:"))
+        layout.addWidget(QLabel(
+            f"为服务 <b>{service_name}</b> 手动输入 Git 分支 / Commit："
+            "<br/><span style='color:#9CA3AF'>留空并确定 = 清除已指定的分支，恢复自动解析</span>"
+        ))
 
         self.edit = QLineEdit(current)
         self.edit.setPlaceholderText("例如: main / feature_20260924_xc / 7a2b3c4")

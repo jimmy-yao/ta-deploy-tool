@@ -134,15 +134,15 @@ class RemoteLogDialog(QDialog):
         server = env.resolve_server(svc)
 
         custom_path = self.path_edit.text().strip()
-        if custom_path:
-            svc.log_path = custom_path
 
         def cb(line):
             self.log_signal.emit(line)
 
         async def runner():
             try:
-                await tail_remote_log(server, svc, cb)
+                # 临时输入的路径只作为本次连接的参数传入，
+                # 不写回 svc.log_path，避免污染共享配置对象。
+                await tail_remote_log(server, svc, cb, log_file=custom_path or None)
             except asyncio.CancelledError:
                 pass
             except Exception as e:

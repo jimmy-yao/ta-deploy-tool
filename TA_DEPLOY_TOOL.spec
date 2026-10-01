@@ -4,6 +4,7 @@ from PyInstaller.utils.hooks import collect_submodules
 hiddenimports = ['PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets']
 hiddenimports += collect_submodules('asyncssh')
 hiddenimports += collect_submodules('qasync')
+hiddenimports += collect_submodules('ruamel.yaml')
 
 
 a = Analysis(
