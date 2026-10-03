@@ -4473,6 +4473,8 @@ dependencies = [
  "ta-deploy-tool-config",
  "ta-deploy-tool-gitops",
  "ta-deploy-tool-proc",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

@@ -12,3 +12,7 @@ publish.workspace = true
 ta-deploy-tool-proc.workspace = true
 ta-deploy-tool-config.workspace = true
 ta-deploy-tool-gitops.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

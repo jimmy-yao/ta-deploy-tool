@@ -328,6 +328,16 @@ PyYAML 6.0.1 的 implicit resolver（`yaml/resolver.py`），而且要**按首�
 （`restart_cmd: ""`）保持一致。两者读回来完全等价，选 `""` 只是为了
 让既有 fixture 不必整体改写。
 
+### E. `build_service` 多两条前置检查
+
+| 项 | 基准（Python） | Go | Rust | 理由 |
+|---|---|---|---|---|
+| `project_dir` 不存在 | 走到 `create_subprocess_exec(cwd=坏)` 抛 `FileNotFoundError` → 退回 shell → 再抛 → **`OSError` 直接冒到界面**，不在 `DeployError` 一族，`is_known_error` 认不出来，用户看到的是堆栈 | 有：`本地路径不存在: <dir>` | 同 Go，但文案接在基准那句 `，` 后面：<服务> 构建失败，本地路径不存在: `<dir>` | 坏路径必须是一条**可读的业务错误**，不是异常堆栈 |
+| `maven` 为空 | `list2cmdline([""])` 交给 shell → 执行空命令 → 退出码 127 → 文案「构建失败，退出码 127」，没人看得出是"忘了配 Maven" | 有：`Maven 路径未配置` | 同 Go | 同上；真正的"退出码 127"留给程序真的找不到的场景（见 MIGRATION.md 偏差 19） |
+
+分隔符仍是**中文逗号**（基准 `f"{name} 构建失败，{msg}"`），
+不是 Go 的 `": "` —— 这一条属于「照基准、不照 Go」。
+
 ---
 
 ## 无偏差项（可直接照搬 Go）
@@ -348,7 +358,7 @@ PyYAML 6.0.1 的 implicit resolver（`yaml/resolver.py`），而且要**按首�
 |---|---|---|---|
 | 1 | workspace 骨架 + YAML codec 选型 | — | ✅ |
 | 2 | `proc`、`config` | `internal/proc`、`internal/config` | ✅ |
-| 3 | `builder`、`gitops` | `internal/builder`、`internal/gitops` | |
+| 3 | `builder`、`gitops` | `internal/builder`、`internal/gitops` | ✅ |
 | 4 | `deployer` | `internal/deployer` | |
 | 5 | `pipeline` | `internal/pipeline` | |
 | 6 | `viewmodel`、`ui`、`cli` | `internal/uiapp`、`ui`、`cmd` | |
