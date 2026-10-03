@@ -93,16 +93,21 @@ type EnvironmentConfig struct {
 }
 
 // AppConfig 顶层配置。
+// 字段声明顺序即 YAML 输出顺序，与 Python save_config 的写入顺序一致。
 type AppConfig struct {
-	Maven                string                        `yaml:"maven"`
-	JavaHome             string                        `yaml:"java_home"`
-	Workspace            string                        `yaml:"workspace"`
-	LogEncoding          string                        `yaml:"log_encoding"`
-	BackupKeep           int                           `yaml:"backup_keep"`
-	DefaultRestartScript string                        `yaml:"default_restart_script"`
-	AutoRemoteName       bool                          `yaml:"auto_remote_name"`
-	Git                  GitConfig                     `yaml:"git"`
-	Environments         map[string]*EnvironmentConfig `yaml:"environments"`
+	Maven                string `yaml:"maven"`
+	JavaHome             string `yaml:"java_home"`
+	Workspace            string `yaml:"workspace"`
+	LogEncoding          string `yaml:"log_encoding"`
+	BackupKeep           int    `yaml:"backup_keep"`
+	MaxParallelBuilds    int    `yaml:"max_parallel_builds"`
+	DefaultRestartScript string `yaml:"default_restart_script"`
+	AutoRemoteName       bool   `yaml:"auto_remote_name"`
+	// AutoRollback 重启命令失败时自动把部署前版本放回原位并重新重启一次。
+	// false = 只报错，线上文件保持新版本不动，由人工处理。
+	AutoRollback bool                          `yaml:"auto_rollback"`
+	Git          GitConfig                     `yaml:"git"`
+	Environments map[string]*EnvironmentConfig `yaml:"environments"`
 
 	// Path 是本配置对象的来源文件，Save 时可复用。
 	Path string `yaml:"-"`
@@ -128,13 +133,25 @@ func (c *AppConfig) SetService(envName, svcName string, svc *ServiceConfig) {
 }
 
 // DefaultAppConfig 返回一份最小可用配置（首次启动模板）。
+// 缺省值与 Python AppConfig 的 dataclass 默认值一致（基准: modular-structure）。
 func DefaultAppConfig() *AppConfig {
 	return &AppConfig{
 		LogEncoding:          "utf-8",
 		BackupKeep:           5,
-		DefaultRestartScript: "start.sh",
+		MaxParallelBuilds:    3,
+		DefaultRestartScript: "bin/start.sh",
 		AutoRemoteName:       true,
+		AutoRollback:         true,
 		Git:                  DefaultGitConfig(),
 		Environments:         map[string]*EnvironmentConfig{},
 	}
+}
+
+// EffectiveMaxParallelBuilds 返回本次构建实际可用的最大并发数。
+// 与 Python `max(1, cfg.max_parallel_builds)` 对应：0 或负数一律按 1 处理。
+func (c *AppConfig) EffectiveMaxParallelBuilds() int {
+	if c.MaxParallelBuilds < 1 {
+		return 1
+	}
+	return c.MaxParallelBuilds
 }

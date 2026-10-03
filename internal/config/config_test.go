@@ -453,7 +453,9 @@ func TestDetectFromEnv(t *testing.T) {
 
 func TestDefaultAppConfig(t *testing.T) {
 	c := DefaultAppConfig()
-	if c.BackupKeep != 5 || c.DefaultRestartScript != "start.sh" || !c.AutoRemoteName {
+	if c.BackupKeep != 5 || c.MaxParallelBuilds != 3 ||
+		c.DefaultRestartScript != "bin/start.sh" ||
+		!c.AutoRemoteName || !c.AutoRollback {
 		t.Errorf("默认配置与 Python dataclass 不一致: %+v", c)
 	}
 	if !c.Git.Enabled || c.Git.BranchMode != "fixed" {

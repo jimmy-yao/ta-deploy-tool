@@ -78,14 +78,26 @@ func TestCheckConfigMissingFile(t *testing.T) {
 }
 
 func TestCheckConfigInvalidService(t *testing.T) {
-	// project_dir 为空是模板里已知的占位，必须被检出
-	p := filepath.Join("..", "..", "config.template.yaml")
+	// project_dir 为空必须被检出。
+	// 模板（基准 modular-structure）已填了合法占位路径，因此这里自造一份
+	// project_dir 为空的配置，不再依赖模板内容。
+	yamlSrc := strings.Replace(validConfigYAML,
+		"project_dir: /tmp/demo", "project_dir: \"\"", 1)
+	p := writeFile(t, t.TempDir(), "config.yaml", yamlSrc)
 	err := checkConfig(p)
 	if err == nil {
-		t.Fatal("模板中的空 project_dir 应被检出")
+		t.Fatal("project_dir 为空时应被检出")
 	}
 	if !strings.Contains(err.Error(), "project_dir") {
 		t.Fatalf("错误信息应包含 project_dir: %v", err)
+	}
+}
+
+// TestCheckConfigTemplateIsValid 保证内嵌模板本身是一份合法可校验的配置
+// （基准 modular-structure 的模板 project_dir 已填非空占位值）。
+func TestCheckConfigTemplateIsValid(t *testing.T) {
+	if err := checkConfig(filepath.Join("..", "..", "config.template.yaml")); err != nil {
+		t.Fatalf("内嵌模板应通过校验: %v", err)
 	}
 }
 

@@ -186,7 +186,8 @@ func TestSaveFieldOrderMatchesPython(t *testing.T) {
 
 	wantSeq := []string{
 		"maven:", "java_home:", "workspace:", "log_encoding:",
-		"backup_keep:", "default_restart_script:", "auto_remote_name:",
+		"backup_keep:", "max_parallel_builds:", "default_restart_script:",
+		"auto_remote_name:", "auto_rollback:",
 		"git:", "environments:",
 	}
 	last := -1

@@ -98,7 +98,8 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	order := config.TopoSort(env, p.opts.Selected)
 	p.log("执行顺序: " + strings.Join(order, " -> "))
 
-	hasGit := p.opts.DoBuild && p.opts.UseGit
+	// git.enabled=false 时整体跳过 Git 阶段（与 Python has_git 三条件一致）
+	hasGit := p.opts.DoBuild && p.opts.UseGit && p.opts.Cfg.Git.Enabled
 	hasBuild := p.opts.DoBuild
 	hasDeploy := p.opts.DoDeploy
 

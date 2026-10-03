@@ -153,9 +153,12 @@ func (u *uiWindow) openConfigEditor() {
 	wsEntry := textEntry(clone.Workspace, func(s string) { clone.Workspace = strings.TrimSpace(s) })
 	encEntry := textEntry(clone.LogEncoding, func(s string) { clone.LogEncoding = strings.TrimSpace(s) })
 	keepEntry := intEntry(clone.BackupKeep, func(n int) { clone.BackupKeep = n })
+	parallelEntry := intEntry(clone.MaxParallelBuilds, func(n int) { clone.MaxParallelBuilds = n })
 	restartEntry := textEntry(clone.DefaultRestartScript, func(s string) { clone.DefaultRestartScript = s })
 	autoNameCheck := boolCheck("缺省 remote_name 时自动取 jar 文件名", clone.AutoRemoteName,
 		func(v bool) { clone.AutoRemoteName = v })
+	autoRollbackCheck := boolCheck("重启失败时自动回滚到部署前版本", clone.AutoRollback,
+		func(v bool) { clone.AutoRollback = v })
 
 	detectMaven := widget.NewButton("自动检测 Maven", func() {
 		if p := config.DetectMavenPath(); p != "" {
@@ -191,8 +194,10 @@ func (u *uiWindow) openConfigEditor() {
 		fieldRow("workspace", wsEntry),
 		fieldRow("log_encoding", encEntry),
 		fieldRow("backup_keep", keepEntry),
+		fieldRow("max_parallel_builds", parallelEntry),
 		fieldRow("default_restart_script", restartEntry),
 		fieldRow("auto_remote_name", autoNameCheck),
+		fieldRow("auto_rollback", autoRollbackCheck),
 		widget.NewSeparator(),
 		widget.NewLabel("git"),
 		gitEnabled,
