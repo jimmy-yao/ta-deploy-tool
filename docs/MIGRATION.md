@@ -37,12 +37,23 @@ GBK / GB18030。
 ### 偏差 2：`known_hosts` 主机指纹需要自己解析
 
 Go 用标准库 `golang.org/x/crypto/ssh/knownhosts` 解析 `known_hosts`。
-Rust 的 `russh` 只给 `check_server_key(&PublicKey) -> bool` 回调，
-**不提供文件解析**。
 
-因此 `crates/deployer/src/known_hosts` 必须自己实现：主机名哈希
-（`|1|...`）、通配符、`[host]:port`、按行比对、算法降级，
-并补齐对应测试。功能对齐 Go，实现成本高于 Go。
+Rust 的 `russh` 其实**自带**一套：`Handler::check_server_key` 回调之外还有
+`keys::known_hosts::{check_known_hosts, check_known_hosts_path}`，已实现
+HMAC-SHA1 的 `|1|salt|hash`、`[host]:port`、非 22 端口归一。**但它够不着
+我们的要求**，所以仍然整段自己实现（`crates/deployer/src/known_hosts.rs`）：
+
+| 能力 | `russh` 自带 | 本实现 |
+|---|---|---|
+| 通配符主机名（`*.example.com`） | ❌ `match_hostname` 只做逐字比对 | ✅ OpenSSH 语义（带回溯的 `glob_match`） |
+| `@revoked` / `@cert-authority` 标记 | ❌ 不识别标记；`@revoked` 那行还会让 `parse_public_key_base64` 吃到算法名 → **`Err` 整份文件读不出来** | ✅ `@revoked` 明确拒绝；`@cert-authority` 不当普通钥匙比对 |
+| 算法降级（`rsa-sha2-*` ≡ `ssh-rsa`） | ❌ `pubkey.algorithm() == recorded.algorithm()` 要求逐字相等 | ✅ `normalize_algorithm` 归一 |
+| 坏行 / 格式错的行 | 任何一行 `?` 出错 → **整份文件读不出来** | ✅ 报到行号的可读错误（静默跳过会漏掉一条本该拦住中间人的条目） |
+| 文件不存在 | 静默 `Ok(vec![])` —— 等于**悄悄关掉校验** | ✅ 交调用方报 `开启严格主机校验需要 known_hosts 文件: <path>` |
+| 不匹配时能否区分「没见过」与「钥匙换了」 | 一律 `Err(KeyChanged)` | ✅ `UnknownHost` / `Mismatch` / `Revoked` 三种结论，文案各不相同 |
+
+因此实现成本高于 Go，换来的是一个**功能超集**；配套测试在
+`known_hosts.rs` 的 `mod tests`（含 `ssh-keygen -H` 的真实输出做 fixture）。
 
 ### 偏差 3：Cargo 没有 Go 的 `internal/` 语义
 
@@ -338,6 +349,55 @@ PyYAML 6.0.1 的 implicit resolver（`yaml/resolver.py`），而且要**按首�
 分隔符仍是**中文逗号**（基准 `f"{name} 构建失败，{msg}"`），
 不是 Go 的 `": "` —— 这一条属于「照基准、不照 Go」。
 
+### F. SSH 建连失败一律翻成可读的业务错误
+
+基准 `src/core/deployer.py:589` 只把 `asyncssh.PermissionDenied` 一层包成
+`DeployExecuteError`；连不上、握手不上、主机密钥不通过，异常是直接冒到
+界面的，`is_known_error` 认不出来，用户看到 Python 堆栈。
+
+| 项 | 基准（Python） | Go | Rust | 理由 |
+|---|---|---|---|---|
+| TCP 连不上 / 握手失败 | `ConnectionResetError`、`DisconnectError` 等原样冒上去 | 有：`SSH 连接失败 <host>:<port>: …` / `SSH 握手失败 <host>:<port>: …` | 同 Go 的两个前缀；超时另外说人话（`连接超时（超过 30s 未建立 TCP 连接）` / `握手或认证超过 60s 未完成`）—— Go 这两处只剩 `net` 包的英文 `i/o timeout` | 连不上是网络 / 防火墙，握手不上是负载或算法不匹配 —— 混成一句「连接失败」会让运维往错的方向查 |
+| `host` 没配 | 不检查，空 host 丢给 asyncssh → 连接异常堆栈 | 有：`服务器 <name> 未配置 host` | 同 Go（`validate_connect`） | 同 **E**：坏配置必须是一条可读的业务错误 |
+| `port` 写成 `0` / 越界 | `port=server.port` 原样交给 asyncssh | 只处理 `port == 0` → `22` | 归一到 `22`（`u16` 换不下的负数 / 越界一并归一），错误消息里也用归一后的值 | `0` 不是合法端口；「没写端口」的意图就是 22 |
+| 主机密钥不通过 | `known_hosts=None`，这条路径压根不会触发 | 走 `x/crypto` 的英文文案 | 自写中文，见**偏差 2**；消息里的主机一律取 `host_target()` 形式（非 22 端口写成 `[h]:p`） | 用户要照着消息 `ssh-keygen -F '[h]:p'` 去查，或知道该往哪补一条；与 known_hosts 首列**逐字相同** |
+| 私钥读不出来 | `asyncssh` 的 `KeyImportError` 堆栈 | `读取私钥失败` / `解析私钥失败` 分开 | 同 Go | 打不开文件和文件格式不对是两回事，合成一句只会让人对着一把好好的 key `chmod` |
+
+**逐字沿用基准的两处文案**：`服务器 <name> (<host>) 未配置 key 或 password`
+（`_make_connect_kwargs:348`）、
+`SSH 认证失败: user=<u> host=<h>:<p> auth=<key|password> 原因=<reason>`
+（`deploy_service:589`）。`auth=` 按基准的 `'key' if server.key else 'password'`；
+`原因` 基准塞的是 asyncssh 英文异常，Rust 拿不到等价物，改用服务端返回的
+`remaining_methods`（`publickey,password` 这类可选方法列表）。
+
+**认证顺序**：`key` 与 `password` 同时配了时先试 key、失败再试 password ——
+基准把两种凭据一起交给 asyncssh，其内部顺序等价。
+**不做** Go 的「`password` 同时当私钥口令」回退（基准没这条）。
+
+### G. `upload_jar` 先拦「远端文件名为空」
+
+| 项 | 基准（Python） | Go | Rust | 理由 |
+|---|---|---|---|---|
+| `remote_name` 与 `local_jar` 都为空 | `_upload_jar` 拿到 `""`，`remote_final = f"{dir}/"` → 随后的 `rename(remote_tmp, remote_final)` 等于**把整个远端目录改名**成 `.tmp` | 有前置拦截 | 有：`远端文件名为空，无法确定落点`，且在 `ensure_remote_dir` **之前** | 这不是「报错好不好看」，是会在远端留下一整个被改名的目录 |
+
+A 节已经把 `remote_name: null` 回落成 `basename(local_jar)` —— 两件事配合，
+基准那条「远端会生成 `None` 这个文件」和这里「目录被改名」两条路都堵上了。
+
+### H. 远程命令的输出实时逐行回显
+
+| 项 | 基准（Python） | Go | Rust | 理由 |
+|---|---|---|---|---|
+| `run` 的输出什么时候回显 | `await conn.run(...)` 期间一行都不打，命令**结束后**才把攒下的 stdout/stderr 逐行 `log()` | `lineWriter` 边写边 `log()` | 同 Go | 一条跑 5 分钟的重启脚本，基准的界面整段时间静止 —— 卡在第几行、在等什么，全靠猜 |
+| 空行 | `splitlines()` 保留空行 | `bufio.Scanner` 丢空行 | 按 `\n` 切、**发空行**，只去掉行尾 `\r` | 空行是分段输出的组成部分，丢了会把两段拼在一起 |
+| 尾部没换行的残余 | 命令结束时 flush | 同 | 结束 / 被中断时 flush | 同上 |
+| `stderr` | `[stderr] <行>` 前缀 | 同 | 同 | — |
+| `stream`（`tail -f`）看不看退出码 | 不看；`tail` 打不开文件时只有一行 `tail: cannot open` 然后静默断掉 | 看 | 看 | 这是唯一能看出「为什么日志停了」的线索 |
+| 中断一条命令 | 不中断（只关会话通道） | `SIGKILL` + 关本地会话 + 2s 限时等服务端收尾 | 同 Go | 只关通道时服务端未必杀子进程，「停止」会挂到命令自然结束，等于退化成空约束 |
+
+收尾两行（`[连接断开] 实时日志监听已停止` / `[日志异常] …`）基准是一次
+`log_cb("\n...")` 调用 —— UI 拆行后等于「空行 + 正文」；Rust 拆成两次回调，
+渲染结果相同。
+
 ---
 
 ## 无偏差项（可直接照搬 Go）
@@ -348,7 +408,9 @@ PyYAML 6.0.1 的 implicit resolver（`yaml/resolver.py`），而且要**按首�
 `--- 部署目标 ---` / `执行顺序` / `[配置] 已写回` 日志、
 `请至少选择一个服务` / `以下服务未配置 project_dir：…` /
 `已有任务在运行中，请稍后再试` 文案、
-通配符日志路径白名单与 `ResolveLogPath` 规则。
+通配符日志路径白名单与 `ResolveLogPath` 规则（唯一文字差别：`remote_dir`
+结尾带 `/` 时 Go / Rust 折掉、基准写成 `/opt/app//logs/info.log`，
+shell 里两者等价）。
 
 ---
 
@@ -359,6 +421,6 @@ PyYAML 6.0.1 的 implicit resolver（`yaml/resolver.py`），而且要**按首�
 | 1 | workspace 骨架 + YAML codec 选型 | — | ✅ |
 | 2 | `proc`、`config` | `internal/proc`、`internal/config` | ✅ |
 | 3 | `builder`、`gitops` | `internal/builder`、`internal/gitops` | ✅ |
-| 4 | `deployer` | `internal/deployer` | |
+| 4 | `deployer` | `internal/deployer` | ✅ |
 | 5 | `pipeline` | `internal/pipeline` | |
 | 6 | `viewmodel`、`ui`、`cli` | `internal/uiapp`、`ui`、`cmd` | |

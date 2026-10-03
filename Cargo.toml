@@ -69,6 +69,15 @@ regex        = "1"                                                   # 1.12.x ·
 serde-saphyr = "1.3"                                       # 1.3.0  · 2026-09-16
 encoding_rs  = "0.8"                                       # 0.8.42 · 2026-09-24
 winreg       = "0.56"                                      # 0.56.0 · 2026-03-14 · 仅 Windows
+# deployer：备份文件名要的是**本地**墙上时间（基准 datetime.now() → Go time.Now()）。
+# std::time::SystemTime 只给 Unix 时间戳，自己换算时区得去读 /etc/localtime，不值当。
+chrono       = { version = "0.4", default-features = false, features = ["clock", "std"] }  # 0.4.x
+# deployer：known_hosts 的 |1|salt|hash 主机名哈希。**是 HMAC-SHA1 不是 SHA256** ——
+# 实测 ssh-keygen -H 生成的条目用 `hmac.new(salt, host, sha1)` 才对得上
+# （OpenSSH 至今如此，Go 的 x/crypto/ssh/knownhosts 也用 sha1.New）。
+hmac        = "0.12"                                       # 0.12.x
+sha1        = "0.10"                                       # 0.10.x
+base64      = "0.22"                                       # 0.22.x
 egui         = "0.36"                                      # 0.36.2 · 2026-09-08
 eframe       = "0.36"                                      # 0.36.2 · 2026-09-08
 clap         = { version = "4.6", features = ["derive"] }  # 4.6.7  · 2026-09-14
