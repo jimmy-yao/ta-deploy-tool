@@ -13,7 +13,7 @@
 Go 版是在基准的某个中间快照上重写的，之后基准又前进了 20+ 个提交；
 Go 侧补了其中几个（并行构建 `7193695`、自动回滚 `2ec6dc7`、服务器分组、
 超时与路径加固），但**没有全部跟上**，且自身引入了一批新的行为偏差。
-逐条排查后共 18 项，见下文「基准 vs Go 差异」。
+逐条排查后共 19 项，见下文「基准 vs Go 差异」。
 
 Rust 版按基准实现，**不照抄 Go 的这些偏差**。
 
@@ -250,6 +250,26 @@ Go 用 `internal/` 让**编译器**强制分层：`internal/proc` 反向依赖
   在当前分支缺失 → Rust 版用 `serde-saphyr` 承担 roundtrip，
   不需要 ruamel；**操作手册需要保留**。
 - `.gitignore` 机密规则与 `config.template.yaml` 已核对一致，无偏差。
+
+### 19. `exec` 起不来时退回 shell 再试一次
+
+- **基准**（`git_ops.py:49-64`、`builder.py:206-223`）：
+  `create_subprocess_exec` 抛 `FileNotFoundError` / `OSError` 时，一律退回
+  `create_subprocess_shell(subprocess.list2cmdline(argv))` 再跑一遍。
+- **Go**（`gitops.go`、`build.go`）：没有这条分支，直接把 `exec` 的错误抛出去。
+- **Rust**：按基准补回，实现在 `proc::shell`（`shell_spec` + `list2cmdline`）。
+  它撑着两件事：
+  1. **Windows 上的裸 `mvn`**：`CreateProcessW` 只认 `.exe`，
+     靠 `PATH` + `PATHEXT` 撞到 `mvn.cmd` 的写法会 `FileNotFoundError`
+     （`CommandSpec` 的 `.cmd`/`.bat` 包装只覆盖**写全后缀**的情况），
+     只有 `cmd.exe /c mvn ...` 跑得起来。
+  2. **程序不存在**：shell 也找不到 → 退出码 127 → 文案落回基准那句
+     `git ls-remote … 失败` / `<服务> 构建失败，退出码 127`，
+     而不是甩给用户一串 `No such file or directory (os error 2)`。
+- 引号规则**逐行移植** Python 的 `subprocess.list2cmdline`，
+  连它「尾部反斜杠只在**带引号**的参数上翻倍」这条反直觉行为也原样复刻
+  （CPython 收尾处对同一个未清空的 `bs_buf` 吐了两次）；
+  单测直接对着 `python3` 的真实输出断言。
 
 ---
 

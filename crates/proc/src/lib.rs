@@ -14,7 +14,7 @@
 //! | `proc_unix.go` | [`tree`] `#[cfg(unix)]` | 进程组 / 信号 |
 //! | `proc_windows.go` | [`tree`] `#[cfg(windows)]` | `taskkill /T` |
 //!
-//! # 两处与 Go 的结构性差异（有意为之）
+//! # 三处与 Go 的结构性差异（有意为之）
 //!
 //! **1. `.cmd`/`.bat` 包装收敛到 [`CommandSpec::new`]。**
 //! Go 把「Windows 下批处理要经 `cmd.exe /c 启动」写在
@@ -27,6 +27,12 @@
 //! 由主循环汇合 —— 行不会被截断，代价是两流之间的先后顺序只精确到「行」。
 //! 构建日志本就是行级信息，这个交换是划算的。
 //!
+//! **3. [`shell`] 模块是 Go 没有的。**
+//! 基准（Python）在 `exec` 失败时会退回 `create_subprocess_shell` 再试一次，
+//! Go 直接把错误抛出去。退回分支撑着三件事：Windows 下裸 `mvn` 靠 `PATHEXT`
+//! 解析成 `mvn.cmd`、Unix 下可读但没 `+x` 的脚本、以及程序不存在时把系统调用
+//! 错误换回基准那句「退出码 127」的业务文案 —— 详见 [`shell`] 的模块文档。
+//!
 //! # 一处已知偏差
 //!
 //! Go 的 `decode.go` 把 `gb2312` 标签映射到 `simplifiedchinese.HZGB2312`
@@ -35,9 +41,11 @@
 
 pub mod decode;
 pub mod run;
+pub mod shell;
 pub mod spec;
 pub mod tree;
 
 pub use decode::{DecodeError, decode_line};
 pub use run::{CancelFn, LineFn, LogFn, RunError, RunOptions, run_command};
+pub use shell::{list2cmdline, shell_spec};
 pub use spec::CommandSpec;

@@ -4516,7 +4516,10 @@ dependencies = [
 name = "ta-deploy-tool-gitops"
 version = "2.0.0"
 dependencies = [
+ "regex",
  "ta-deploy-tool-proc",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

@@ -9,4 +9,10 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# 分层：gitops 只允许依赖 proc（见 scripts/check_layering.py）
 ta-deploy-tool-proc.workspace = true
+regex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
