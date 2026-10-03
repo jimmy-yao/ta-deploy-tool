@@ -195,6 +195,65 @@ func TestITRunCapturesStderr(t *testing.T) {
 	}
 }
 
+// TestITRunCommandTimeout 远程命令必须有执行上限。
+// 没有上限时，远端重启脚本卡死会让本端的部署永远停在"重启中"，
+// 操作者既看不到错误、也等不到结束，只能杀进程。
+func TestITRunCommandTimeout(t *testing.T) {
+	srv := itServer(t)
+	conn, err := Dial(context.Background(), srv, Options{CmdTimeout: time.Second})
+	if err != nil {
+		t.Fatalf("连接失败: %v", err)
+	}
+	defer conn.Close()
+
+	start := time.Now()
+	var lines []string
+	err = conn.Run(context.Background(), "echo partial-out; sleep 5",
+		func(s string) { lines = append(lines, s) })
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("超时的命令应报错")
+	}
+	if !strings.Contains(err.Error(), "远程命令超时") {
+		t.Errorf("错误信息应说明超时: %v", err)
+	}
+	if !strings.Contains(err.Error(), "1s") {
+		t.Errorf("错误信息应带上限时长便于定位: %v", err)
+	}
+	if elapsed > 4*time.Second {
+		t.Errorf("应在 1s 左右中断，实际耗时 %v", elapsed)
+	}
+	// 超时前已回显的输出必须保留，否则无从判断卡在哪一步
+	if !strings.Contains(strings.Join(lines, "\n"), "partial-out") {
+		t.Errorf("超时前的输出应已回显: %v", lines)
+	}
+}
+
+// TestITRunRespectsCallerCancel 上游取消（用户点停止）仍应返回 ctx.Err()，
+// 不能被命令超时逻辑吞成"远程命令超时"。
+func TestITRunRespectsCallerCancel(t *testing.T) {
+	srv := itServer(t)
+	// CmdTimeout 放得足够大，确保触达的是 ctx 而非单命令上限
+	conn, err := Dial(context.Background(), srv, Options{CmdTimeout: 60 * time.Second})
+	if err != nil {
+		t.Fatalf("连接失败: %v", err)
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err = conn.Run(ctx, "sleep 5", func(string) {})
+	if err != context.DeadlineExceeded {
+		t.Errorf("应返回上游 ctx.Err(), 实际 %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Errorf("上游取消后应立即返回，实际耗时 %v", elapsed)
+	}
+}
+
 // ---------- 2. 部署全流程 ----------
 
 func TestITDeployUploadBackupCleanup(t *testing.T) {

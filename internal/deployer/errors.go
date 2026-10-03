@@ -40,8 +40,19 @@ func deployErrf(format string, args ...any) error {
 
 // Options SSH 连接与执行选项。
 type Options struct {
-	// Timeout 单次连接/命令的超时，0 表示使用 DefaultTimeout
+	// Timeout TCP 建连超时，0 表示使用 ConnectTimeout
 	Timeout time.Duration
+	// LoginTimeout SSH 握手与认证超时，0 表示使用 LoginTimeout
+	//
+	// 与建连超时分开：一个对端可能秒接 TCP 却因为负载高 / 证书校验慢而
+	// 拖延握手，用同一个值会让"慢握手"被误判成"连不上"，排查方向会错。
+	LoginTimeout time.Duration
+	// CmdTimeout 单条远程命令（重启脚本、cp 等）的最长执行时间，
+	// 0 表示使用 RemoteCmdTimeout
+	//
+	// 重启脚本里常见的 stop -> 换包 -> start 序列本身就可能跑很久，
+	// 没有上限的话，远端卡死会让本端的部署永远停在"重启中"。
+	CmdTimeout time.Duration
 	// KnownHosts 为 known_hosts 文件路径；为空时使用 StrictHostKey 标志
 	KnownHosts string
 	// StrictHostKey 为 true 时强制校验主机公钥（需要 KnownHosts 或默认 known_hosts 文件）
@@ -49,14 +60,38 @@ type Options struct {
 	StrictHostKey bool
 }
 
-// DefaultTimeout 连接与远程命令的默认超时。
-const DefaultTimeout = 30 * time.Second
+// 三类超时，与 Python deployer.py 的同名常量一致。
+const (
+	// ConnectTimeout TCP 建连超时。
+	ConnectTimeout = 30 * time.Second
+	// LoginTimeout SSH 握手与认证超时（asyncssh 默认 120，基准收紧到 60）。
+	LoginTimeout = 60 * time.Second
+	// RemoteCmdTimeout 单条远程命令（如重启脚本）最长执行时间。
+	RemoteCmdTimeout = 300 * time.Second
+)
+
+// DefaultTimeout 连接超时的兼容别名：历史上调用方用它表示"连不上就放弃"。
+const DefaultTimeout = ConnectTimeout
 
 func (o Options) timeout() time.Duration {
 	if o.Timeout > 0 {
 		return o.Timeout
 	}
-	return DefaultTimeout
+	return ConnectTimeout
+}
+
+func (o Options) loginTimeout() time.Duration {
+	if o.LoginTimeout > 0 {
+		return o.LoginTimeout
+	}
+	return LoginTimeout
+}
+
+func (o Options) cmdTimeout() time.Duration {
+	if o.CmdTimeout > 0 {
+		return o.CmdTimeout
+	}
+	return RemoteCmdTimeout
 }
 
 // timestampMs 返回形如 20260102_150404.000 的时间戳。

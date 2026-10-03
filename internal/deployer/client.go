@@ -124,13 +124,17 @@ func Dial(ctx context.Context, srv config.ServerConfig, opts Options) (*Conn, er
 		return nil, deployErrf("SSH 连接失败 %s: %v", addr, err)
 	}
 
-	// 握手同样受超时约束，完成后解除
-	_ = raw.SetDeadline(time.Now().Add(opts.timeout()))
+	// 握手与认证同样受超时约束，完成后解除。
+	// 用单独的 loginTimeout 而非建连超时：TCP 秒接但握手被拖慢是
+	// 真实存在的故障形态，共用一个值会把"认证慢"报成"连不上"。
+	_ = raw.SetDeadline(time.Now().Add(opts.loginTimeout()))
 	clientConn, chans, reqs, err := ssh.NewClientConn(raw, addr, sshCfg)
 	if err != nil {
 		_ = raw.Close()
 		return nil, translateDialError(err, srv, port)
 	}
+	// 清除握手 deadline，否则连接在建立 loginTimeout 后会被内核判定失效，
+	// 短命任务看起来正常，长任务（部署 + 重启）则会在中途诡异断开。
 	_ = raw.SetDeadline(time.Time{})
 
 	return &Conn{ssh: ssh.NewClient(clientConn, chans, reqs), srv: srv, opts: opts}, nil
@@ -177,17 +181,42 @@ func safeLog(log LogFn) LogFn {
 	}
 }
 
+// remoteTermGrace 中断命令后等待服务端回收子进程的上限。
+const remoteTermGrace = 2 * time.Second
+
+// terminateCommand 终止远端命令并有限等待会话收尾。
+//
+// 三步缺一不可：
+//  1. SIGKILL —— 让服务端真正回收子进程。只关会话通道时服务端未必杀进程，
+//     等待方会一直挂到命令自然结束，"中断"退化成空约束；
+//  2. 关本地会话；
+//  3. 限时等待 —— 服务端不支持 signal 时，不能让中断本身变成新的卡点。
+func terminateCommand(session *ssh.Session, waitCh chan error) {
+	_ = session.Signal(ssh.SIGKILL)
+	_ = session.Close()
+	select {
+	case <-waitCh:
+	case <-time.After(remoteTermGrace):
+	}
+}
+
 // lineWriter 按行切分写入内容并回调。
 type lineWriter struct {
-	mu     sync.Mutex
-	buf    []byte
-	prefix string
-	emit   LogFn
+	mu      sync.Mutex
+	buf     []byte
+	prefix  string
+	emit    LogFn
+	stopped bool
 }
 
 func (w *lineWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.stopped {
+		// 已经向调用方报告完本次操作的结局，之后再到达的输出
+		// 不能补进来——否则超时/取消返回后还会继续往日志里灌内容。
+		return len(p), nil
+	}
 	w.buf = append(w.buf, p...)
 	for {
 		idx := bytes.IndexByte(w.buf, '\n')
@@ -210,6 +239,17 @@ func (w *lineWriter) flush() {
 		w.emit(w.prefix + line)
 	}
 	w.buf = nil
+}
+
+// stop 冲掉末行、然后封闭写入端：后续 Write 直接丢弃。
+func (w *lineWriter) stop() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if line := strings.TrimRight(string(w.buf), "\r"); line != "" {
+		w.emit(w.prefix + line)
+	}
+	w.buf = nil
+	w.stopped = true
 }
 
 // Run 执行远程命令并记录输出，退出码非 0 返回 *DeployExecuteError。
@@ -235,13 +275,25 @@ func (c *Conn) Run(ctx context.Context, cmd string, log LogFn) error {
 	}
 	go func() { waitErr <- session.Wait() }()
 
+	// 单条命令的执行上限：远端重启脚本卡死时，本端必须给出明确的
+	// 超时结论并断开会话，否则部署会永远停在"重启中"，操作者无从判断。
+	runCtx, cancel := context.WithTimeout(ctx, c.opts.cmdTimeout())
+	defer cancel()
+
 	select {
-	case <-ctx.Done():
-		_ = session.Close()
-		<-waitErr
-		outW.flush()
-		errW.flush()
-		return ctx.Err()
+	case <-runCtx.Done():
+		// 远端进程必须显式终止：只关本地会话的话，服务端未必立刻回收
+		// 子进程，<waitErr> 会一直等到命令自然结束，超时就退化成空约束
+		// （表现为"中断耗时 = 命令总时长"）。
+		terminateCommand(session, waitErr)
+		outW.stop()
+		errW.stop()
+		// 上游主动取消（用户点停止 / 外层整体超时）优先，保持原有语义
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return deployErrf("远程命令超时（超过 %ds 未退出，已中断）: %s",
+			int(c.opts.cmdTimeout()/time.Second), cmd)
 	case we := <-waitErr:
 		outW.flush()
 		errW.flush()
@@ -280,9 +332,10 @@ func (c *Conn) Stream(ctx context.Context, cmd string, onLine func(string)) erro
 
 	select {
 	case <-ctx.Done():
-		_ = session.Close()
-		<-done
-		outW.flush()
+		// tail -f 不会因为通道关闭而自行退出，不杀进程的话
+		// <-done 会挂到命令自然结束，"停止监听"变成假返回。
+		terminateCommand(session, done)
+		outW.stop()
 		return ctx.Err()
 	case we := <-done:
 		outW.flush()

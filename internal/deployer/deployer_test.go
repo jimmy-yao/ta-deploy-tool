@@ -216,6 +216,41 @@ func TestTailCommandRejectsUnsafeGlob(t *testing.T) {
 	}
 }
 
+// ---------- 4b. 超时策略 ----------
+
+// TestTimeoutDefaultsMatchPython 三类超时必须与 Python 基准的同名常量一致：
+// 建连 / 握手认证 / 单条命令各自独立，共用一个值会把"认证慢"报成"连不上"，
+// 或者让卡死的重启脚本永远等不到结论。
+func TestTimeoutDefaultsMatchPython(t *testing.T) {
+	var o Options
+	if got := o.timeout(); got != 30*time.Second {
+		t.Errorf("建连超时应为 30s, 得到 %v", got)
+	}
+	if got := o.loginTimeout(); got != 60*time.Second {
+		t.Errorf("握手/认证超时应为 60s, 得到 %v", got)
+	}
+	if got := o.cmdTimeout(); got != 300*time.Second {
+		t.Errorf("单命令超时应为 300s, 得到 %v", got)
+	}
+
+	// 显式配置优先
+	o = Options{
+		Timeout:      3 * time.Second,
+		LoginTimeout: 4 * time.Second,
+		CmdTimeout:   5 * time.Second,
+	}
+	if o.timeout() != 3*time.Second || o.loginTimeout() != 4*time.Second ||
+		o.cmdTimeout() != 5*time.Second {
+		t.Errorf("显式超时未生效: %v/%v/%v", o.timeout(), o.loginTimeout(), o.cmdTimeout())
+	}
+
+	// 显式填 0 视为"用默认值"，不能变成 0（0 会让 WithTimeout 立即触发）
+	o = Options{Timeout: 0, LoginTimeout: 0, CmdTimeout: 0}
+	if o.timeout() <= 0 || o.loginTimeout() <= 0 || o.cmdTimeout() <= 0 {
+		t.Error("零值应回落到默认超时")
+	}
+}
+
 // ---------- 5. 认证 ----------
 
 func TestBuildAuthNoCredentials(t *testing.T) {
