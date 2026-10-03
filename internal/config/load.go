@@ -157,7 +157,9 @@ func ResolveRestartCmd(svc *ServiceConfig, defaultScript string) (string, bool) 
 	if defaultScript == "" {
 		return "", false
 	}
-	return fmt.Sprintf("cd %s && bash %s", svc.RemoteDir, defaultScript), true
+	// 路径里的空格 / 引号会把这条命令截断成多条，逐段转义后拼接
+	return fmt.Sprintf("cd %s && bash %s",
+		QuoteRemotePath(svc.RemoteDir), QuoteRemotePath(defaultScript)), true
 }
 
 // IsWindows 报告当前是否运行在 Windows 上（用于 mvn.cmd / taskkill 分支）。

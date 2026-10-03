@@ -541,7 +541,8 @@ func writeRemote(t *testing.T, conn *Conn, path, content string) {
 // ensureRemoteDirFor 在既有连接上创建远端目录。
 func ensureRemoteDirFor(conn *Conn, dir string) error {
 	return SFTPOn(conn, func(sc *sftp.Client) error {
-		return ensureRemoteDir(sc, dir)
+		_, err := ensureRemoteDir(sc, dir)
+		return err
 	})
 }
 

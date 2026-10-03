@@ -77,15 +77,26 @@ func ResolveLogPath(svc *config.ServiceConfig) string {
 }
 
 // TailCommand 构造 tail 命令。
-// 含通配符时不加引号（交给远端 shell 展开），否则单引号包裹。
-func TailCommand(logFile string, lines int) string {
+//
+// 含通配符时必须原样交给远端 shell 展开，无法整体加引号，
+// 因此改用白名单校验：只放行无需转义的字符，遇到空格 / 引号 / ;
+// 等元字符直接拒绝，否则命令会被截断或被当成多条命令执行。
+// 不含通配符时按 '/' 逐段转义，路径里的空格与引号都不会逃逸。
+//
+// 对应 Python tail_remote_log 中的两条分支。
+func TailCommand(logFile string, lines int) (string, error) {
 	if lines <= 0 {
 		lines = 200
 	}
-	if strings.Contains(logFile, "*") {
-		return "tail -n " + strconv.Itoa(lines) + " -f " + logFile + " 2>&1"
+	if strings.ContainsAny(logFile, "*?[") {
+		if !globSafePath.MatchString(logFile) {
+			return "", deployErrf(
+				"日志路径含空格或 shell 特殊字符，无法用于通配符匹配: %q"+
+					"（请改用不含空格的路径，或填写具体的日志文件名）", logFile)
+		}
+		return "tail -n " + strconv.Itoa(lines) + " -f " + logFile + " 2>&1", nil
 	}
-	return "tail -n " + strconv.Itoa(lines) + " -f '" + logFile + "' 2>&1"
+	return "tail -n " + strconv.Itoa(lines) + " -f " + config.QuoteRemotePath(logFile) + " 2>&1", nil
 }
 
 // ============================================================
@@ -124,7 +135,8 @@ func DeployService(
 	}
 	defer sc.Close()
 
-	if err := uploadJar(ctx, sc, localJar, svc.RemoteDir, svc.RemoteName,
+	// outcome 记录备份落点，重启失败时据此自动回滚（下一阶段接入）
+	if _, err := uploadJar(ctx, sc, localJar, svc.RemoteDir, svc.RemoteName,
 		log, opts.Progress, opts.BackupKeep, opts.now()); err != nil {
 		return err
 	}
@@ -156,6 +168,10 @@ func serverLabel(server config.ServerConfig) string {
 // ============================================================
 
 // ListRemoteBackups 列出远端可用备份（名称倒序）。
+//
+// 严格按 `<remote_name>.bak.` 前缀匹配：前缀无法确定时直接返回空，
+// 绝不回退成宽松匹配 —— 否则会把同目录下其它服务的备份也列出来，
+// 回滚时可能选错文件覆盖线上 jar。
 func ListRemoteBackups(
 	ctx context.Context,
 	server config.ServerConfig,
@@ -164,9 +180,15 @@ func ListRemoteBackups(
 ) ([]string, error) {
 
 	remoteName := RemoteNameOf(svc)
-	prefix := remoteName + ".bak."
 	if remoteName == "" {
-		prefix = ".bak."
+		return nil, nil
+	}
+	prefix := remoteName + ".bak."
+
+	remoteDir, err := NormalizeRemoteDir(svc.RemoteDir)
+	if err != nil {
+		// 目录无效时按"没有备份"处理，弹窗不该因为路径配置问题直接抛异常
+		return nil, nil
 	}
 
 	conn, err := Dial(ctx, server, opts)
@@ -181,14 +203,21 @@ func ListRemoteBackups(
 	}
 	defer sc.Close()
 
-	entries, err := sc.ReadDir(svc.RemoteDir)
+	// SFTP 协议不展开 ~：不先解析的话，`~/app` 会按字面路径查，
+	// 出现"部署/重启正常、回滚弹窗却列不出备份"的不一致。
+	expanded, err := ExpandRemoteHome(sc, remoteDir)
+	if err != nil {
+		return nil, nil
+	}
+
+	entries, err := sc.ReadDir(expanded)
 	if err != nil {
 		return nil, nil
 	}
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
 		n := e.Name()
-		if strings.HasPrefix(n, prefix) || strings.Contains(n, ".bak.") {
+		if n != "." && n != ".." && strings.HasPrefix(n, prefix) {
 			names = append(names, n)
 		}
 	}
@@ -211,6 +240,17 @@ func RollbackService(
 		return deployErrf("服务 %s 未指定 remote_name，无法回滚", svc.Name)
 	}
 
+	// 备份文件名由界面提供并直接进入远端 cp 命令，必须先校验：
+	// 拒绝路径分隔符与 `.`/`..`（防穿越），并要求属于本服务。
+	if err := ValidateBackupFilename(remoteName, backupFilename); err != nil {
+		return err
+	}
+
+	remoteDir, err := NormalizeRemoteDir(svc.RemoteDir)
+	if err != nil {
+		return err
+	}
+
 	log("=== [回滚] " + svc.Name + " -> 使用备份: " + backupFilename + " ===")
 
 	conn, err := Dial(ctx, server, opts.Conn)
@@ -219,9 +259,11 @@ func RollbackService(
 	}
 	defer conn.Close()
 
-	srcPath := remoteJoin(svc.RemoteDir, backupFilename)
-	dstPath := remoteJoin(svc.RemoteDir, remoteName)
-	cpCmd := "cp '" + srcPath + "' '" + dstPath + "'"
+	srcPath := remoteJoin(remoteDir, backupFilename)
+	dstPath := remoteJoin(remoteDir, remoteName)
+	// 路径里可能有空格 / 引号等字符，直接用单引号包裹会被截断或破裂，
+	// 统一按 '/' 逐段转义（~ 段保持裸露以保留家目录展开）。
+	cpCmd := "cp " + config.QuoteRemotePath(srcPath) + " " + config.QuoteRemotePath(dstPath)
 	if err := conn.Run(ctx, cpCmd, log); err != nil {
 		return err
 	}
@@ -231,7 +273,12 @@ func RollbackService(
 	if restartEnabled {
 		log("[重启] 将执行: " + restartCmd)
 		if err := conn.Run(ctx, restartCmd, log); err != nil {
-			return err
+			// 文件已经恢复成功了，只是没起来 —— 必须讲清楚，
+			// 否则操作者看到"回滚失败"会以为文件没回过去，又去手工覆盖一次。
+			return deployErrf(
+				"回滚的文件恢复已成功: %s -> %s\n  但重启命令失败: %s\n  原因: %v\n"+
+					"  服务当前很可能处于停止状态，请立即手动执行重启脚本",
+				backupFilename, remoteName, restartCmd, err)
 		}
 		log("[重启] 命令执行完成: " + restartCmd)
 	} else {
@@ -257,7 +304,10 @@ func TailRemoteLog(
 ) error {
 	log := safeLog(logCb)
 	logFile := ResolveLogPath(svc)
-	cmd := TailCommand(logFile, lines)
+	cmd, err := TailCommand(logFile, lines)
+	if err != nil {
+		return err
+	}
 
 	log("[SSH 连接中...] " + serverLabel(server))
 	log("$ " + cmd)

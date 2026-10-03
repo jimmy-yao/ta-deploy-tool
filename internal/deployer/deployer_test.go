@@ -51,7 +51,8 @@ func TestRemoteSegments(t *testing.T) {
 	}{
 		{"/opt/app/common", true, []string{"opt", "app", "common"}},
 		{"opt/app", false, []string{"opt", "app"}},
-		{"/", false, nil},
+		// "/" 是根：绝对语义成立，但没有可创建的层级
+		{"/", true, nil},
 		{"", false, nil},
 		{"///opt//app///", true, []string{"opt", "app"}},
 		{"/opt/./app", true, []string{"opt", "app"}},
@@ -157,17 +158,61 @@ func TestResolveLogPath(t *testing.T) {
 }
 
 func TestTailCommand(t *testing.T) {
-	got := TailCommand("/opt/app/logs/info.log", 200)
-	if got != "tail -n 200 -f '/opt/app/logs/info.log' 2>&1" {
+	// 安全字符集内的路径与 Python quote_remote_path 一致：逐段判定后不加引号
+	got, err := TailCommand("/opt/app/logs/info.log", 200)
+	if err != nil {
+		t.Fatalf("不应报错: %v", err)
+	}
+	if got != "tail -n 200 -f /opt/app/logs/info.log 2>&1" {
 		t.Errorf("命令错误: %q", got)
 	}
-	got = TailCommand("/opt/app/logs/*.log", 100)
+
+	// 含空格的路径必须被转义，否则远端 shell 会把命令截断
+	got, err = TailCommand("/opt/my app/info.log", 10)
+	if err != nil {
+		t.Fatalf("不应报错: %v", err)
+	}
+	if got != "tail -n 10 -f /opt/'my app'/info.log 2>&1" {
+		t.Errorf("含空格路径应逐段转义: %q", got)
+	}
+
+	// 通配符路径原样交给 shell 展开
+	got, err = TailCommand("/opt/app/logs/*.log", 100)
+	if err != nil {
+		t.Fatalf("不应报错: %v", err)
+	}
 	if got != "tail -n 100 -f /opt/app/logs/*.log 2>&1" {
 		t.Errorf("通配符不应加引号: %q", got)
 	}
-	got = TailCommand("/a.log", 0)
+
+	// 行数兜底
+	got, err = TailCommand("/a.log", 0)
+	if err != nil {
+		t.Fatalf("不应报错: %v", err)
+	}
 	if !strings.Contains(got, "-n 200") {
 		t.Errorf("行数应兜底到 200: %q", got)
+	}
+}
+
+// TestTailCommandRejectsUnsafeGlob 通配符路径无法加引号，只能白名单放行。
+// 含 shell 元字符时必须拒绝，否则等同于把远端命令交给配置文件注入。
+func TestTailCommandRejectsUnsafeGlob(t *testing.T) {
+	for _, p := range []string{
+		"/opt/app/logs/a b/*.log", // 空格
+		"/opt/app/logs/a;rm -rf x/*.log",
+		"/opt/app/logs/$(id)/*.log",
+		"/opt/app/logs/a`id`/*.log",
+		"/opt/app/logs/a'b/*.log",
+		"/opt/app/logs/a|id/*.log",
+		"/opt/app/logs/a&id/*.log",
+		"/opt/app/logs/a\nid/*.log",
+	} {
+		if _, err := TailCommand(p, 10); err == nil {
+			t.Errorf("含 shell 元字符的通配符路径应被拒绝: %q", p)
+		} else if !strings.Contains(err.Error(), "通配符") {
+			t.Errorf("错误信息应说明通配符限制: %v", err)
+		}
 	}
 }
 
