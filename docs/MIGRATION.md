@@ -92,8 +92,10 @@ Go 用 `internal/` 让**编译器**强制分层：`internal/proc` 反向依赖
   `_ENTITY_ITEM_PRUNE` / `_SUB_PRUNE`。
 - **Go**：`internal/config/save.go:14-20` 整体重新 marshal 后
   `os.WriteFile` → 注释全丢、schema 外键全丢、非原子。
-- **Rust**：用 `serde-saphyr` 的 `Commented<T>` 做 roundtrip 合并，
-  同一套剪枝规则，`.tmp` + `rename` 原子替换。
+- **Rust**：自研**行级文档树**（`crates/config/src/doc.rs`）做 roundtrip 合并 ——
+  `serde-saphyr` 没有暴露带注释的 DOM（`Commented<T>` 只能挂单条尾注释，
+  撑不起整篇 round-trip）。同一套剪枝规则，`.tmp` + `rename` 原子替换，
+  落盘前把合并结果**重新解析一遍**自校验，失败则退回整体重写。
 
 ### 3. YAML 键顺序：**声明序**，不是字母序 ★致命
 
@@ -251,6 +253,63 @@ Go 用 `internal/` 让**编译器**强制分层：`internal/proc` 反向依赖
 
 ---
 
+## 有意偏离基准的地方（读取宽容化 + 保存加强）
+
+下面这些**不是缺陷，是决定**。基准是 Python：字段靠 `raw.get()` +
+`bool()` / `int()` / `str()` 现场转换，异常处理基本没有；Rust 要么报错、
+要么主动宽容，两边必须选一边并写清楚。
+
+### A. 读取侧：宽容化
+
+| 项 | 基准（Python） | Rust | 理由 |
+|---|---|---|---|
+| 字符串字段写成 `null`（`maven:`） | 得到 `None`，保存时写回 `key: null` | 统一成 `""`，保存时写 `key: ""` | `if x:` / `if not x:` 判空处两者等价；`""` 不会把 `null` 这种"类型信息"扩散到下游 |
+| 整数字段写成 `null`（`backup_keep:`） | `int(None)` → `TypeError`，**整份配置读不进来** | 读成 `0`，合法字段照常加载 | 一个多余的冒号不该让整个工具打不开配置；真正非法的值（`backup_keep: abc`）仍然报错 |
+| `log_encoding` 为空 | `"".encode()` 解不出任何字节 | 回落 `utf-8` | 空编码没有意义，直接报错只会误伤 |
+| `build_args` 为 `null` | `str(None)` → `"None"` 传给构建命令 | 回落默认 `clean install` | `"None"` 会真的变成一条构建命令 |
+| `remote_name` 为 `null` | `str(None)` → `"None"` 作为远端文件名 | 回落 `basename(local_jar)` | 同上，远端会生成 `None` 这个文件 |
+| `git.strategy` 为空串 | （基准按值透传） | 不把整段 `git` 重置掉 | 空串不等于"用户想恢复默认" |
+
+### B. 保存侧：比基准更保守
+
+- **值没变的键，一个字节都不动。** 基准 `_merge_config` 对 `src` 里的每个键
+  无条件 `dst[key] = value`，ruamel 虽然会保留节点，但**引号风格会被重建**。
+  Rust 版先把原文档解析成旧值，逐键比对：相同 → 完全跳过。
+  效果是 `java_home: ''`、`servers: {}`、`password: 'p@ss w0rd'`、
+  序列项后面的 `# 注释` 在"用户什么都没改"的保存里**逐字节存活**。
+- **schema 之外的键与注释恒保留**（与基准一致）；合并结果落盘前必须能被
+  自己重新解析，否则退回整体重写 —— 注释可以丢，配置不能坏。
+
+### C. 类型伪装判定必须逐字对齐 PyYAML
+
+`password: yes` 写成 plain，旧版读回来是个布尔 `True` 而不是密码。
+所以**写出**时必须判断"这个字符串 plain 写出去会不会被读成别的类型"。
+
+判定**不能问 `serde-saphyr`**（它按 YAML 1.2 core schema 走），必须手写
+PyYAML 6.0.1 的 implicit resolver（`yaml/resolver.py`），而且要**按首字符
+分派** —— PyYAML 的解析器就是按标量首字符索引的。做成"全量正则"会得到
+错误结果，实测：
+
+| 写法 | PyYAML（按首字符分派） | 全量正则 |
+|---|---|---|
+| `1e10` | 字符串（指数必须带 `+`/`-`） | 数字 |
+| `-.nan` | 字符串（`.nan` 不允许符号） | 数字 |
+| `0123` | 整数 83（`0[0-7_]+`） | 字符串 |
+| `0o17` | 字符串（YAML 1.1 没有 `0o`） | 整数 |
+
+同理，**读取侧**的重复键策略必须设成 `DuplicateKeyPolicy::LastWins`
+（PyYAML 后者覆盖；`serde-saphyr` 默认 `Error`，会让一份旧版读得动的
+配置整份读不进来），`strict_booleans` 保持默认 `false` 以接受
+`yes` / `no` / `on` / `off`。
+
+### D. 空串写成 `""` 而不是 PyYAML 的 `''`
+
+与仓库既有的 `config.template.yaml` golden 及 Go `fidelity_test.go:243`
+（`restart_cmd: ""`）保持一致。两者读回来完全等价，选 `""` 只是为了
+让既有 fixture 不必整体改写。
+
+---
+
 ## 无偏差项（可直接照搬 Go）
 
 `quote_remote_path`、`restart_cmd` 三态（空/`-`/自定义）、
@@ -268,7 +327,7 @@ Go 用 `internal/` 让**编译器**强制分层：`internal/proc` 反向依赖
 | 里程碑 | crate | 对应 Go | 状态 |
 |---|---|---|---|
 | 1 | workspace 骨架 + YAML codec 选型 | — | ✅ |
-| 2 | `proc`、`config` | `internal/proc`、`internal/config` | 进行中 |
+| 2 | `proc`、`config` | `internal/proc`、`internal/config` | ✅ |
 | 3 | `builder`、`gitops` | `internal/builder`、`internal/gitops` | |
 | 4 | `deployer` | `internal/deployer` | |
 | 5 | `pipeline` | `internal/pipeline` | |

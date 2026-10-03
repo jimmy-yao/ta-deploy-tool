@@ -60,6 +60,8 @@ tokio-util   = "0.7"                                       # CancellationToken
 russh        = "0.63"                                      # 0.63.3 · 2026-09-09
 russh-sftp   = "3.0"                                       # 3.0.1  · 2026-09-28
 serde        = { version = "1", features = ["derive"] }
+indexmap     = { version = "2", features = ["serde"] }                # 2.14.2 · 2025-11-07
+regex        = "1"                                                   # 1.12.x · 校验 iteration_pattern
 # YAML codec 选型已定案：**serde-saphyr**。
 # 落选的 serde_norway（0.9.42）在空串上写 ''，而 Go yaml.v3 写 ""，
 # 且没有任何选项能改 —— Go 的 fidelity_test.go:243 断言 restart_cmd: ""，

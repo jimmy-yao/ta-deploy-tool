@@ -11,6 +11,11 @@ publish.workspace = true
 [dependencies]
 serde.workspace = true
 serde-saphyr.workspace = true
+# environments / servers / services 必须**按声明顺序**遍历（基准: modular-structure）。
+# Go 用的 map 遍历是随机序，已确认为偏差，这里不能照抄。
+indexmap.workspace = true
+regex.workspace = true
+thiserror.workspace = true
 
 # 对应 Go 的 detect_registry_windows.go（build tag）—— Cargo 用
 # target-specific dependency 表达同样的"仅某平台参与编译"。
