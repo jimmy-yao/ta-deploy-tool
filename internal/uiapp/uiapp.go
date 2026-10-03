@@ -338,6 +338,10 @@ func (a *App) ensureChecked() {
 }
 
 // visibleSet 返回当前筛选下可见的服务名集合。
+//
+// 筛选同时匹配服务名与**组名**（服务器名）：输入服务器名可以直接列出
+// 该服务器下的全部服务。可见集合同时驱动渲染与勾选操作——
+// "全选 / 仅选当前"作用的正是这里算出来的集合，与基准一致。
 func (a *App) visibleSet() map[string]bool {
 	out := map[string]bool{}
 	env, ok := a.cfg.Env(a.envName)
@@ -345,53 +349,153 @@ func (a *App) visibleSet() map[string]bool {
 		return out
 	}
 	kw := strings.ToLower(a.filter)
+	if kw == "" {
+		for name := range env.Services {
+			out[name] = true
+		}
+		return out
+	}
+
+	serverHit := map[string]bool{}
+	for _, g := range config.GroupServicesByServer(env) {
+		if strings.Contains(strings.ToLower(g.Name), kw) {
+			for _, n := range g.Services {
+				serverHit[n] = true
+			}
+		}
+	}
 	for name := range env.Services {
-		if kw == "" || strings.Contains(strings.ToLower(name), kw) {
+		if strings.Contains(strings.ToLower(name), kw) || serverHit[name] {
 			out[name] = true
 		}
 	}
 	return out
 }
 
-// Services 返回按配置顺序排列的服务视图（已应用筛选）。
-func (a *App) Services() []ServiceView {
+// ServiceGroupView 侧边栏一个分组：组头 + 组内可见服务。
+type ServiceGroupView struct {
+	// Name 组头标题
+	Name string
+	// Detail 组头副标题：host:port；未匹配组为引用到的未定义 server 名
+	Detail string
+	// Server 为 nil 表示"未匹配服务器"组
+	Server *config.ServerConfig
+	// Services 组内可见服务
+	Services []ServiceView
+	// VisibleCount / CheckedCount 只统计**可见**服务，
+	// 与组勾选的作用范围保持一致，否则点了组勾选却看不到组头变化
+	VisibleCount int
+	CheckedCount int
+	// AllChecked 组头勾选框取值：组内可见服务全部勾选时为 true；
+	// 部分勾选时为 false，"n/m" 计数负责表达"部分"
+	AllChecked bool
+}
+
+// ServiceGroups 返回按服务器分组的侧边栏视图。
+//
+// 已应用筛选；没有任何可见服务的组不返回，否则侧边栏会满屏只有组头。
+func (a *App) ServiceGroups() []ServiceGroupView {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.serviceGroupsLocked()
+}
+
+// serviceGroupsLocked 调用方需持锁。
+func (a *App) serviceGroupsLocked() []ServiceGroupView {
 	env, ok := a.cfg.Env(a.envName)
 	if !ok {
 		return nil
 	}
 	visible := a.visibleSet()
-	out := make([]ServiceView, 0, len(visible))
-	names := make([]string, 0, len(env.Services))
-	for n := range env.Services {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		if !visible[name] {
+	out := make([]ServiceGroupView, 0, len(env.Servers)+2)
+	for _, g := range config.GroupServicesByServer(env) {
+		view := ServiceGroupView{Name: g.Name, Detail: g.Detail, Server: g.Server}
+		for _, name := range g.Services {
+			if !visible[name] {
+				continue
+			}
+			svc := env.Services[name]
+			if svc == nil {
+				continue
+			}
+			view.Services = append(view.Services, a.serviceViewLocked(name, svc))
+			view.VisibleCount++
+			if a.checked[name] {
+				view.CheckedCount++
+			}
+		}
+		if view.VisibleCount == 0 {
 			continue
 		}
-		svc := env.Services[name]
-		view := ServiceView{
-			Name:       name,
-			Checked:    a.checked[name],
-			Status:     a.statuses[name],
-			ProjectDir: svc.ProjectDir,
-			LocalJar:   svc.LocalJar,
-			RemoteDir:  svc.RemoteDir,
-			RemoteName: svc.RemoteName,
-			DependsOn:  svc.DependsOn,
-			Server:     config.PtrOr(svc.Server),
-			Branch:     a.resolved[name],
-		}
-		if strings.HasPrefix(view.Branch, "(") || strings.HasPrefix(view.Branch, "解析失败") {
-			view.BranchHint = view.Branch
-			view.Branch = ""
-		}
+		view.AllChecked = view.CheckedCount == view.VisibleCount
 		out = append(out, view)
 	}
 	return out
+}
+
+// serviceViewLocked 把配置服务转成一行视图（调用方需持锁）。
+func (a *App) serviceViewLocked(name string, svc *config.ServiceConfig) ServiceView {
+	view := ServiceView{
+		Name:       name,
+		Checked:    a.checked[name],
+		Status:     a.statuses[name],
+		ProjectDir: svc.ProjectDir,
+		LocalJar:   svc.LocalJar,
+		RemoteDir:  svc.RemoteDir,
+		RemoteName: svc.RemoteName,
+		DependsOn:  svc.DependsOn,
+		Server:     config.PtrOr(svc.Server),
+		Branch:     a.resolved[name],
+	}
+	if strings.HasPrefix(view.Branch, "(") || strings.HasPrefix(view.Branch, "解析失败") {
+		view.BranchHint = view.Branch
+		view.Branch = ""
+	}
+	return view
+}
+
+// Services 返回按分组顺序排列的服务视图（已应用筛选）。
+//
+// 结果恒等于 ServiceGroups() 的逐组展平 —— 侧边栏行顺序与计数口径
+// 走同一个数据源，才不会出现"列表里看得见、计数里没算上"的错位。
+func (a *App) Services() []ServiceView {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	groups := a.serviceGroupsLocked()
+	out := make([]ServiceView, 0, len(groups))
+	for _, g := range groups {
+		out = append(out, g.Services...)
+	}
+	return out
+}
+
+// SetGroupChecked 勾选/取消一个分组内**可见**的服务。
+//
+// 被筛选隐藏的服务保持原状：边筛边勾时如果连看不见的服务一起动，
+// 用户会发现"我只想改这一屏，别的却变了"。
+func (a *App) SetGroupChecked(name string, v bool) {
+	a.mu.Lock()
+	a.ensureChecked()
+	env, ok := a.cfg.Env(a.envName)
+	if !ok {
+		a.mu.Unlock()
+		return
+	}
+	visible := a.visibleSet()
+	for _, g := range config.GroupServicesByServer(env) {
+		if g.Name != name {
+			continue
+		}
+		for _, n := range g.Services {
+			if !visible[n] {
+				continue
+			}
+			a.checked[n] = v
+		}
+		break
+	}
+	a.mu.Unlock()
+	a.sink.changed()
 }
 
 // Selected 返回勾选的服务名（配置顺序）。

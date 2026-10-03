@@ -36,7 +36,11 @@ type uiWindow struct {
 	themeSel    *widget.Select
 	filterEntry *widget.Entry
 
-	svcList        *widget.List
+	svcList *widget.List
+	// rows 是 svcList 的数据源：组头行 + 服务行交替的平铺序列
+	rows []sidebarRow
+	// services 是 rows 里的服务行，供计数/定位当前服务使用；
+	// 与 rows 同源，避免"列表里看得见、计数里没算上"的错位
 	services       []uiapp.ServiceView
 	currentService string
 	countLabel     *widget.Label
@@ -186,18 +190,21 @@ func (u *uiWindow) buildSidebar() fyne.CanvasObject {
 	u.filterEntry.OnChanged = func(s string) { u.vm.SetFilter(s) }
 
 	u.svcList = widget.NewList(
-		func() int { return len(u.services) },
+		func() int { return len(u.rows) },
 		func() fyne.CanvasObject { return newServiceRow(u) },
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			if int(id) >= 0 && int(id) < len(u.services) {
-				obj.(*serviceRow).update(u.services[int(id)])
+			if int(id) >= 0 && int(id) < len(u.rows) {
+				obj.(*serviceRow).updateRow(u.rows[int(id)])
 			}
 		},
 	)
 	u.svcList.OnSelected = func(id widget.ListItemID) {
-		if int(id) >= 0 && int(id) < len(u.services) {
-			u.currentService = u.services[int(id)].Name
+		// 组头不是可操作目标：选中它不该顶掉"当前服务"，
+		// 否则点一下服务器标题，部署目标就悄悄变成了上一个服务。
+		if int(id) < 0 || int(id) >= len(u.rows) || u.rows[int(id)].IsHeader {
+			return
 		}
+		u.currentService = u.rows[int(id)].Service.Name
 	}
 
 	title := widget.NewLabel("服务列表")
@@ -366,7 +373,9 @@ func (u *uiWindow) setRunning(v bool) {
 // ============================================================
 
 func (u *uiWindow) refreshServices() {
-	u.services = u.vm.Services()
+	// 行序列与服务列表同源：先按服务器分组，再摊平成组头行 + 服务行
+	u.rows = sidebarRows(u.vm.ServiceGroups())
+	u.services = rowServices(u.rows)
 	if u.svcList != nil {
 		u.svcList.Refresh()
 	}
@@ -491,7 +500,40 @@ func (u *uiWindow) showMoreMenu() {
 // 服务行
 // ============================================================
 
-// serviceRow 侧边栏一行：勾选框 + 名称/路径 + 状态徽章。
+// sidebarRow 侧边栏的一行：要么是分组头，要么是服务行。
+// widget.List 是平的，按服务器分组只能靠把组头当成一行插进去实现。
+type sidebarRow struct {
+	IsHeader bool
+	Group    uiapp.ServiceGroupView
+	Service  uiapp.ServiceView
+}
+
+// sidebarRows 把分组视图摊平成 widget.List 需要的行序列：
+// 组头 + 该组服务 + 下一个组头 + ……
+func sidebarRows(groups []uiapp.ServiceGroupView) []sidebarRow {
+	out := make([]sidebarRow, 0, len(groups))
+	for _, g := range groups {
+		out = append(out, sidebarRow{IsHeader: true, Group: g})
+		for _, s := range g.Services {
+			out = append(out, sidebarRow{Service: s})
+		}
+	}
+	return out
+}
+
+// rowServices 取出序列里的服务行，保持渲染顺序。
+func rowServices(rows []sidebarRow) []uiapp.ServiceView {
+	out := make([]uiapp.ServiceView, 0, len(rows))
+	for _, r := range rows {
+		if !r.IsHeader {
+			out = append(out, r.Service)
+		}
+	}
+	return out
+}
+
+// serviceRow 侧边栏一行：勾选框 + 名称/路径 + 状态徽章；
+// 作为组头行时复用同一套控件：组勾选框 + 组名 + host:port/计数，徽章隐藏。
 type serviceRow struct {
 	fyne.CanvasObject
 	chk   *widget.Check
@@ -499,7 +541,8 @@ type serviceRow struct {
 	sub   *widget.Label
 	badge *statusBadge
 	ui    *uiWindow
-	name  string
+	name  string // 服务行的服务名；组头行为空
+	group string // 组头行的组名；服务行为空
 }
 
 func newServiceRow(u *uiWindow) *serviceRow {
@@ -515,15 +558,57 @@ func newServiceRow(u *uiWindow) *serviceRow {
 
 	r := &serviceRow{CanvasObject: row, chk: chk, title: title, sub: sub, badge: badge, ui: u}
 	chk.OnChanged = func(v bool) {
-		if r.name != "" {
+		switch {
+		case r.name != "":
 			u.vm.SetChecked(r.name, v)
+		case r.group != "":
+			u.vm.SetGroupChecked(r.group, v)
 		}
 	}
 	return r
 }
 
+func (r *serviceRow) updateRow(row sidebarRow) {
+	if row.IsHeader {
+		r.updateHeader(row.Group)
+		return
+	}
+	r.update(row.Service)
+}
+
+// updateHeader 组头：组名 + host:port（未匹配组为引用到的未定义 server 名）
+// + n/m 计数 + 整组勾选框。
+//
+// Fyne 的 widget.Check 只有两态，表达不了 Qt 的三态（部分勾选），
+// 所以部分勾选时勾选框是空的，靠 n/m 把"部分"说出来 —— 否则
+// "全选"和"选了一半"在界面上一模一样。
+func (r *serviceRow) updateHeader(g uiapp.ServiceGroupView) {
+	r.name = ""
+	r.group = g.Name
+	r.title.SetText(g.Name)
+
+	count := fmt.Sprintf("%d/%d", g.CheckedCount, g.VisibleCount)
+	if g.Detail != "" {
+		r.sub.SetText(g.Detail + " · " + count)
+	} else {
+		r.sub.SetText(count)
+	}
+
+	r.chk.OnChanged = nil
+	r.chk.SetChecked(g.AllChecked)
+	r.chk.OnChanged = func(v bool) {
+		if r.group != "" {
+			r.ui.vm.SetGroupChecked(r.group, v)
+		}
+	}
+
+	// 组头没有部署状态，徽章留着只会挤掉组名
+	r.badge.Hide()
+}
+
 func (r *serviceRow) update(s uiapp.ServiceView) {
 	r.name = s.Name
+	r.group = ""
 	r.title.SetText(s.Name)
 	r.sub.SetText(serviceSubtitle(s))
 
@@ -535,6 +620,7 @@ func (r *serviceRow) update(s uiapp.ServiceView) {
 		}
 	}
 
+	r.badge.Show()
 	r.badge.set(s.Status.Key(), s.Status.Badge())
 }
 
