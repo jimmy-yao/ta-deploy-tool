@@ -70,12 +70,12 @@ fn main() {
     // 首次运行从 assets::TEMPLATE_YAML 生成、--check 校验、启动 egui 界面。
     // TODO(milestone-2): config crate 落地后接入 load / validate。
     if cli.check {
-        eprintln!("[TODO] --check 尚未实现（里程碑 2：config crate）");
+        eprintln!("[TODO] --check 尚未实现（里程碑 7：cli crate）");
         std::process::exit(2);
     }
 
     eprintln!(
-        "[TODO] 界面尚未实现（里程碑 6），已解析配置路径: {}",
+        "[TODO] 界面尚未实现（里程碑 7），已解析配置路径: {}",
         path.as_deref().unwrap_or("(自动定位)")
     );
     std::process::exit(2);

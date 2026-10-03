@@ -13,7 +13,7 @@
 Go 版是在基准的某个中间快照上重写的，之后基准又前进了 20+ 个提交；
 Go 侧补了其中几个（并行构建 `7193695`、自动回滚 `2ec6dc7`、服务器分组、
 超时与路径加固），但**没有全部跟上**，且自身引入了一批新的行为偏差。
-逐条排查后共 21 项，见下文「基准 vs Go 差异」。
+逐条排查后共 28 项，见下文「基准 vs Go 差异」。
 
 Rust 版按基准实现，**不照抄 Go 的这些偏差**。
 
@@ -254,6 +254,7 @@ Go 用 `internal/` 让**编译器**强制分层：`internal/proc` 反向依赖
 | 打包/部署忙时 | 只打日志，不弹窗 | 一律 `ShowError` 弹窗 | 按基准（回滚路径才弹窗） |
 | `UpdateRepo` 的 rev-parse | 不检查退出码 | 非 0 即报错 | 按基准放宽 |
 | `git branch` 正则校验 | `re.error` → `GitError` | 同（文案不同） | 按基准文案 |
+| 日志行数上限 | 无上限（`QPlainTextEdit` 一直涨） | 封 20000 行，超出砍最老的 | 按基准默认不封；`App::set_max_log_lines` 暴露出来，`ui` 想封自己设 |
 
 ### 18. 仓库资产
 
@@ -304,6 +305,79 @@ Go 用 `internal/` 让**编译器**强制分层：`internal/proc` 反向依赖
 - **Go**（`pipeline.go:554`）：`"%s（当前 jar 名 %s，如需自动更新请开启 auto_remote_name)"`
   的写法里 `old` 后直接接全角括号，**没有**这个空格。
 - **Rust**：照基准补上空格；单测对着完整文案断言。
+
+### 22. 环境下拉按声明序
+
+- **基准**（`main_window.py:128-129`）：`env_combo.addItems(list(cfg.environments.keys()))`
+  —— `environments` 是 dict，取键即**配置声明序**。
+- **Go**（`uiapp.go EnvNames`）：`sort.Strings(names)` → 字母序。
+- **Rust**：声明序（`AppConfig::environments` 是 `IndexMap`）。
+- 影响面：下拉顺序、以及「配置里第一个环境 = 启动时选中的环境」。
+
+### 23. `ReloadConfig` 没有「分支没变就跳过」
+
+- **基准**（`main_window.py:556-569` `_branch_state`、`:571-610` `_reload_config`）：
+  - 只有 **`git` 段 + 各服务的 `(name, project_dir, git_branch)`** 变了才清缓存、
+    才 `refresh` —— iteration 模式下全量刷新 = 每个服务一次 `git ls-remote`，
+    改个服务器地址 / 部署路径不该付这个代价；
+  - 没变时**下拉候选与已选分支一并保留**，日志是
+    `配置已重新加载（分支相关配置未变，跳过分支刷新）`；
+  - **勾选状态保留**，只剔除配置里已不存在的服务（跨环境的也保留）。
+- **Go**（`uiapp.go ReloadConfig`）：一律清空 `checked` / `statuses` / `resolved`、
+  一律 `RefreshBranches()`，日志只有 `配置已重新加载`。
+- **Rust**：照基准（`App::reload_config`）。
+
+### 24. 运行中切环境：基准允许，Go 拦截
+
+- **基准**（`_on_env_changed`）：任务跑着的时候环境下拉**没被禁用**，
+  切了就照切 —— 清勾选 / 状态 / 分支、重刷分支；流水线继续跑它自己
+  捕获的 `env_name` 与 `selected`，互不干扰。
+- **Go**（`uiapp.go SetEnv`）：`if a.running { return }` 静默忽略。
+- **Rust**：按基准（允许切换）。Go 的护栏是个**改进**，但它改变了
+  「切环境后侧边栏立刻反映新环境」这个基准可观测行为，不照抄。
+
+### 25. 日志着色：全部加粗 + 两个不同的灰
+
+- **基准**（`main_window.py:747-793`）：
+  - 每个标签 span 的模板都带 `font-weight:bold` —— **23 条标签全加粗**；
+  - `[DEBUG]` 是 `#9CA3AF`、`[env]` 是 `#6B7280` —— **两个不同的灰**；
+  - 替换表里有 `[最新分支] #22D3EE`（见上文第 16 条）。
+- **Go**（`color.go`）：只有 `[构建完成]` / `[部署完成]` / `[结果]` / `[失败]`
+  四条加粗；只定义了一个 `muted = #9CA3AF`，`[env]` 被归到它，**颜色不对**。
+- **Rust**：`Color::Debug` / `Color::Env` 分成两个语义色，
+  `TAGS` 表逐条照基准、标签一律 `bold`；`color.rs` 有一条单测专门断言
+  「任意两条标签不能互为前缀」—— 那是「按表序扫」与基准的
+  「逐条 `str.replace`」等价的前提。
+
+### 26. 动作卡片的初始态与 `finish`
+
+- **基准**（`widgets.py::CurrentActionCard`）：
+  - 初始 `准备就绪` / `等待操作` / 0% / 空耗时；
+  - `start` → `准备中...` / 0% / `Elapsed: 0s`；
+  - `finish(true, …)` → **进度拉到 100**、状态 `完成`；
+  - `finish(false, msg)` → 状态 = `msg`（空则 `失败`），**进度不动**；
+  - 两种收尾都**不改标题**（标题停在 `Building …`）。
+- **Go**（`uiapp.go actionCard`）：初始 `Ready` / `选择服务后点击「打包」或「部署」`；
+  `finish` 不动进度条（成功也不拉到 100），并把标题改成 `操作成功` / `操作失败`。
+- **Rust**：照基准。
+
+### 27. 进度百分比的舍入
+
+- **基准**（`main_window.py:736-743`）：`int(round(current * 100 / total))` ——
+  Python 的 `round` 是**四舍六入五成双**，`round(12.5) == 12`、`round(13.5) == 14`；
+  `total <= 0` 时 `pct = 0`；最后 `max(0, min(100, pct))`。
+  另外**整段套在 `if status:` 里** —— `status` 为空时连百分比都不写。
+- **Go**（`uiapp.go OnProgress`）：`int(float64(current) * 100 / float64(total))` 是
+  **截断**，且无条件写 `Percent`。
+- **Rust**：自写 `py_round` 照 Python 的半到偶，`status` 为空不写卡片。
+
+### 28. 单服务任务的标题要点名 scope
+
+- **基准**（`main_window.py:914-923`）：
+  `scope = ", ".join(selected) if services is not None else "selected services"`，
+  右键「仅打包 `svc-a`」时标题是 `Building svc-a`。
+- **Go**（`uiapp.go actionTitle`）：固定写 `selected services`，看不出跑的是谁。
+- **Rust**：照基准。
 
 ---
 
@@ -460,6 +534,18 @@ A 节已经把 `remote_name: null` 回落成 `basename(local_jar)` —— 两件
 
 ---
 
+### J. 服务徽章状态存进 map，不随筛选重建清零（M6）
+
+| 项 | 基准（Python） | Go | Rust | 理由 |
+|---|---|---|---|---|
+| 徽章状态存在哪儿 | `ServiceItemWidget` 这个 **Qt 控件**里；`_load_services` 每次改筛选 / 换环境都 `clear()` 再重建，**所有徽章一律回到 `idle`** | `map[string]Status`，跨筛选保留 | 同 Go：`map[string]Status`，跨筛选保留，**换环境才清** | 基准「跑完 `svc-a` 再敲一下筛选框，它的徽章就变回 Idle」是 Qt 控件生命周期的副作用，不是语义。跨筛选保留状态才让「边筛边看」有意义 |
+| 状态更新作用到谁 | 只作用于 `_service_items` 里**可见**的行（widget 不存在直接 `return`） | 作用于 `statuses` 里的**所有**服务 | 作用于状态表里**已登记**的服务；`start()` 会给**全部选中服务**（不分可见性）登记初始徽章 | 筛选藏起来的服务同样在跑，不登记就永远收不到进度状态 |
+| 首屏徽章文案 | `StatusBadge("idle","idle")` → 首屏是小写 `idle`，之后才变成 `Idle` | `Idle` | `Idle` | 小写是控件构造参数的偶然产物，不是语义；`Status::badge()` 统一返回 `Idle` |
+
+`App::set_env` 仍然清空状态表 —— 两边在「换环境」上一致。
+
+---
+
 ## 无偏差项（可直接照搬 Go）
 
 `quote_remote_path`、`restart_cmd` 三态（空/`-`/自定义）、
@@ -483,4 +569,6 @@ shell 里两者等价）。
 | 3 | `builder`、`gitops` | `internal/builder`、`internal/gitops` | ✅ |
 | 4 | `deployer` | `internal/deployer` | ✅ |
 | 5 | `pipeline` | `internal/pipeline` | ✅ |
-| 6 | `viewmodel`、`ui`、`cli` | `internal/uiapp`、`ui`、`cmd` | |
+| 6 | `viewmodel` | `internal/uiapp` | ✅ |
+| 7 | `cli` | `cmd/deploytool` | |
+| 8 | `ui`（egui） | `ui` | |

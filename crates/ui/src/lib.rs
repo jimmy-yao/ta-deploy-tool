@@ -26,7 +26,7 @@
 //! **已知近似**：Fyne/Qt 的勾选框有三态（部分勾选），egui 的 `ui.checkbox`
 //! 只有两态 —— 部分勾选时显示未勾选，靠 `n/m` 计数把"部分"说出来。
 
-// 计划中的模块（里程碑 6 落地）：
+// 计划中的模块（里程碑 8 落地）：
 //   pub mod app;
 //   pub mod config_dialog;
 //   pub mod dialogs;
