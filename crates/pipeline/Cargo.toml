@@ -18,3 +18,10 @@ ta-deploy-tool-deployer.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 thiserror.workspace = true
+futures.workspace = true
+# discovered 必须按"构建完成顺序"迭代（基准是 dict 插入序），
+# HashMap 会把日志顺序打乱。
+indexmap.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

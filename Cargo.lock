@@ -4598,11 +4598,14 @@ dependencies = [
 name = "ta-deploy-tool-pipeline"
 version = "2.0.0"
 dependencies = [
+ "futures",
+ "indexmap",
  "ta-deploy-tool-builder",
  "ta-deploy-tool-config",
  "ta-deploy-tool-deployer",
  "ta-deploy-tool-gitops",
  "ta-deploy-tool-proc",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",

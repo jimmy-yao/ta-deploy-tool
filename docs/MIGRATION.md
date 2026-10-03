@@ -13,7 +13,7 @@
 Go 版是在基准的某个中间快照上重写的，之后基准又前进了 20+ 个提交；
 Go 侧补了其中几个（并行构建 `7193695`、自动回滚 `2ec6dc7`、服务器分组、
 超时与路径加固），但**没有全部跟上**，且自身引入了一批新的行为偏差。
-逐条排查后共 19 项，见下文「基准 vs Go 差异」。
+逐条排查后共 21 项，见下文「基准 vs Go 差异」。
 
 Rust 版按基准实现，**不照抄 Go 的这些偏差**。
 
@@ -282,6 +282,29 @@ Go 用 `internal/` 让**编译器**强制分层：`internal/proc` 反向依赖
   （CPython 收尾处对同一个未清空的 `bs_buf` 吐了两次）；
   单测直接对着 `python3` 的真实输出断言。
 
+### 20. 回写遍历序：基准插入序 / Go 字母序
+
+- **基准**（`pipeline.py:329` `_persist_discovered_jars`）：走
+  `discovered.items()`，按**插入序**遍历 —— 也就是「构建完成顺序」。
+  串行层与拓扑序一致；并行层是 `asyncio.gather` 的完成序，本身随调度抖动。
+- **Go**（`pipeline.go:618` `sortedKeys`）：`map[string]string` + 手写插入排序，
+  按**服务名字母序**遍历。
+- **Rust**：`discovered` 是 `Vec<(String, String)>`，按**收集序**遍历 ——
+  各层依次推进、层内为该层的**输入序**（`join_all` 保持提交序，
+  与基准 `zip(layer, results)` 同构）。
+  - 串行层与基准**逐字相同**；
+  - 并行层基准是完成序、本就非确定，这里取确定序而不是引入抖动；
+  - 与 Go 的字母序无关。
+- 影响面：只决定几行 `[更新] …` 日志的先后与回写的先后，最终内容相同。
+
+### 21. `[保留]` 那行在 `old` 之后少了一个空格
+
+- **基准**：`[保留] {name}.remote_name: {old} （当前 jar 名 {jar}，如需自动更新请开启 auto_remote_name）`
+  —— `old` 与全角括号之间**有一个半角空格**。
+- **Go**（`pipeline.go:554`）：`"%s（当前 jar 名 %s，如需自动更新请开启 auto_remote_name)"`
+  的写法里 `old` 后直接接全角括号，**没有**这个空格。
+- **Rust**：照基准补上空格；单测对着完整文案断言。
+
 ---
 
 ## 有意偏离基准的地方（读取宽容化 + 保存加强）
@@ -400,6 +423,43 @@ A 节已经把 `remote_name: null` 回落成 `basename(local_jar)` —— 两件
 
 ---
 
+### I. 流水线的取消语义收敛到 `run()` 外层（M5）
+
+这是 M5 唯一一处**真的**偏离基准可观测输出的地方，其余一律照抄。
+
+| 项 | 基准（Python） | Go | Rust | 理由 |
+|---|---|---|---|---|
+| `[取消] 任务已停止并取消` + 进度 `已取消` 在哪儿打 | 写在**每个阶段**的循环顶 `except CancelledError` 里 | `wrapCancel` / `guardCancel(ctx, "已取消")`，每个阶段各一份 | **只在 `run()` 的收尾打一次**；各阶段的 `guard()` 只返回 `PipelineError::Cancelled`，不打日志 | asyncio 下 `_task.cancel()` 必然注入在 await 挂起点，各阶段的 `except CancelledError: raise` 排在前面，这两行在 GUI 路径**根本不可达**。照抄等于写死代码；收在 `run()` 才实现基准「用户点停止要看到这一套输出」的本意 |
+| 非取消错误会不会误打 `[取消]` | 不会 | 不会（`wrapCancel` 先判 `builder.ErrCancelled`） | 不会 —— `run()` 只在 `is_cancelled()` 时走取消分支，其余原样透传 | — |
+| `[配置] 存在构建失败，本次识别到的 jar 不写回配置` | 只在**非取消**失败时打（`except CancelledError` 提前于 `except BaseException`） | 同 | 同：取消立刻 `return`，不进失败汇总 | 取消不是失败，没有「不写回」这回事 |
+| 取消的机制 | `asyncio.Task.cancel()` + `CancelledError` | `context.CancellationToken` | `tokio_util::CancellationToken`，经 `Pipeline::with_cancel` 注入，`cancel()` / `cancel_handle()` 触发，逐层转成 `is_cancelled: CancelFn` | 与 `proc` / `builder` / `gitops` / `deployer` 已有的 `CancelFn` 是同一套，不引入第二套 |
+| 信号量 vs 取消 | `async with sem:` 之后才有 `if self._cancelled: raise` | — | 先 `sem.acquire().await` 再 `guard()` | 逐字照抄：拿不到 permit 就取消，会在信号量释放处自然醒来 |
+| 取消优先于失败的判定顺序 | 串行 `except CancelledError: raise` 在 `except BaseException` 之前；并行 `zip` 里逐个先判 `CancelledError` | `cancelErr` 优先 | 同基准：同层结果先扫一遍取消，命中立刻返回 | 取消时同层各任务在不同位置退出，先报「构建失败」会让操作者以为是自己的代码或配置出了问题 |
+
+照抄基准、**不是**偏离的几处（一并记此备查）：
+
+- `has_git = do_build && use_git && cfg.git.enabled` —— Git 阶段必须跟着构建走，
+  单独跑 Git 是基准没有的形态；
+- `stages == 0` → 只打 `没有需要执行的任务`，**不发任何进度**；
+- 层内并发判定 `len(layer) == 1 || max_concurrency == 1`，
+  层间是 barrier，`max_concurrency = max(1, cfg.max_parallel_builds)`；
+- 并发原语用 `futures::future::join_all` + 跨层共享的 `tokio::sync::Semaphore`
+  （基准的 `sem` 也在层循环之外建），**不**引入 `tokio::spawn` / `JoinSet`
+  —— 后者的完成序会让 `zip(layer, results)` 的语义悄悄变成 Go 的完成序；
+- `环境不存在: <name>` 用 `PipelineError::Failed`：基准这里是裸
+  `KeyError` → `run` 外层展开成同名字符串，`if msg in cfg.environ`
+  会把它当一条「环境不存在的提示」原样抛给 UI；
+- `--- 部署目标 ---` 里的端口走 `server_label`（归一到 22），
+  与同一次运行里 `=== [部署] … ===`、SSH 错误行口径一致
+  （基准打裸 `server.port`，`port: 0` 会印出 `:0`，但它自己接着按
+  `port or 22` 连 —— 印出来的比实际用的还错，见上表 F 节的端口行）；
+- `local_jar` 的相对路径用自写的 `persist::relpath`
+  （`abspath` + 公共祖先 + `..`，结果按 `MAIN_SEPARATOR` 拼接再把 `\`
+  折成 `/`，失败退回绝对路径的斜杠化），对应基准 `os.path.relpath` 的
+  `except ValueError` —— Go 的 `filepath.Rel` 归约规则不同，不能照抄。
+
+---
+
 ## 无偏差项（可直接照搬 Go）
 
 `quote_remote_path`、`restart_cmd` 三态（空/`-`/自定义）、
@@ -422,5 +482,5 @@ shell 里两者等价）。
 | 2 | `proc`、`config` | `internal/proc`、`internal/config` | ✅ |
 | 3 | `builder`、`gitops` | `internal/builder`、`internal/gitops` | ✅ |
 | 4 | `deployer` | `internal/deployer` | ✅ |
-| 5 | `pipeline` | `internal/pipeline` | |
+| 5 | `pipeline` | `internal/pipeline` | ✅ |
 | 6 | `viewmodel`、`ui`、`cli` | `internal/uiapp`、`ui`、`cmd` | |

@@ -83,6 +83,9 @@ eframe       = "0.36"                                      # 0.36.2 · 2026-09-0
 clap         = { version = "4.6", features = ["derive"] }  # 4.6.7  · 2026-09-14
 thiserror    = "2"
 anyhow       = "1"
+# pipeline：层内并发聚合。语义对齐 `asyncio.gather(return_exceptions=True)` ——
+# 等同层**全部**任务结束再统一判定，且结果保持提交顺序。
+futures      = "0.3"                                      # 0.3.34
 
 # ---- 测试 ----
 insta    = "1"   # YAML 快照断言：config.yaml 必须逐字节对齐基准
