@@ -18,6 +18,19 @@ build/
 *.apk
 *.aab
 
+# ---- 本地机密配置（含服务器明文口令，严禁提交）----
+# 与 legacy-python/.gitignore 的同名规则保持一致：
+# config.yaml 只在本机存在，仓库里只放无口令的 config.template.yaml。
+config.yaml
+config.local.yaml
+*.secret.yaml
+.env
+.env.*
+secrets/
+
+# ---- 崩溃日志 ----
+crash.log
+
 # ---- IDE / 系统 ----
 .idea/
 .vscode/
