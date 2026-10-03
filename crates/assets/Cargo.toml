@@ -1,0 +1,9 @@
+[package]
+name = "ta-deploy-tool-assets"
+description = "内嵌资源（config.template.yaml、窗口图标），对应 Go 根包 embed.go"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true

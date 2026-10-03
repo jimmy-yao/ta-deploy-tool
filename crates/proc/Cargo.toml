@@ -1,0 +1,12 @@
+[package]
+name = "ta-deploy-tool-proc"
+description = "子进程执行与日志编码，对应 Go internal/proc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+encoding_rs.workspace = true

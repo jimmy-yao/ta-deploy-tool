@@ -1,0 +1,12 @@
+[package]
+name = "ta-deploy-tool-gitops"
+description = "Git 分支识别与更新，对应 Go internal/gitops"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ta-deploy-tool-proc.workspace = true

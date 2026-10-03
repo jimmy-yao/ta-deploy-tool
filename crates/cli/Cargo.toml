@@ -1,0 +1,23 @@
+[package]
+name = "ta-deploy-tool-cli"
+description = "可执行入口，对应 Go cmd/deploytool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# 产物名对齐 Go 版的 deploytool / DeployTool.exe
+[[bin]]
+name = "deploytool"
+path = "src/main.rs"
+
+[dependencies]
+ta-deploy-tool-assets.workspace = true
+ta-deploy-tool-proc.workspace = true
+ta-deploy-tool-config.workspace = true
+ta-deploy-tool-ui.workspace = true
+
+clap.workspace = true
+anyhow.workspace = true

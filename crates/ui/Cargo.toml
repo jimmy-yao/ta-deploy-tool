@@ -1,0 +1,29 @@
+[package]
+name = "ta-deploy-tool-ui"
+description = "egui/eframe 桌面界面，对应 Go ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ta-deploy-tool-assets.workspace = true
+ta-deploy-tool-proc.workspace = true
+ta-deploy-tool-config.workspace = true
+ta-deploy-tool-deployer.workspace = true
+ta-deploy-tool-viewmodel.workspace = true
+
+egui.workspace = true
+eframe.workspace = true
+
+# winit 的 Android 后端依赖 android-activity，却**自己不激活它的任何入口实现**
+# （game-activity / native-activity），而是要求最终应用二选一 —— 否则
+# android-activity 直接 compile_error!。Termux 的 target 是
+# aarch64-linux-android，不补这一条 `cargo build --workspace` 就编不过。
+#
+# 选 native-activity：不引入 game-activity 的 native-glue 那套额外生命周期，
+# 与"这本质是个桌面工具、Android 只是开发宿主"的定位一致。
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }

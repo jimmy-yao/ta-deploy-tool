@@ -1,0 +1,20 @@
+[package]
+name = "ta-deploy-tool-viewmodel"
+description = "GUI 视图模型（服务列表、分组、状态、启动流水线），对应 Go internal/uiapp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ta-deploy-tool-proc.workspace = true
+ta-deploy-tool-config.workspace = true
+ta-deploy-tool-builder.workspace = true
+ta-deploy-tool-deployer.workspace = true
+ta-deploy-tool-pipeline.workspace = true
+
+tokio.workspace = true
+tokio-util.workspace = true
+thiserror.workspace = true

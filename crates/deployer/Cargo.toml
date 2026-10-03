@@ -1,0 +1,19 @@
+[package]
+name = "ta-deploy-tool-deployer"
+description = "SSH 连接、SFTP 上传与回滚，对应 Go internal/deployer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ta-deploy-tool-proc.workspace = true
+ta-deploy-tool-config.workspace = true
+
+tokio.workspace = true
+tokio-util.workspace = true
+russh.workspace = true
+russh-sftp.workspace = true
+thiserror.workspace = true

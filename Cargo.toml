@@ -1,0 +1,78 @@
+# ta-deploy-tool · Rust 重写版
+#
+# 分层与 refactor/go-rewrite 完全同向、同名：
+#
+#   proc ─┐
+#   config ─┼─→ gitops ───┐
+#     │  │       └─→ builder ─┤
+#     │  └──────────→ deployer ─┼─→ pipeline ─→ viewmodel ─→ ui ─┐
+#     │                    │       │                            ├─→ cli
+#     └────────────────────┴───────┴───── assets ───────────────┘
+#
+# 注意：Cargo **没有** Go 的 internal/ 语义 —— workspace 里任何 crate 都能
+# import 任何 crate。分层方向改由 scripts/check_layering.py 用 cargo metadata
+# 在 CI 里断言（Go 由编译器强制的边界，Rust 这里退化成约定，见迁移说明偏差 3）。
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/assets",
+    "crates/proc",
+    "crates/config",
+    "crates/gitops",
+    "crates/builder",
+    "crates/deployer",
+    "crates/pipeline",
+    "crates/viewmodel",
+    "crates/ui",
+    "crates/cli",
+    # 实验用：YAML codec 选型对比，不产出任何业务代码
+    "experiments/yaml-probe",
+]
+
+# 不设 default-members：裸 `cargo build` / `cargo test` 必须覆盖整个
+# workspace，否则本地全绿而 CI 编译，是更难查的失败。
+# 嫌单 crate 慢就用 `cargo build -p ta-deploy-tool-config`。
+
+[workspace.package]
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/jimmy-yao/ta-deploy-tool"
+publish = false
+
+[workspace.dependencies]
+# ---- workspace 内部（目录名短，包名带 ta-deploy-tool- 前缀）----
+ta-deploy-tool-assets    = { path = "crates/assets" }
+ta-deploy-tool-proc      = { path = "crates/proc" }
+ta-deploy-tool-config    = { path = "crates/config" }
+ta-deploy-tool-gitops    = { path = "crates/gitops" }
+ta-deploy-tool-builder   = { path = "crates/builder" }
+ta-deploy-tool-deployer  = { path = "crates/deployer" }
+ta-deploy-tool-pipeline  = { path = "crates/pipeline" }
+ta-deploy-tool-viewmodel = { path = "crates/viewmodel" }
+ta-deploy-tool-ui        = { path = "crates/ui" }
+
+# ---- 第三方：版本均经 crates.io 核实（注释为「版本 · 最后更新日期」）----
+tokio        = { version = "1.53", features = ["full"] }  # 1.53.1 · 2026-07-20
+tokio-util   = "0.7"                                       # CancellationToken
+russh        = "0.63"                                      # 0.63.3 · 2026-09-09
+russh-sftp   = "3.0"                                       # 3.0.1  · 2026-09-28
+serde        = { version = "1", features = ["derive"] }
+# YAML codec 选型已定案：**serde-saphyr**。
+# 落选的 serde_norway（0.9.42）在空串上写 ''，而 Go yaml.v3 写 ""，
+# 且没有任何选项能改 —— Go 的 fidelity_test.go:243 断言 restart_cmd: ""，
+# 把那 494 个测试搬过来必红。详见 experiments/yaml-probe 的文档。
+serde-saphyr = "1.3"                                       # 1.3.0  · 2026-09-16
+encoding_rs  = "0.8"                                       # 0.8.42 · 2026-09-24
+winreg       = "0.56"                                      # 0.56.0 · 2026-03-14 · 仅 Windows
+egui         = "0.36"                                      # 0.36.2 · 2026-09-08
+eframe       = "0.36"                                      # 0.36.2 · 2026-09-08
+clap         = { version = "4.6", features = ["derive"] }  # 4.6.7  · 2026-09-14
+thiserror    = "2"
+anyhow       = "1"
+
+# ---- 测试 ----
+insta    = "1"   # YAML 快照断言：config.yaml 必须逐字节对齐基准
+proptest = "1"

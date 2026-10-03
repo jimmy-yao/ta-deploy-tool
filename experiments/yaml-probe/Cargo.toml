@@ -1,0 +1,13 @@
+[package]
+name = "yaml-probe"
+description = "YAML codec 选型探针：config.yaml 必须 100% 兼容，而 serde_yaml 已废弃"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde-saphyr.workspace = true

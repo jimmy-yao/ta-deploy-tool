@@ -1,0 +1,4 @@
+# 锁定工具链版本（rustup 用户生效；本机 Termux 用 pkg 装的 rust，忽略此文件）。
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

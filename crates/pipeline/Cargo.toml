@@ -1,0 +1,20 @@
+[package]
+name = "ta-deploy-tool-pipeline"
+description = "构建/部署流水线编排，对应 Go internal/pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ta-deploy-tool-proc.workspace = true
+ta-deploy-tool-config.workspace = true
+ta-deploy-tool-gitops.workspace = true
+ta-deploy-tool-builder.workspace = true
+ta-deploy-tool-deployer.workspace = true
+
+tokio.workspace = true
+tokio-util.workspace = true
+thiserror.workspace = true

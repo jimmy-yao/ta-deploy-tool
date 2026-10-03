@@ -1,0 +1,33 @@
+maven: D:/apache-maven-3.9.6/bin/mvn.cmd
+java_home: C:/Program Files/Java/jdk-17
+workspace: D:/work
+log_encoding: utf-8
+backup_keep: 5
+max_parallel_builds: 3
+default_restart_script: bin/start.sh
+auto_remote_name: false
+auto_rollback: true
+git:
+  enabled: true
+  branch_mode: iteration
+  default_branch: main
+  iteration_pattern: ^feature_(\d{8})_xc$
+  remote: origin
+  strategy: reset
+  fetch_timeout: 180
+  ls_remote_timeout: 60
+environments:
+  dev:
+    default_server:
+      host: 192.168.1.100
+      port: 22
+      user: deploy
+      password: your-password
+    services:
+      example-service:
+        project_dir: D:/work/example-service
+        build_args: clean install -DskipTests
+        local_jar: ""
+        remote_dir: /data/deploy/envs/tgfw-xc/example-service
+        remote_name: ""
+        depends_on: []
