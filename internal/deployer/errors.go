@@ -1,4 +1,4 @@
-// Package deployer 对应原 Python src/core/deployer.py：
+// Package deployer 对应原 Python legacy-python/src/core/deployer.py：
 // SSH 连接、SFTP 上传与备份、远程命令执行、回滚与日志监听。
 package deployer
 

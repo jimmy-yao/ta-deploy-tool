@@ -2,7 +2,7 @@ package builder
 
 import "github.com/jimmy-yao/ta-deploy-tool/internal/proc"
 
-// 以下类型/函数与原 Python src/core/builder.py 一一对应，
+// 以下类型/函数与原 Python legacy-python/src/core/builder.py 一一对应，
 // 实现统一收敛在 internal/proc 中，此处做别名以保持 builder 包的对外 API 稳定。
 
 // LogFn 日志回调（对应 Python log(text)）。

@@ -1,7 +1,7 @@
 // Package uiapp 是 GUI 的"视图模型 / 控制器"层：不依赖任何 GUI 框架，
 // 只维护界面状态（配置、勾选、分支解析、进度、日志）并驱动 internal/pipeline。
 //
-// 对应原 Python src/gui/main_window.py 的状态与回调逻辑，
+// 对应原 Python legacy-python/src/gui/main_window.py 的状态与回调逻辑，
 // 把它从 PySide6 中剥离出来，使得这些逻辑可以脱离显示器做单元测试。
 package uiapp
 

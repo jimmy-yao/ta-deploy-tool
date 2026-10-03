@@ -1,4 +1,4 @@
-// Package gitops 对应原 Python src/core/git_ops.py：
+// Package gitops 对应原 Python legacy-python/src/core/git_ops.py：
 // 远程分支枚举、迭代分支解析、仓库更新（reset / pull 两种策略）。
 package gitops
 

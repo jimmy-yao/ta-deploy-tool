@@ -14,7 +14,7 @@ import (
 	"github.com/jimmy-yao/ta-deploy-tool/internal/uiapp"
 )
 
-// ThemeMode 三套主题，对应原 Python src/gui/theme.py 中的
+// ThemeMode 三套主题，对应原 Python legacy-python/src/gui/theme.py 中的
 // MODERN_DARK_QSS / MODERN_LIGHT_QSS / MODERN_OCEANIC_QSS。
 type ThemeMode string
 

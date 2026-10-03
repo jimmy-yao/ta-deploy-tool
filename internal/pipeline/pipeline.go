@@ -1,4 +1,4 @@
-// Package pipeline 对应原 Python src/core/pipeline.py：
+// Package pipeline 对应原 Python legacy-python/src/core/pipeline.py：
 // Git 更新 → Maven 构建 → 部署 的三阶段流水线，带进度上报与取消。
 package pipeline
 

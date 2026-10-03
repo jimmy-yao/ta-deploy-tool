@@ -1,9 +1,11 @@
-# Spring Boot 部署工具
+# Spring Boot 部署工具（Go 版）
 
-基于 PySide6 + asyncssh + qasync 的桌面部署工具，用于在 Windows 本地构建 Spring Boot 微服务并上传到 Linux 服务器。
+基于 Go + [Fyne](https://fyne.io) 的桌面部署工具：在 Windows 本地构建 Spring Boot 微服务，
+再通过 SSH/SFTP 上传到 Linux 服务器。
 
-> **Go 重写版**：本仓库的 `refactor/go-rewrite` 分支同时包含 Go + Fyne 实现（仓库根目录的 `go.mod` / `cmd` / `internal` / `ui`），
-> 与原 Python 实现并存，配置文件 `config.yaml` 完全兼容。构建方式见文末「Go 重写版」。
+- 单个 exe，配置文件跟 exe 同目录，拷贝即用
+- **`config.yaml` 与原 PySide6 版 100% 字段兼容**，新旧版本可互相读取同一份配置
+- 原 Python 实现已归档到 [`legacy-python/`](legacy-python/)，仅作对照参考，不参与本分支的构建
 
 ## 功能
 
@@ -25,33 +27,20 @@
 
 1. **DeployTool.exe 同目录的 config.yaml**（首选）
    - 绿色版风格：拷贝 exe + config.yaml 到任何地方都能直接跑
-2. 用户目录（仅当 exe 同目录不可写时使用，例如放在 Program Files）
+2. 工作目录（`go run` / 开发时）
+3. 用户目录（仅当上面都不可写时使用，例如 exe 放在 Program Files）
    - Windows: `%APPDATA%\deploy_tool\config.yaml`
    - macOS:   `~/Library/Application Support/deploy_tool/config.yaml`
    - Linux:   `~/.config/deploy_tool/config.yaml`
 
-首次启动时，如果配置文件不存在，会从内置模板复制一份到 exe 同目录，并弹出提示。
+首次启动时，如果配置文件不存在，会从内置模板复制一份到 exe 同目录，并输出提示。
 
 窗口标题栏会显示当前实际使用的配置文件路径。
-
-## 安装（开发）
-
-    pip install -r requirements.txt
-
-## 运行（开发）
-
-    python main.py
-
-## 打包
-
-    build.bat
-
-产出 `dist\DeployTool.exe`，单文件，可直接发给同事。
 
 ## 用户使用
 
 1. 双击 `DeployTool.exe`
-2. 首次运行会提示已生成配置文件，点确定
+2. 首次运行会提示已生成配置文件
 3. 点「配置」按钮，可视化编辑 Maven 路径、Git 规则、环境、服务器、服务
 4. 保存后重新加载
 5. 勾选服务，点「打包」和「部署」
@@ -75,37 +64,17 @@
 ## 注意事项
 
 - 需要本机已安装 git 并加入 PATH
-- SSH 认证建议用 key；用密码可通过环境变量读取
-- 生产环境建议把 known_hosts=None 改为实际 known_hosts 路径
+- SSH 认证建议用 key；密码认证可由环境变量读取
+- SSH 默认不校验主机公钥（沿用旧版 `known_hosts=None` 行为）；
+  生产环境建议开启严格校验并配置 known_hosts 路径
 - git strategy=reset 会丢弃本地改动，构建机专用；开发者本地用 pull
-
-## 文件说明
-
-| 文件 | 说明 |
-|---|---|
-| main.py | 入口，启动 Qt + asyncio 事件循环，处理配置文件位置 |
-| ui.py | PySide6 主界面 |
-| config_editor.py | 配置可视化编辑对话框 |
-| pipeline.py | 部署流程编排（git -> build -> deploy） |
-| builder.py | Maven 构建 + 分支解析 |
-| git_ops.py | git 命令封装（异步） |
-| deployer.py | asyncssh SFTP 上传 + 远程命令 |
-| config.py | 配置加载、保存、校验、拓扑排序 |
-| config.template.yaml | 首次运行复制到 exe 同目录的模板 |
-
----
-
-# Go 重写版
-
-`refactor/go-rewrite` 分支用 Go + [Fyne](https://fyne.io) 全量重写了原 PySide6 实现，
-**`config.yaml` 与 Python 版 100% 字段兼容**，可与旧版互相读取同一份配置。
 
 ## 目录结构
 
 | 路径 | 说明 |
 |---|---|
 | `cmd/deploytool/` | 程序入口：参数解析、首次运行生成配置 |
-| `internal/config/` | 配置模型、加载/保存/校验、Java/Maven 自动探测 |
+| `internal/config/` | 配置模型、加载/保存/校验、克隆、Java/Maven 自动探测 |
 | `internal/proc/` | 子进程执行、UTF-8/GBK 输出解码、取消 |
 | `internal/builder/` | Maven 构建、jar 挑选、分支解析 |
 | `internal/gitops/` | git fetch/reset/pull、迭代分支解析 |
@@ -115,6 +84,9 @@
 | `ui/` | Fyne 界面：主题、主窗口、配置编辑器、回滚/远程日志对话框 |
 | `embed.go` | 嵌入 `config.template.yaml` 与窗口图标 |
 | `stdio_android.go` / `stdio_other.go` | Android 构建下还原被 Fyne 改道的标准输出 |
+| `config.template.yaml` | 首次运行复制到 exe 同目录的模板 |
+| `assets/` | 窗口图标 `app.png`（`app.ico` 已随 Python 版归档） |
+| `legacy-python/` | 原 PySide6 实现归档，只读参考 |
 
 ## 依赖
 
@@ -133,6 +105,7 @@ fyne.io/fyne/v2       # GUI
     go run ./cmd/deploytool          # 自动定位 / 首次生成 config.yaml
     go run ./cmd/deploytool -check   # 只校验配置（无 GUI，适合 CI）
     go run ./cmd/deploytool -config path/to/config.yaml
+    go run ./cmd/deploytool -version
 
 > **`-check` 对模板会报错，属预期**：按完整规则校验，而
 > `config.template.yaml` 里的 `example-service` 是占位服务，`project_dir` 为空，
@@ -163,13 +136,22 @@ CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc \
 ```
 
 单个 exe 内已嵌入 `config.template.yaml` 与图标，拷贝 exe + `config.yaml` 即可运行（绿色版）。
-配置文件查找顺序与 Python 版一致：**exe 同目录 → 工作目录 → 用户目录**
-（Windows `%APPDATA%\deploy_tool`、macOS `~/Library/Application Support/deploy_tool`、Linux `~/.config/deploy_tool`）。
+配置文件查找顺序：**exe 同目录 → 工作目录 → 用户目录**。
 
-## 与 Python 版的差异
+## 与旧版（Python）的差异
 
 - 界面用 Fyne 绘制，视觉上为同一套三主题配色（深色 / 浅色 / 海蓝），但不是 Qt 控件。
-- 不支持 Python 版的全局快捷键（Ctrl+B/D/L/R/F/Esc）。
+- 不支持旧版的全局快捷键（Ctrl+B/D/L/R/F/Esc）。
 - `environments` 下的环境名在 YAML 输出时按**字母序**排列（yaml.v3 对 map 的确定性排序）；
   Python 版保留文件中的书写顺序。功能不受影响。
-- 打包按钮语义与 Python 一致：「打包」= 仅构建，「部署」= 仅部署（均按 `depends_on` 拓扑排序）。
+- 打包按钮语义与旧版一致：「打包」= 仅构建，「部署」= 仅部署（均按 `depends_on` 拓扑排序）。
+- 旧版 PyInstaller / Nuitka 打包流程不再适用，改用上面的 Go 打包命令。
+
+## 历史实现 `legacy-python/`
+
+原 PySide6 + asyncssh + qasync 实现整体归档在 [`legacy-python/`](legacy-python/)，
+便于对照行为与排查回归，**不是本分支的构建目标**。
+
+- 归档时保持原有目录结构，仅根目录下新增了说明文件
+- PyInstaller / Nuitka 的 CI 工作流已随归档移出 `.github/workflows/`，不会再被触发
+- 若要重新构建旧版，见 [`legacy-python/README.md`](legacy-python/README.md)

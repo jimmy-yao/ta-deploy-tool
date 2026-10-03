@@ -1,4 +1,4 @@
-// Package builder 对应原 Python src/core/builder.py：
+// Package builder 对应原 Python legacy-python/src/core/builder.py：
 // Maven 异步构建、构建产物挑选、Git 更新编排、进程树清理。
 package builder
 
