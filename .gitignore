@@ -1,0 +1,24 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- Go ----
+/dist/
+/deploytool
+/deploytool.exe
+*.test
+*.out
+*.prof
+
+# ---- 打包产物 ----
+build/
+*.apk
+*.aab
+
+# ---- IDE / 系统 ----
+.idea/
+.vscode/
+.DS_Store
