@@ -25,6 +25,9 @@ const (
 	PhaseUploadDone   = "upload_done"
 	PhaseRestartStart = "restart_start"
 	PhaseRestartDone  = "restart_done"
+	// 重启失败触发自动回滚时的两个阶段
+	PhaseRollbackStart = "rollback_start"
+	PhaseRollbackDone  = "rollback_done"
 )
 
 // DeployExecuteError 部署执行期业务异常（对应 Python DeployExecuteError）。

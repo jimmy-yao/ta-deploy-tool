@@ -2,6 +2,7 @@ package deployer
 
 import (
 	"context"
+	"fmt"
 	"path"
 	"sort"
 	"strconv"
@@ -20,6 +21,11 @@ type DeployOptions struct {
 	BackupKeep int
 	// DefaultRestartScript 服务未显式配置 restart_cmd 时使用的脚本名
 	DefaultRestartScript string
+	// AutoRollback 重启失败时自动把部署前的版本放回去并重新重启一次。
+	//
+	// 关闭时只报错，线上文件保持新版本不动，由人工处理 —— 对应配置项
+	// auto_rollback，基准默认 true。
+	AutoRollback bool
 	// Conn SSH 连接选项
 	Conn Options
 	// Now 覆盖时间戳（测试用），零值表示 time.Now()
@@ -135,9 +141,10 @@ func DeployService(
 	}
 	defer sc.Close()
 
-	// outcome 记录备份落点，重启失败时据此自动回滚（下一阶段接入）
-	if _, err := uploadJar(ctx, sc, localJar, svc.RemoteDir, svc.RemoteName,
-		log, opts.Progress, opts.BackupKeep, opts.now()); err != nil {
+	// outcome 记录备份落点：重启失败时据此把部署前的版本放回去
+	outcome, err := uploadJar(ctx, sc, localJar, svc.RemoteDir, svc.RemoteName,
+		log, opts.Progress, opts.BackupKeep, opts.now())
+	if err != nil {
 		return err
 	}
 	opts.emitPhase(PhaseUploadDone)
@@ -145,13 +152,91 @@ func DeployService(
 	if restartEnabled {
 		opts.emitPhase(PhaseRestartStart)
 		if err := conn.Run(ctx, restartCmd, log); err != nil {
-			return err
+			// 此刻新版本已覆盖线上、部署前版本在 .bak 里，
+			// 不兜底的话服务会一直起不来 —— 交给回滚逻辑收尾。
+			return opts.rollbackAfterRestartFailure(
+				ctx, conn, sc, svc, outcome, restartCmd, err, log)
 		}
 		opts.emitPhase(PhaseRestartDone)
 	}
 
 	log("=== [部署完成] " + svc.Name + " ===")
 	return nil
+}
+
+// rollbackAfterRestartFailure 重启失败后的兜底：
+// 恢复部署前版本并重新重启，最后统一返回失败。
+//
+// 无论回滚是否成功，本函数都以错误结束 —— 部署本身已经失败，
+// 绝不能因为"回滚做完了"就让调用方把它当成部署成功。
+func (o DeployOptions) rollbackAfterRestartFailure(
+	ctx context.Context,
+	conn *Conn,
+	sc *sftp.Client,
+	svc *config.ServiceConfig,
+	outcome *uploadOutcome,
+	restartCmd string,
+	restartErr error,
+	log LogFn,
+) error {
+	remoteFinal := remoteJoin(outcome.RemoteDir, outcome.RemoteName)
+	backupPath := outcome.BackupPath
+
+	deployedVersion := backupPath
+	if deployedVersion == "" {
+		deployedVersion = "(无，首次部署)"
+	}
+	detail := fmt.Sprintf(
+		"重启命令失败: %s\n  原因: %v\n  新版本已就位: %s\n  部署前版本: %s",
+		restartCmd, restartErr, remoteFinal, deployedVersion)
+
+	if !o.AutoRollback {
+		return deployErrf(
+			"%s\n  自动回滚已关闭：线上文件保持新版本不动，服务未重启成功，请人工处理。",
+			detail)
+	}
+	if outcome.RemoteName == "" || backupPath == "" {
+		return deployErrf(
+			"%s\n  没有可回滚的部署前版本（首次部署或 remote_name 为空）："+
+				"线上文件保持新版本不动，服务未重启成功。",
+			detail)
+	}
+
+	log("=== [重启失败] " + svc.Name + ": " + restartErr.Error() + " ===")
+	log("=== [自动回滚] " + svc.Name + " -> 恢复部署前版本 ===")
+	o.emitPhase(PhaseRollbackStart)
+
+	failedPath, err := restoreBackup(
+		sc, outcome.RemoteDir, outcome.RemoteName, backupPath, o.now(), log)
+	if err != nil {
+		return err
+	}
+
+	log("[回滚] 重新执行重启命令: " + restartCmd)
+	rollbackRestartErr := conn.Run(ctx, restartCmd, log)
+	if rollbackRestartErr != nil {
+		if ctx.Err() != nil {
+			log("[警告] 回滚后的重启被取消，服务可能尚未启动，请手动执行重启脚本")
+			return ctx.Err()
+		}
+		log("[警告] 回滚后的重启仍失败: " + rollbackRestartErr.Error())
+	}
+
+	o.emitPhase(PhaseRollbackDone)
+
+	if rollbackRestartErr == nil {
+		return deployErrf(
+			"%s\n  [已自动回滚] 部署前版本已恢复并重启成功: %s"+
+				"\n  本次失败的新版本已隔离留存: %s"+
+				"\n  部署结果: 失败（请修复重启脚本或服务问题后重试）",
+			detail, outcome.RemoteName, failedPath)
+	}
+	return deployErrf(
+		"%s\n  [回滚部分完成] 部署前版本已恢复: %s"+
+			"\n  但回滚后的重启仍失败: %v"+
+			"\n  本次失败的新版本已隔离留存: %s"+
+			"\n  服务当前很可能处于停止状态，请立即手动执行: %s",
+		detail, backupPath, rollbackRestartErr, failedPath, restartCmd)
 }
 
 // serverLabel 返回 "name@host:port"。

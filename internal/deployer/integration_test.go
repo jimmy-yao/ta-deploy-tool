@@ -416,6 +416,181 @@ func TestITDeployRestartFailureAborts(t *testing.T) {
 	}
 }
 
+// ---------- 2b. 重启失败自动回滚 ----------
+
+// listRemoteNames 列出远端目录下的文件名。
+func listRemoteNames(t *testing.T, srv config.ServerConfig, dir string) []string {
+	t.Helper()
+	conn, err := Dial(context.Background(), srv, Options{})
+	if err != nil {
+		t.Fatalf("连接失败: %v", err)
+	}
+	defer conn.Close()
+	var names []string
+	if err := SFTPOn(conn, func(sc *sftp.Client) error {
+		entries, err := sc.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("列出远端目录失败: %v", err)
+	}
+	return names
+}
+
+// failingRestartCmd 构造"按线上文件内容决定成败"的重启命令：
+// 线上是 version-2 就失败，回滚回部署前版本后自然成功。
+// 这样一次部署就能走完"新版本起来失败 -> 自动回滚 -> 旧版本重启成功"。
+func failingRestartCmd(remoteDir, marker string) string {
+	return "if grep -q " + marker + " " + remoteDir + "/app.jar; then exit 3; fi"
+}
+
+func TestITDeployAutoRollbackRestoresPrevious(t *testing.T) {
+	srv := itServer(t)
+	remoteDir := itWorkDir(t)
+	svc := &config.ServiceConfig{
+		Name: "it-svc", RemoteDir: remoteDir, RemoteName: "app.jar",
+	}
+	svc.RestartCmd = config.StrPtr(failingRestartCmd(remoteDir, "version-2"))
+
+	v1 := itJar(t, "version-1")
+	if err := DeployService(context.Background(), srv, svc, v1, DeployOptions{
+		BackupKeep: 3, DefaultRestartScript: "start.sh", AutoRollback: true,
+	}); err != nil {
+		t.Fatalf("部署 v1 应成功: %v", err)
+	}
+
+	var phases, logs []string
+	v2 := itJar(t, "version-2")
+	err := DeployService(context.Background(), srv, svc, v2, DeployOptions{
+		BackupKeep: 3, DefaultRestartScript: "start.sh", AutoRollback: true,
+		Log:   func(s string) { logs = append(logs, s) },
+		Phase: func(p string) { phases = append(phases, p) },
+	})
+
+	// 回滚成功也绝不能让调用方当成部署成功
+	if err == nil {
+		t.Fatal("重启失败的部署必须返回错误，即使回滚成功")
+	}
+	for _, want := range []string{"重启命令失败", "退出码 3", "[已自动回滚]"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误信息缺少 %q:\n%v", want, err)
+		}
+	}
+	if !strings.Contains(err.Error(), "部署结果: 失败") {
+		t.Errorf("结尾必须点明部署本身是失败的:\n%v", err)
+	}
+
+	// 线上必须回到部署前版本
+	if got := readRemote(t, srv, remoteDir+"/app.jar"); got != "version-1" {
+		t.Errorf("回滚后线上内容应为 version-1, 得到 %q", got)
+	}
+
+	// 被换下来的新版本隔离留存，便于事后取证
+	var failedName string
+	for _, n := range listRemoteNames(t, srv, remoteDir) {
+		if strings.Contains(n, ".failed.") {
+			failedName = n
+		}
+	}
+	if failedName == "" {
+		t.Fatalf("被隔离的新版本未找到: %v", listRemoteNames(t, srv, remoteDir))
+	}
+	if got := readRemote(t, srv, remoteDir+"/"+failedName); got != "version-2" {
+		t.Errorf("隔离文件应保留失败的新版本, 得到 %q", got)
+	}
+
+	for _, want := range []string{PhaseRollbackStart, PhaseRollbackDone} {
+		if !containsStr(phases, want) {
+			t.Errorf("缺少阶段 %s: %v", want, phases)
+		}
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "[自动回滚]") {
+		t.Errorf("缺少自动回滚日志: %v", logs)
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "[回滚] 重新执行重启命令") {
+		t.Errorf("回滚后应重新执行重启命令: %v", logs)
+	}
+}
+
+func TestITDeployAutoRollbackDisabled(t *testing.T) {
+	srv := itServer(t)
+	remoteDir := itWorkDir(t)
+	svc := &config.ServiceConfig{
+		Name: "it-svc", RemoteDir: remoteDir, RemoteName: "app.jar",
+	}
+	svc.RestartCmd = config.StrPtr(failingRestartCmd(remoteDir, "version-2"))
+
+	v1 := itJar(t, "version-1")
+	if err := DeployService(context.Background(), srv, svc, v1, DeployOptions{
+		BackupKeep: 3, DefaultRestartScript: "start.sh", AutoRollback: true,
+	}); err != nil {
+		t.Fatalf("部署 v1 应成功: %v", err)
+	}
+
+	var phases []string
+	v2 := itJar(t, "version-2")
+	err := DeployService(context.Background(), srv, svc, v2, DeployOptions{
+		BackupKeep: 3, DefaultRestartScript: "start.sh", AutoRollback: false,
+		Phase: func(p string) { phases = append(phases, p) },
+	})
+	if err == nil {
+		t.Fatal("重启失败应报错")
+	}
+	if !strings.Contains(err.Error(), "自动回滚已关闭") {
+		t.Errorf("应说明自动回滚被关闭: %v", err)
+	}
+	// 关闭回滚 = 线上文件保持新版本不动
+	if got := readRemote(t, srv, remoteDir+"/app.jar"); got != "version-2" {
+		t.Errorf("关闭回滚时线上应保持新版本, 得到 %q", got)
+	}
+	for _, want := range []string{PhaseRollbackStart, PhaseRollbackDone} {
+		if containsStr(phases, want) {
+			t.Errorf("关闭回滚时不应触发 %s: %v", want, phases)
+		}
+	}
+}
+
+func TestITDeployRestartFailureFirstDeployNoBackup(t *testing.T) {
+	srv := itServer(t)
+	remoteDir := itWorkDir(t)
+	svc := &config.ServiceConfig{
+		Name: "it-svc", RemoteDir: remoteDir, RemoteName: "app.jar",
+	}
+	svc.RestartCmd = config.StrPtr("exit 3")
+
+	jar := itJar(t, "v1")
+	err := DeployService(context.Background(), srv, svc, jar, DeployOptions{
+		BackupKeep: 3, DefaultRestartScript: "start.sh", AutoRollback: true,
+	})
+	if err == nil {
+		t.Fatal("重启失败应报错")
+	}
+	if !strings.Contains(err.Error(), "没有可回滚的部署前版本") {
+		t.Errorf("首次部署无备份时应说明不可回滚: %v", err)
+	}
+	if !strings.Contains(err.Error(), "(无，首次部署)") {
+		t.Errorf("应点明这是首次部署: %v", err)
+	}
+	// 无备份时线上文件不动
+	if got := readRemote(t, srv, remoteDir+"/app.jar"); got != "v1" {
+		t.Errorf("线上应保持刚上传的新版本, 得到 %q", got)
+	}
+}
+
+func containsStr(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
 // ---------- 3. 回滚 ----------
 
 func TestITRollback(t *testing.T) {

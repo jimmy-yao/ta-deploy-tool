@@ -88,6 +88,37 @@ func TestLoadMinimal(t *testing.T) {
 	if cfg.Git.DefaultBranch != "main" {
 		t.Errorf("git.default_branch 默认值错误: %q", cfg.Git.DefaultBranch)
 	}
+	// 基准新增的三个键必须在缺省时仍取 dataclass 的默认值：
+	// 老配置文件里没有这些键，取到零值会让"自动回滚"静默失效、
+	// 并发数被压成 0。
+	if cfg.MaxParallelBuilds != 3 {
+		t.Errorf("max_parallel_builds 缺省应为 3, 实际 %d", cfg.MaxParallelBuilds)
+	}
+	if cfg.EffectiveMaxParallelBuilds() != 3 {
+		t.Errorf("EffectiveMaxParallelBuilds 缺省应为 3, 实际 %d",
+			cfg.EffectiveMaxParallelBuilds())
+	}
+	if !cfg.AutoRollback {
+		t.Error("auto_rollback 缺省应为 true（老配置文件里没有该键）")
+	}
+	if cfg.DefaultRestartScript != "bin/start.sh" {
+		t.Errorf("default_restart_script 缺省应为 bin/start.sh, 实际 %q",
+			cfg.DefaultRestartScript)
+	}
+}
+
+// TestLoadExplicitFalseNotOverridden 显式写 false 必须被保留，
+// 不能被缺省值兜底逻辑顶掉。
+func TestLoadExplicitFalseNotOverridden(t *testing.T) {
+	raw := "maven: /usr/bin/mvn\nauto_rollback: false\nmax_parallel_builds: 0\n"
+	cfg := mustLoad(t, raw)
+	if cfg.AutoRollback {
+		t.Error("显式 false 应被保留")
+	}
+	// 0 是"用默认"以外的显式输入，Effective* 归 1（对应 Python max(1, ...)）
+	if cfg.EffectiveMaxParallelBuilds() != 1 {
+		t.Errorf("0 应归到 1, 实际 %d", cfg.EffectiveMaxParallelBuilds())
+	}
 }
 
 func TestLoadFull(t *testing.T) {

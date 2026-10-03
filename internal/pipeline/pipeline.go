@@ -251,6 +251,7 @@ func (p *Pipeline) Run(ctx context.Context) error {
 				Log:                  p.opts.Log,
 				BackupKeep:           p.opts.Cfg.BackupKeep,
 				DefaultRestartScript: p.opts.Cfg.DefaultRestartScript,
+				AutoRollback:         p.opts.Cfg.AutoRollback,
 				Progress:             p.makeProgressCb(baseUnits, lastReported, name, svc.RemoteName, totalUnits),
 				Phase:                p.makePhaseCb(baseUnits, name, svc.RemoteName, totalUnits),
 			}
@@ -339,6 +340,10 @@ func (p *Pipeline) makePhaseCb(baseVal int, svcName, fileName string, totalUnits
 			p.emit(baseVal+UploadShare, totalUnits, fmt.Sprintf("%s: 执行重启命令", svcName))
 		case deployer.PhaseRestartDone:
 			p.emit(baseVal+UploadShare, totalUnits, fmt.Sprintf("%s: 重启完成", svcName))
+		case deployer.PhaseRollbackStart:
+			p.emit(baseVal+UploadShare, totalUnits, fmt.Sprintf("%s: 重启失败，自动回滚中", svcName))
+		case deployer.PhaseRollbackDone:
+			p.emit(baseVal+UploadShare, totalUnits, fmt.Sprintf("%s: 已回滚到部署前版本", svcName))
 		}
 	}
 }
