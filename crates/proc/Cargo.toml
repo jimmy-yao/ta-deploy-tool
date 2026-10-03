@@ -10,3 +10,10 @@ publish.workspace = true
 
 [dependencies]
 encoding_rs.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+
+# Unix 侧杀整棵进程树要 kill(-pgid)，没有等价的标准库 API。
+# Windows 侧走 taskkill，不需要。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
