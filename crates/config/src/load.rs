@@ -154,18 +154,22 @@ fn expand_vars(s: &str) -> String {
         }
 
         // Windows 独有的 %NAME%
+        // 两层嵌套都并进 let-chain —— edition 2024 下 clippy::collapsible_if
+        // 会报「this `if` statement can be collapsed」，而这整个分支是
+        // #[cfg(windows)]，Linux 的 clippy 根本不编译它，看不见。
+        // 语义不变：内层没有 else，条件不成立时照旧落到下面按字符宽度推进。
         #[cfg(windows)]
-        if c == b'%' {
-            if let Some(rel) = s[i + 1..].find('%') {
-                let end = i + 1 + rel;
-                let name = &s[i + 1..end];
-                if !name.is_empty() {
-                    if let Ok(v) = std::env::var(name) {
-                        out.push_str(&v);
-                        i = end + 1;
-                        continue;
-                    }
-                }
+        if c == b'%'
+            && let Some(rel) = s[i + 1..].find('%')
+        {
+            let end = i + 1 + rel;
+            let name = &s[i + 1..end];
+            if !name.is_empty()
+                && let Ok(v) = std::env::var(name)
+            {
+                out.push_str(&v);
+                i = end + 1;
+                continue;
             }
         }
 
