@@ -70,8 +70,20 @@ a = Analysis(
 )
 
 # 精准过滤未使用的 Qt 巨型动态库 (.dll) 与插件，彻底瘦身
+#
+# ⚠ 'Qt6OpenGL' **不能**再加回来。它看着无人使用，但有 7 个被打包的库
+#   链着它（libQt6EglFSDeviceIntegration / libqminimalegl / 5 个
+#   waylandcompositor server 插件）。删掉它 = 留下唯一的悬空依赖，
+#   那几个库一旦被 dlopen 就直接失败，而且报的是 "could not load Qt
+#   platform plugin" 这种指向完全错误的信息。
+#   代价是多 710KB（产物 74MB 里的零头），比兜住一个静默炸点便宜得多。
+#
+#   2026-10-04 用 readelf 对 PySide6 的 388 个自带共享库做了全量
+#   NEEDED 扫描：这是**唯一**一处悬空。桌面路径 libqxcb.so 不依赖它，
+#   所以 X11/Wayland 下一直没暴露 —— 只有显式 QT_QPA_PLATFORM=eglfs
+#   或 minimal-egl 才会踩到。
 unwanted_keywords = [
-    'Qt6Pdf', 'Qt6Qml', 'Qt6Quick', 'Qt6VirtualKeyboard', 'Qt6OpenGL',
+    'Qt6Pdf', 'Qt6Qml', 'Qt6Quick', 'Qt6VirtualKeyboard',
     'Qt6NetworkAuth', 'Qt6Bluetooth', 'Qt6Designer', 'Qt63D',
     'qpdf', 'qtvirtualkeyboard', 'qicns', 'qtiff', 'qwebp', 'qtga'
 ]
