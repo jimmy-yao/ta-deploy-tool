@@ -1,0 +1,154 @@
+# Rust workspace 的门禁 CI。
+#
+# 改之前先读这几条，①②③ 是实测出来的，不是想当然：
+#
+# ① 工具链不用装。`rust-toolchain.toml` 锁 1.98.1 并列了 rustfmt / clippy，
+#    runner 上的 rustup 在 checkout 后第一次跑 cargo 就会自动装齐，
+#    所以这里既没有 dtolnay/rust-toolchain 也不用 `rustup component add`。
+#
+# ② `Cargo.lock` 已跟踪（二进制项目必须跟踪）→ 一律加 `--locked`，
+#    上游依赖发新版不会让 CI 无缘无故变红。
+#    全 workspace 无 `build.rs`，构建期不联网。
+#
+# ③ ubuntu job **必须显式装 openssh-server**。
+#    `crates/deployer/tests` 要在本机起一个 sshd，但它的策略是「起不来就
+#    `eprintln!` 一句跳过然后 `return`」—— **测试照样算通过**。镜像里没有
+#    sshd 的话，SSH 那层覆盖会悄悄掉光而 CI 依然全绿。装上它才会真跑。
+#    （已实测：非 root 起 sshd + 私钥认证 + SFTP 子系统全通，不需要 sudo，
+#     也不需要 /run/sshd —— 测试里那句 create_dir 只在 root 启动时才卡。）
+#
+# ④ Windows 上集成测试**根本不编译**：`crates/deployer/tests` 与
+#    `crates/builder/tests` 都是 `#![cfg(unix)]`。所以 windows job 只跑单测
+#    + build --release，跑 clippy/fmt 是重复劳动（ubuntu 已经跑过）。
+#
+# ⑤ 私有仓库要烧分钟数：ubuntu 1x / windows 2x / macos 10x（Free 每月 2000）。
+#    想省就把 windows job 整个删掉 —— 四道门禁在 ubuntu 上已经是完整的，
+#    windows job 的价值只在于「主目标平台真的编得过、单测也过」。
+#
+# ⑥ 没有 GUI 冒烟。界面行为由 `crates/ui` 的 80 个无头测试覆盖
+#    （`egui::Context::run_ui` 驱动，不需要显示器）；「真的开一个窗口」这一步
+#    有意不做。要加的话见文件末尾注释掉的 xvfb 片段。
+#
+# ── 本地复现（顺序就是下面 job 里的顺序，先跑便宜的）─────────────────────
+#   cargo fmt --all --check
+#   python3 scripts/check_layering.py
+#   cargo clippy --workspace --all-targets --locked -- -D warnings
+#   cargo test  --workspace --locked
+#
+# 注意 `cargo clippy --all-targets` 本身**不会**让警告变红，必须显式
+# `-D warnings` —— 本地那句「0 warning」靠的是人看输出，CI 里没人看。
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# 同一 ref 上的新 push 取消上一次还在跑的 —— 省分钟数的最有效手段
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 只读：CI 不需要写仓库的权限
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ------------------------------------------------------------------
+  # 四道门禁。这是这个仓库唯一的"正确性"信号。
+  # ------------------------------------------------------------------
+  gates:
+    name: 门禁 · ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # 必须装，理由见文件头 ③。漏了这步 deployer 的 SSH 集成测试会静默跳过。
+      - name: 装 openssh-server（deployer 集成测试要起本机 sshd）
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q openssh-server
+
+      # 第三方 action，只做 target/ 缓存，删掉只是变慢、不影响正确性。
+      - uses: Swatinem/rust-cache@v2
+
+      # —— 便宜的先跑，快速失败 ——
+      - name: 格式检查
+        run: cargo fmt --all --check
+
+      - name: 分层断言（Cargo 没有 internal/，边界靠这个脚本）
+        run: python3 scripts/check_layering.py
+
+      - name: clippy（警告即错误）
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: 测试
+        run: cargo test --workspace --locked
+
+      # 无窗口路径冒烟：-v 不需要显示器，用来确认 bin 真的链接出来了。
+      # 注意 `--check` 对 config.template.yaml 是**预期失败**（退出码 1，
+      # 只报 Maven 路径），不能拿它的退出码当断言。
+      - name: 冒烟
+        run: cargo run --locked -p ta-deploy-tool-cli -- --version
+
+  # ------------------------------------------------------------------
+  # 主目标平台。集成测试在这里不编译（文件头 ④），价值在"编得过 + 单测过"。
+  # 计 2x 分钟，要省可整段删除。
+  # ------------------------------------------------------------------
+  windows:
+    name: 构建 · windows
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 单测：config / builder / proc / cli 里已有成体系的 #[cfg(windows)] 分支，
+      # 但**这条 job 没在本机实跑过**（开发机是 linux/aarch64）——
+      # 第一次 push 上去如果有平台相关的单测红了，是发现而不是回归。
+      - name: 测试（单测）
+        run: cargo test --workspace --locked
+
+      - name: release 构建（单 exe）
+        run: cargo build --release --locked
+
+      - name: 冒烟
+        shell: pwsh
+        run: .\target\release\deploytool.exe --version
+
+      # 产物只留 7 天，方便下载看一眼。要按 tag 发 Release 资产另建一个
+      # workflow，别塞在这里 —— 门禁和发版的触发条件不一样。
+      - uses: actions/upload-artifact@v7
+        with:
+          name: deploytool-windows
+          path: target/release/deploytool.exe
+          retention-days: 7
+
+# ── 可选：GUI 真开窗口的冒烟（默认不加，理由见文件头 ⑥）─────────────────
+#
+# ubuntu 上要真开窗口得有 X server，用 xvfb 虚一个：
+#
+#       - name: 装 xvfb
+#         run: sudo apt-get install -y -q xvfb
+#       - name: GUI 冒烟（能撑过 5 秒没崩就算过）
+#         run: |
+#           set +e
+#           xvfb-run -a ./target/debug/deploytool &
+#           pid=$!
+#           sleep 5
+#           if kill -0 $pid 2>/dev/null; then
+#             echo "窗口起来了"; kill $pid; exit 0
+#           else
+#             echo "5 秒内就退了"; cat crash.log 2>/dev/null; exit 1
+#           fi
+#
+# 风险：egui/wgpu 在纯软件渲染（llvmpipe）下首次初始化较慢，5 秒阈值可能
+# 需要放宽；另外 CI 是私有仓库，xvfb 本身不额外计费但会多花 1~2 分钟。
