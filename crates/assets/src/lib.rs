@@ -17,6 +17,33 @@ pub const TEMPLATE_YAML: &[u8] = include_bytes!("../../../config.template.yaml")
 /// 对应 Go 的 `deploytool.AppIconPNG`。
 pub const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/app.png");
 
+/// 中文字体子集 `assets/NotoSansSC-subset.otf` 的原始内容。
+///
+/// # 为什么必须自带
+///
+/// egui/epaint 的默认字体链只有 `Ubuntu-Light` / `Hack` / `NotoEmoji-Regular` /
+/// `emoji-icon-font`，**一个都不含 CJK 字形**。`epaint` 找不到字形时不是留空，
+/// 而是整段替换掉（`text/fonts.rs` 的 `PRIMARY_REPLACEMENT_CHAR = '◻'`），
+/// 于是界面上那 4744 个中文字会全部变成 `◻◻◻`。Qt 基准靠系统字体兜底，
+/// egui 没有这一层 —— 见 `docs/MIGRATION.md` 的 UI 近似表。
+///
+/// # 子集范围
+///
+/// GB2312 全集（6763 汉字 + 符号）+ ASCII + 全角标点 + 仓库内实际出现的汉字
+/// ≈ 7479 码点 / 8138 字形，**1.7MB**（原字体 8.3MB）。
+///
+/// 不能只子集源码里用到的字：日志区会显示 git / Maven / 远端 shell 的**外部**
+/// 输出，任何汉字都可能冒出来。
+///
+/// # 授权
+///
+/// SIL Open Font License 1.1（已写进字体 name 表 ID 13），明确允许嵌入
+/// 可执行文件并随软件再分发。
+pub const CJK_FONT: &[u8] = include_bytes!("../../../assets/NotoSansSC-subset.otf");
+
+/// [`CJK_FONT`] 在 `FontDefinitions` 里的键名。
+pub const CJK_FONT_NAME: &str = "NotoSansSC-subset";
+
 /// 版本号。
 ///
 /// 对应 Go 的 `deploytool.Version`：Go 靠 `-ldflags -X ...Version=x.y.z` 在
@@ -51,6 +78,27 @@ mod tests {
             APP_ICON_PNG.starts_with(b"\x89PNG\r\n\x1a\n"),
             "窗口图标必须是 PNG，实际首字节 {:?}",
             &APP_ICON_PNG[..8.min(APP_ICON_PNG.len())]
+        );
+    }
+
+    /// 中文字体必须是能被 `skrifa` 解析的 OpenType。
+    ///
+    /// 空文件 / 被截断的文件会让界面上所有汉字退回 `◻` —— 正是这次要修的
+    /// bug，不能让它静默复发。字形能不能真解析由 `ui` 的
+    /// `install_cjk_font_makes_chinese_renderable` 钉，这里只拦"文件本身坏了"。
+    #[test]
+    fn cjk_font_is_opentype() {
+        assert!(
+            CJK_FONT.starts_with(b"OTTO") || CJK_FONT.starts_with(b"\x00\x01\x00\x00"),
+            "中文字体必须是 OpenType（OTTO / TrueType 头），实际首字节 {:?}",
+            &CJK_FONT[..4.min(CJK_FONT.len())]
+        );
+        // 全量 8.3MB、当前子集 1.7MB。掉到几十 KB 说明子集生成时字符集是空的
+        // —— 那种文件依然是合法 OTF，只有这条量级断言能拦住。
+        assert!(
+            CJK_FONT.len() > 500_000,
+            "中文字体只有 {} 字节，子集多半生成坏了",
+            CJK_FONT.len()
         );
     }
 

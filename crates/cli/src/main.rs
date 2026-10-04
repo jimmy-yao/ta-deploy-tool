@@ -1,3 +1,17 @@
+// Windows 上不弹那个空的 cmd 黑窗。
+//
+// 基准 `TA_DEPLOY_TOOL.spec` 是 `console=False` 的**纯 GUI 入口**；Go 版
+// `cmd/deploytool` 把它改成了控制台程序（docs/MIGRATION.md 差异 29）。Rust
+// 不声明子系统就继承了 Go 这条偏离：双击 `deploytool.exe` 会同时开一个**空的**
+// cmd 窗口（GUI 路径压根不往 stdout 写，所以它一个字都没有）。
+//
+// 写成 `cfg_attr(windows, …)` 而非无条件声明：这个属性只在链接 Windows PE 时
+// 有意义，条件式让它在 Linux / macOS 构建里根本不出现。
+//
+// 代价是 windowed 子系统下双击启动**没有控制台**、`stderr` 为无效句柄，而
+// `println!` / `eprintln!` 写失败会 panic —— 下面 `fatal()` 与
+// `ui::show_native_error` 已改成忽略写错误，GUI 路径的启动失败另补原生弹窗。
+#![cfg_attr(windows, windows_subsystem = "windows")]
 //! 可执行入口 —— 对应 Go 的 `cmd/deploytool/main.go`，
 //! 行为基准是仓库根的 `main.py`（配置定位与首启文案）。
 //!
@@ -23,6 +37,7 @@
 mod locate;
 
 use std::fmt::Display;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
@@ -74,7 +89,20 @@ fn main() {
                 notice = located.notice;
                 located.path
             }
-            Err(err) => fatal(err),
+            Err(err) => {
+                // GUI 路径没有控制台（见文件头 `windows_subsystem`），stderr
+                // 写出去没人看得见 —— 改成 windowed 之前这条错误还能在 cmd 窗口
+                // 里闪一下，之后会退化成「双击后什么都没发生」。基准 `main.py`
+                // 在这条路上弹的是 `QMessageBox`（差异 29），这里补同一个原生
+                // 弹窗。`--check` 一定是在终端里跑的，走 stderr 才是对的渠道。
+                if !cli.check {
+                    ta_deploy_tool_ui::show_native_error(
+                        "TA-DEPLOY-TOOL 启动失败",
+                        &format!("[错误] {err}"),
+                    );
+                }
+                fatal(err);
+            }
         },
     };
 
@@ -154,8 +182,12 @@ fn check_config(path: &Path) -> anyhow::Result<()> {
 }
 
 /// 对应 Go `fatal`：`[错误] {err}` 走 stderr、退出码 1。
+///
+/// 用 `writeln!` 并忽略错误，而不是 `eprintln!`：windowed 子系统下双击启动
+/// **没有控制台**，`stderr` 是无效句柄，`eprintln!` 写失败会 panic —— 那会把
+/// 「配置定位失败、退出码 1」升级成一次崩溃，连退出码都不再有意义。
 fn fatal(err: impl Display) -> ! {
-    eprintln!("[错误] {err}");
+    let _ = writeln!(std::io::stderr(), "[错误] {err}");
     std::process::exit(1);
 }
 

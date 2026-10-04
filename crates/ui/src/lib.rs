@@ -67,6 +67,7 @@ pub mod sidebar;
 pub mod theme;
 pub mod widgets;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -122,6 +123,10 @@ pub fn run(config_path: impl Into<PathBuf>, first_run: Option<FirstRun>) -> Resu
         options,
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
+            // 字体和主题都必须在**第一次画之前**装好，否则第一帧会闪一下默认
+            // 色 / 把汉字画成 `◻`。顺序上字体在前：`theme::apply` 只改
+            // `Style`（字号、颜色），不碰 `FontDefinitions`，两者互不覆盖。
+            install_cjk_font(&ctx);
             // 主题必须在**第一次画之前**装好，否则第一帧会闪一下默认色
             let mode = theme::load(cc.storage);
             theme::apply(&ctx, mode);
@@ -200,6 +205,51 @@ fn app_icon() -> Option<egui::IconData> {
 }
 
 // ============================================================
+// 中文字体
+// ============================================================
+
+/// 装中文字体 —— 不装的话界面上**每个汉字都画成 `◻`**。
+///
+/// # 为什么必须做这一步
+///
+/// egui/epaint 的默认字体族是 `FontFamily::Proportional → ["Ubuntu-Light",
+/// "NotoEmoji-Regular", "emoji-icon-font"]`、`Monospace → ["Hack", …]`，
+/// 一个都不含 CJK 字形。`epaint` 查不到字形时走的是
+/// `text/fonts.rs` 的 `PRIMARY_REPLACEMENT_CHAR = '◻'` —— 不是留空，而是**整段
+/// 替换**，于是本仓库字符串里那 4744 个中文字（596 条文案，覆盖主窗口、弹窗、
+/// 日志区）会全部变成方块。Qt 基准靠系统字体兜底，egui 没有这层。
+///
+/// # 为什么用 `set_fonts` 而不是 `ctx.add_font`
+///
+/// `add_font(FontInsert)` 要的 `FontInsert` / `InsertFontFamily` /
+/// `FontPriority` **没有被 `egui` re-export**（`ui` 只依赖 `egui`，为这三个
+/// 类型单拉一个 `epaint` 依赖不值当）。`set_fonts(FontDefinitions)` 收的是
+/// re-export 过的 `FontDefinitions` / `FontData` / `FontFamily`，够用。
+///
+/// # 为什么挂到链尾（`push` 而不是插到 0）
+///
+/// 中文字体子集**同时含 ASCII**（GB2312 子集必须带），插到链头会让所有英文和
+/// 数字改走中文字体，界面字形整体换脸。放在链尾则只有前面三个字体覆盖不到的
+/// 码位才落过来：拉丁/emoji 照旧，汉字才走这里。
+///
+/// 每次都从 `FontDefinitions::default()` 起手，所以**幂等**：连调两次和调一次
+/// 结果完全一致，不会把同名字体塞进族链两遍。
+pub fn install_cjk_font(ctx: &egui::Context) {
+    let mut defs = egui::FontDefinitions::default();
+    defs.font_data.insert(
+        ta_deploy_tool_assets::CJK_FONT_NAME.to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(ta_deploy_tool_assets::CJK_FONT)),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        defs.families
+            .entry(family)
+            .or_default()
+            .push(ta_deploy_tool_assets::CJK_FONT_NAME.to_owned());
+    }
+    ctx.set_fonts(defs);
+}
+
+// ============================================================
 // 崩溃兜底
 // ============================================================
 
@@ -242,7 +292,10 @@ pub fn show_native_error(title: &str, text: &str) {
     }
     #[cfg(windows)]
     native_message_box(title, text);
-    eprintln!("{title}\n{text}");
+    // 忽略写错误：windowed 子系统下双击启动**没有控制台**，`stderr` 是无效
+    // 句柄，`eprintln!` 会 panic —— 而这里恰恰是"已经出错了"的兜底路径，
+    // 绝不能再抛一次把原始错误盖掉。真正送达用户的出口是上面那个原生弹窗。
+    let _ = writeln!(std::io::stderr(), "{title}\n{text}");
 }
 
 /// 可执行文件所在的目录 —— 基准 `app_dir()`（`cli::locate` 有一份同语义的）。
@@ -317,5 +370,106 @@ mod tests {
     #[test]
     fn window_title_matches_the_baseline() {
         assert_eq!(TITLE, "TA-DEPLOY-TOOL");
+    }
+
+    /// 跑一帧让字体真正装上 —— `fonts_mut` / `fonts` 在首次
+    /// [`egui::Context::run_ui`] 之前会直接 panic（拿不到 `pixels_per_point`）。
+    fn first_frame(ctx: &egui::Context) {
+        let out = ctx.run_ui(Default::default(), |_| {});
+        out.drop_without_applying_deltas();
+    }
+
+    /// 反向断言：**不装**自带字体时，汉字确实一个也画不出来。
+    ///
+    /// 少了这条，下面那条 `assert!(ok)` 就变成"跑一遍必然为真"的空断言 ——
+    /// 字体压根没生效时它照样可能含糊过关（AGENTS.md 说的假阳性陷阱）。
+    /// 两条放在一起才构成「修复前坏、修复后好」的完整证据链。
+    #[test]
+    fn egui_default_fonts_cannot_render_chinese() {
+        let ctx = egui::Context::default();
+        first_frame(&ctx);
+        let renderable = ctx.fonts_mut(|f| f.has_glyphs(&egui::FontId::default(), "配置校验通过"));
+        assert!(
+            !renderable,
+            "egui 默认字体链已能渲染中文 —— 上游补了 CJK，可以评估删掉 \
+             assets/NotoSansSC-subset.otf 省下 1.7MB"
+        );
+    }
+
+    /// 装上后，界面实际用到的文案必须真的画得出来，**两个族都要** —— 等宽族是
+    /// 日志区那一整片中文的来源，漏了它就等于没修。
+    ///
+    /// 这里**不能**直接用 `has_glyphs("…")` 断整串：它返回
+    /// `resolve_face(c) != replacement_face_key`，而 epaint 用「链上第一个含 `◻`
+    /// 的 face」当替换面 —— Monospace 链首的 `Hack` 正好含 `◻`，于是所有由
+    /// `Hack` 提供的字符（`[`、`]`、空格）一律假阴性。那是改动前就有的 egui
+    /// 怪癖（push 到链尾不改变 `find_face_for_char` 的遍历顺序），跟字体装没装
+    /// 无关。所以拆成两条各自可靠的断言。
+    #[test]
+    fn install_cjk_font_makes_chinese_renderable() {
+        let ctx = egui::Context::default();
+        install_cjk_font(&ctx);
+        first_frame(&ctx);
+
+        /// 日志区真实一行（等宽族用）—— 混着 ASCII 与中文。
+        const LOG_LINE: &str = "[错误] 分支更新完成 已有任务在运行中，请稍后再试";
+        /// 界面文案（比例族用）。
+        const LABELS: &str = "配置校验通过 部署回滚 首次运行";
+
+        let bad = ctx.fonts_mut(|f| {
+            let mut bad: Vec<String> = Vec::new();
+            for (fam, id) in [
+                ("比例族", egui::FontId::default()),
+                // 12.5 是 logview 的等宽字号，取真实值而不是随手一个
+                ("等宽族", egui::FontId::monospace(12.5)),
+            ] {
+                // ① 汉字：直接问「这条族链里有没有 face 认得它」。
+                //    没装字体时这条必然为假（见
+                //    `egui_default_fonts_cannot_render_chinese`），所以不是空断言。
+                for c in LABELS.chars().chain(LOG_LINE.chars()) {
+                    if !c.is_ascii() && !f.has_glyph(&id, c) {
+                        bad.push(format!("{fam} 汉字 {c:?} 解析不到"));
+                    }
+                }
+                // ② 整行：逐字要求有非零字形宽度，拦住 `[`、空格这类被
+                //    `has_glyph` 假阴性放过的字符真的没有字形的情况。
+                for c in LOG_LINE.chars() {
+                    if f.glyph_width(&id, c) <= 0.0 {
+                        bad.push(format!("{fam} {c:?} 字形宽度为 0"));
+                    }
+                }
+            }
+            bad
+        });
+        assert!(bad.is_empty(), "以下字符渲染不出来：{bad:#?}");
+    }
+
+    /// 中文字体必须挂在族链**末尾**。
+    ///
+    /// 子集里带 ASCII（GB2312 子集必须带），一旦插到链头，所有英文和数字都会
+    /// 改走中文字体，界面字形整体换脸。这条锁死 `install_cjk_font` 用的是
+    /// `push` 而不是插入到 0。
+    #[test]
+    fn cjk_font_is_appended_to_the_end_of_both_chains() {
+        let ctx = egui::Context::default();
+        install_cjk_font(&ctx);
+        first_frame(&ctx);
+
+        let name = ta_deploy_tool_assets::CJK_FONT_NAME;
+        ctx.fonts(|f| {
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                let chain = &f.definitions().families[&family];
+                assert_eq!(
+                    chain.last().map(String::as_str),
+                    Some(name),
+                    "{family:?} 的族链必须以中文字体收尾，实际是 {chain:?}"
+                );
+                assert_eq!(
+                    chain.iter().filter(|n| n.as_str() == name).count(),
+                    1,
+                    "{family:?} 里中文字体只能出现一次"
+                );
+            }
+        });
     }
 }

@@ -397,6 +397,7 @@ Go 用 `internal/` 让**编译器**强制分层：`internal/proc` 反向依赖
 | `--check` | 不存在 | 有 | 有，**环境按声明序**打印 | Go 遍历 `map[string]…` 是字母序（差异 22）；Rust 走 `IndexMap` |
 | 版本行 | 不存在 | `TA-DEPLOY-TOOL x (linux/amd64)` | `TA-DEPLOY-TOOL x (linux/x86_64)` | 架构名各随生态（Go `GOARCH=amd64` vs Rust `ARCH=x86_64`），文案结构一致 |
 | 崩溃兜底 `show_native_error`（写 `crash.log` + 原生弹窗） | 有（`main.py` 的 `__main__` 守卫） | 无 | ✅ `ui::show_native_error`：`panic` 钩子 + `run()` 两条错误分支都走它；Windows 下直接 `#[link(name = "user32")] MessageBoxW`，非 Windows 退到 stderr | 兜底框本体在 `ui`，`cli` 不需要它 |
+| Windows 子系统（双击开几个窗） | `TA_DEPLOY_TOOL.spec` 是 `console=False` → **纯 GUI，不弹控制台** | 控制台程序 → 双击会多弹一个**空的** cmd 窗口（GUI 路径压根不往 stdout 写） | `#![cfg_attr(windows, windows_subsystem = "windows")]` → GUI 子系统，**回到基准** | 连带两处必须一起改：① `fatal` / `show_native_error` 的 stderr 写入改成忽略错误 —— 无控制台时 `eprintln!` 会 panic，把「退出码 1」升级成崩溃；② GUI 路径的定位失败补原生弹窗 —— 否则去掉黑窗后启动失败变成「双击后什么都没发生」。`--check` / `--version` 从终端跑时 std 句柄照常继承，输出不受影响 |
 
 ---
 
@@ -428,6 +429,7 @@ Go 用 `internal/` 让**编译器**强制分层：`internal/proc` 反向依赖
 
 | 项 | 基准（Qt） | Rust（egui） | 位置 |
 |---|---|---|---|
+| **中文字形** | Qt 自带字体回退，系统装了 CJK 字体就画得出来 | egui 默认链 `Ubuntu-Light` → `NotoEmoji-Regular` → `emoji-icon-font`（等宽族首为 `Hack`），**一个都不含 CJK**；`epaint` 查不到字形**不是留空，而是整段替换成 `◻`** → 自带 `assets/NotoSansSC-subset.otf`（GB2312 全集 + ASCII + 仓库内汉字，7479 码点 / **1.7MB** / SIL OFL 1.1）`include_bytes!` 进二进制，挂到两条族链**末尾**（子集含 ASCII，插链头会让英文数字全换脸） | `ui::install_cjk_font`、`assets::CJK_FONT` |
 | 字号单位 | QSS 写 **px**（正文 13px / 标题 15px / 副标题 12px / 小字 11px） | `FontId` 吃 **pt**，只能取量级一致，换算说明写在 `theme::PALETTE_NOTE` | `theme.rs` |
 | 粗体字重 | `font-weight: bold`，Qt 有真正的粗体字形 | egui 默认字体只有 `Ubuntu-Light` / `Hack-Regular`，**没有 bold 字重** → 用 **字号 ×1.08** 近似：颜色照常、视觉分量还在，代价是粗体片段比基准略大一点 | `widgets::BOLD_SCALE`、`logview::BOLD_SCALE` |
 | 日志折行 | `QPlainTextEdit` 默认按宽度折行 | `ScrollArea::show_rows` 假设行高均匀，折行会让行高不均、行与行重叠 → **不折行**（长行右侧裁掉），换只画可见行、2 万行不掉帧 | `logview` 模块文档 |
