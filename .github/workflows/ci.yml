@@ -50,10 +50,13 @@
 #    所以 windows job 里先跑一遍 clippy 再 build —— 否则「clippy 零警告」
 #    这条标准在 Windows 代码上形同虚设。
 #
-#    **本地就能提前抓到，不必等 CI**（交叉 `cargo check` 不链接，不需要 MSVC）：
+#    **本地就能提前抓到，不必等 CI**（交叉编译不链接，不需要 MSVC）：
 #      apt-get install -y gcc-mingw-w64-x86-64 nasm     # aws-lc-sys 要编 C 和 x86 汇编
 #      rustup target add x86_64-pc-windows-gnu
-#      cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
+#      cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+#    ⚠ 必须跑 **clippy 且带 -D warnings**，跑 `cargo check` 是不够的 ——
+#      check 只查类型、不含 lint，而 CI 这一步就是 clippy。第二轮 CI 就是
+#      在 check 全绿的情况下被 clippy::collapsible_if 拦下的。
 #    ⚠ 用 `x86_64-pc-windows-msvc` 是**不行**的：aws-lc-sys 明确拒绝
 #      "GNU compiler is not supported for this target"，而本机没有 MSVC。
 #
