@@ -13,7 +13,8 @@
 Go 版是在基准的某个中间快照上重写的，之后基准又前进了 20+ 个提交；
 Go 侧补了其中几个（并行构建 `7193695`、自动回滚 `2ec6dc7`、服务器分组、
 超时与路径加固），但**没有全部跟上**，且自身引入了一批新的行为偏差。
-逐条排查后共 29 项，见下文「基准 vs Go 差异」。
+逐条排查后共 30 项，见下文「基准 vs Go 差异」。
+（其中 1–29 是「基准 vs Go」，30 是里程碑 8 新增的「基准 vs Rust UI 层」。）
 
 Rust 版按基准实现，**不照抄 Go 的这些偏差**。
 
@@ -391,11 +392,53 @@ Go 用 `internal/` 让**编译器**强制分层：`internal/proc` 反向依赖
 | `config.yaml` 是目录 | `Path.exists()` → 算命中，后续 `load_config` 报「读取失败」 | `!st.IsDir()` → 跳过、落到下一级 | 按基准 `Path::exists()` | 单测 `file_exists_follows_baseline_path_exists` 钉死这条 |
 | 模板缺失 | `找不到模板文件：…\n\n请重新安装程序。`（`QMessageBox.critical`） | 模板 `//go:embed`，不可达 | 模板 `include_bytes!`，**不可达** | 不设该错误分支 |
 | 程序目录不存在 | `_is_dir_writable` 直接 OSError → 判不可写，**不**先 `mkdir` | 对每个候选都 `MkdirAll` | 按基准：只给**用户目录**建父目录 | 单测 `app_dir_missing_is_treated_as_unwritable` |
-| 首启提示 | `QMessageBox`，标题 `首次运行`，正文点名「**配置**」按钮 | stdout 打 `[首次运行] …（也可在程序内点击「设置」直接编辑）` | 复刻**基准**正文；`cli` 打印，`FirstRun::title()/body()` 原样留给 `ui` 弹窗 | Go 的「设置」既换了词、也换了落点 |
+| 首启提示 | `QMessageBox`，标题 `首次运行`，正文点名「**配置**」按钮 | stdout 打 `[首次运行] …（也可在程序内点击「设置」直接编辑）` | 复刻**基准**正文；类型 `FirstRun` 住在 `ui`（`title()`/`body()` 给弹窗、`announce()` 给命令行）。GUI 路径整条交给 `ui` 弹窗，**只有** `--check` 这种没有窗口的路径才打印 stdout | Go 的「设置」既换了词、也换了落点 |
 | 定位失败的退出码 | `ensure_config()` 返 `None` → `main()` 正常返回，**退出码 0** | `fatal` → stderr + 1 | stderr `[错误] {err}` + 1（与 Go 一致） | 控制台程序必须非 0；基准那种「弹完窗静默退出」只在 GUI 下才合理 |
 | `--check` | 不存在 | 有 | 有，**环境按声明序**打印 | Go 遍历 `map[string]…` 是字母序（差异 22）；Rust 走 `IndexMap` |
 | 版本行 | 不存在 | `TA-DEPLOY-TOOL x (linux/amd64)` | `TA-DEPLOY-TOOL x (linux/x86_64)` | 架构名各随生态（Go `GOARCH=amd64` vs Rust `ARCH=x86_64`），文案结构一致 |
-| 崩溃兜底 `show_native_error`（写 `crash.log` + 原生弹窗） | 有（`main.py` 的 `__main__` 守卫） | 无 | **推迟到里程碑 8** | 属于 GUI 层，`ui` 落地时一并补上 |
+| 崩溃兜底 `show_native_error`（写 `crash.log` + 原生弹窗） | 有（`main.py` 的 `__main__` 守卫） | 无 | ✅ `ui::show_native_error`：`panic` 钩子 + `run()` 两条错误分支都走它；Windows 下直接 `#[link(name = "user32")] MessageBoxW`，非 Windows 退到 stderr | 兜底框本体在 `ui`，`cli` 不需要它 |
+
+---
+
+### 30. 主题持久化的载体：`QSettings` → eframe `Storage`（M8）
+
+里程碑 8 才暴露的一条：基准**每次切主题立刻落盘**，Rust 的 egui 没有
+`QSettings` 这种"随时可写"的设置后端。
+
+| 项 | 基准（Qt） | Go（Fyne） | Rust（egui） |
+|---|---|---|---|
+| 载体 | `QSettings("ta-deploy-tool", "deploy_tool")`（Windows 落注册表、Linux 落 `~/.config/ta-deploy-tool/deploy_tool.conf`） | `app.Preferences()` | eframe `Storage`（`persistence` feature → RON 存档） |
+| 键名 | `theme` | `theme` | `theme`（`theme::STORAGE_KEY`） |
+| 取值域 | `care` / `light` / `oceanic`；**未知值（含已删除的 `dark`）回 `care`** | 同左 | 同左（`theme::load` → `ThemeMode::parse` → 回 `care`） |
+| 写入时机 | `_on_theme_changed` **同步** `setValue` | 切换时写 | eframe 只在**退出 / 每 30s** 调一次 `App::save()` → 落盘最多延迟 30s |
+| 何时读 | `main.py` 建窗口**之前**读，再 `apply_theme` | — | `run()` 的 `create` 回调里 `theme::load(cc.storage)` + `theme::apply`，**先于**第一帧，不会闪一下默认色 |
+
+键名与取值域逐字对齐（`theme` / `care`|`light`|`oceanic`，未知值回 `care`），
+语义上两套实现是同一份设置；**载体本身不同**（注册表 / conf 文件不会自动
+迁到 RON 存档），所以从 Qt 版升级过来时主题会回到 `care`，需要重选一次 ——
+这是 egui 没有系统级设置后端导致的，不是行为偏差。
+
+---
+
+## UI 层的工具链固有近似（egui vs Qt）
+
+下面这些**不是行为差异，是渲染能力差异**：文案、顺序、状态机全部照抄基准，
+只有"画出来长什么样"受 egui 限制。统一列在这里，`crates/ui/src/lib.rs` 的
+模块文档里也有一张简表。
+
+| 项 | 基准（Qt） | Rust（egui） | 位置 |
+|---|---|---|---|
+| 字号单位 | QSS 写 **px**（正文 13px / 标题 15px / 副标题 12px / 小字 11px） | `FontId` 吃 **pt**，只能取量级一致，换算说明写在 `theme::PALETTE_NOTE` | `theme.rs` |
+| 粗体字重 | `font-weight: bold`，Qt 有真正的粗体字形 | egui 默认字体只有 `Ubuntu-Light` / `Hack-Regular`，**没有 bold 字重** → 用 **字号 ×1.08** 近似：颜色照常、视觉分量还在，代价是粗体片段比基准略大一点 | `widgets::BOLD_SCALE`、`logview::BOLD_SCALE` |
+| 日志折行 | `QPlainTextEdit` 默认按宽度折行 | `ScrollArea::show_rows` 假设行高均匀，折行会让行高不均、行与行重叠 → **不折行**（长行右侧裁掉），换只画可见行、2 万行不掉帧 | `logview` 模块文档 |
+| 弹窗图标 | `QMessageBox` 的原生 ℹ / ⚠ / ✖ 系统图标 | 彩色 emoji 字形 `ℹ` / `⚠` / `✖` | `dialogs` |
+| 窗口图标 | `find_app_icon()` 现场找 `app.ico` / `app.png` 文件 | 图标 `include_bytes!` 进二进制（保单 exe 卖点），egui 只吃 RGBA → 多一个 `png = "0.18"` 解码 `APP_ICON_PNG` | `ui::app_icon` |
+| 配置编辑器 | `dlg.exec()` 应用级模态 | `egui::Window`（`Order::Middle`）浮动窗口；弹窗类一律 `egui::Modal`（`Order::Foreground`），**Modal 恒在配置窗之上** | `config_dialog` |
+| 文件选择 | `QFileDialog` 原生对话框 | Go 版也没有 → 自建 `dialogs::PathPicker`（同样不引 `rfd`） | `dialogs` |
+| 三态复选框 | `QCheckBox.setTristate(True)` 原生 | egui 没有三态 → 自绘 `widgets::tri_checkbox`（"全选 → 点成全不选"的语义照抄 `ServerGroupWidget._on_clicked`） | `widgets` |
+| 进度条渐变 | `QProgressBar` + QSS `qlineargradient` | egui 无原生渐变 → `widgets::gradient_progress` 按停靠点切竖条 | `widgets` |
+| 快捷键 | `QShortcut(QKeySequence("Ctrl+…"))` 写死 Ctrl | `Modifiers::command`（macOS 上是 ⌘，其余平台仍是 Ctrl） | `app::shortcuts` |
+| 首启提示时机 | `main.py` 建窗口**之前** `QMessageBox.information` | egui 没有"窗口外"的弹窗位 → 首帧进 `MsgQueue` 弹出，正文与标题逐字一致 | `app::UiApp::new` |
 
 ---
 
@@ -588,5 +631,18 @@ shell 里两者等价）。
 | 4 | `deployer` | `internal/deployer` | ✅ |
 | 5 | `pipeline` | `internal/pipeline` | ✅ |
 | 6 | `viewmodel` | `internal/uiapp` | ✅ |
-| 7 | `cli` | `cmd/deploytool` | ✅（`ui::run` 接线留给 8） |
-| 8 | `ui`（egui） | `ui` | |
+| 7 | `cli` | `cmd/deploytool` | ✅ |
+| 8 | `ui`（egui） | `ui` | ✅ |
+
+`ui` 的八个模块与基准文件的对应关系、以及为什么选 egui（而不是 Tauri /
+egui 之外的方案），写在 `crates/ui/src/lib.rs` 的模块文档里。
+
+四道门禁（M8 收口时）：`cargo test --workspace` **500** 个测试全绿、
+`cargo clippy --workspace --all-targets` **0 warning**、
+`cargo fmt --all --check` 通过、`python3 scripts/check_layering.py` 11 个 crate
+依赖方向正确。
+
+「单个 exe」复核：`cargo build --release` 出的是**一个** ELF，
+`ldd` 只列 `libc` / `libm` / `libgcc_s` —— 没有 webview、没有 Qt、
+没有 Python 运行时，README 那条卖点在 Rust 版上依然成立（这也是选 egui
+而不是 Tauri 的直接理由，见 `crates/ui/src/lib.rs` 模块文档）。

@@ -17,8 +17,8 @@
 //! # 分层
 //!
 //! 这是 `cli` 允许依赖的最上层：`assets`（模板 + 版本）、`config`（读 / 校验）、
-//! `proc`、`ui`（里程碑 8 接上）。`cli` **不**直接碰 `pipeline` / `viewmodel`，
-//! 由 `ui` 负责把它们串起来。
+//! `proc`、`ui`（里程碑 8 起的图形入口）。`cli` **不**直接碰 `pipeline` /
+//! `viewmodel`，由 `ui` 负责把它们串起来。
 
 mod locate;
 
@@ -63,14 +63,15 @@ fn main() {
         return;
     }
 
+    // 首启提示：GUI 路径整条交给 `ui` 弹窗（基准 `main.py` 就是在建窗口
+    // 之前弹的那条 `QMessageBox.information`）；`--check` 没有窗口，
+    // 才退回打印到 stdout。
+    let mut notice = None;
     let path = match resolve_config_path(&cli) {
         Some(path) => path,
         None => match ensure_config() {
             Ok(located) => {
-                if let Some(notice) = located.notice {
-                    // 基准这里弹 QMessageBox；CLI 阶段先打印，`ui` 接上后原样弹窗。
-                    println!("{}", notice.announce());
-                }
+                notice = located.notice;
                 located.path
             }
             Err(err) => fatal(err),
@@ -78,19 +79,21 @@ fn main() {
     };
 
     if cli.check {
+        if let Some(notice) = notice {
+            println!("{}", notice.announce());
+        }
         if let Err(err) = check_config(&path) {
             fatal(err);
         }
         return;
     }
 
-    // TODO(milestone-8): `ui::run(path)` —— 基准是 `MainWindow(str(config_path))`
-    // + 事件循环；`ui` crate 落地后把 FirstRun 提示也一并交给它弹窗。
-    eprintln!(
-        "[TODO] 界面尚未实现（里程碑 8），已解析配置路径: {}",
-        path.display()
-    );
-    std::process::exit(2);
+    // 对应基准 `window = MainWindow(str(config_path))` + 事件循环。
+    // 启动失败（配置读不出来 / 图形后端起不来）由 `ui::run` 自己走
+    // `show_native_error` 落 `crash.log`，这里只收口退出码。
+    if let Err(err) = ta_deploy_tool_ui::run(path, notice) {
+        fatal(err);
+    }
 }
 
 /// 取显式配置路径：`--config` 优先，其次是位置参数；

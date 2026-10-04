@@ -16,7 +16,16 @@ ta-deploy-tool-deployer.workspace = true
 ta-deploy-tool-viewmodel.workspace = true
 
 egui.workspace = true
-eframe.workspace = true
+# `persistence`：主题跨次启动记忆。等价于基准的 QSettings（`apply_theme` 的
+# 持久化载体）、Go 的 `fapp.Preferences()` —— 各工具链各用各的存储，
+# 见 docs/MIGRATION.md 差异 30。
+eframe = { workspace = true, features = ["persistence"] }
+tokio.workspace = true
+tokio-util.workspace = true
+thiserror.workspace = true
+# 窗口图标：assets::APP_ICON_PNG 是 PNG 字节，egui 只吃 RGBA，
+# 必须自己解一次。只用这一个 API，别为了它引入整包 image。
+png = "0.18"
 
 # winit 的 Android 后端依赖 android-activity，却**自己不激活它的任何入口实现**
 # （game-activity / native-activity），而是要求最终应用二选一 —— 否则
@@ -27,3 +36,6 @@ eframe.workspace = true
 # 与"这本质是个桌面工具、Android 只是开发宿主"的定位一致。
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }
+
+[dev-dependencies]
+tempfile = "3"

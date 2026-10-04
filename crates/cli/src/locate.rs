@@ -17,58 +17,24 @@
 //!   后续 `load_config` 会给出「读取失败」的业务错误。
 //! - Go 生成成功打的是 `[首次运行] 已生成默认配置文件：…（也可在程序内点击
 //!   「设置」直接编辑）`；基准是 `QMessageBox` 弹窗、正文写「配置」按钮。
-//!   这里复刻基准的正文（`cli` 打印、`ui` 将来弹窗），标题/正文拆开暴露。
+//!   这里复刻基准的正文 —— 数据类型住在 [`ui`]（`弹窗的才是界面层`），
+//!   `cli` 只负责生成提示：GUI 路径整条交给 `ui` 弹窗，`--check` 这种
+//!   没有窗口的路径才 [`announce`](FirstRun::announce) 到 stdout。
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use ta_deploy_tool_assets::TEMPLATE_YAML;
 
+/// 首次运行提示 —— 定义在 `ui`（弹窗的那一层），
+/// `cli` 与 `ui` 共用一份措辞，这里只是原样转发。
+pub use ta_deploy_tool_ui::FirstRun;
+
 /// 配置文件名。
 pub const CONFIG_FILE: &str = "config.yaml";
 
 /// 用户配置目录名（基准 `user_config_dir("deploy_tool")` 的第二个参数）。
 pub const APP_DIR_NAME: &str = "deploy_tool";
-
-// ============================================================
-// 首次运行提示
-// ============================================================
-
-/// 首次运行生成了配置文件的提示。
-///
-/// 基准这里弹的是 `QMessageBox.information(None, "首次运行", …)`；
-/// `cli` 阶段还没有窗口，先 [`announce`](FirstRun::announce) 到 stdout，
-/// 标题与正文原样留给 `ui` 弹窗用。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FirstRun {
-    /// 模板已复制到**程序目录**。
-    AppDir(PathBuf),
-    /// 程序目录不可写，复制到了**用户目录**。
-    UserDir(PathBuf),
-}
-
-impl FirstRun {
-    /// 弹窗标题 —— 基准 `QMessageBox.information(..., "首次运行", ...)`。
-    pub fn title(&self) -> &'static str {
-        "首次运行"
-    }
-
-    /// 弹窗正文，逐字对应基准 `main.py::ensure_config` 的两段 f-string。
-    pub fn body(&self) -> String {
-        let tail = "\n\n请修改后重启程序。\n\n（可在程序里点击「配置」按钮直接编辑）";
-        match self {
-            FirstRun::AppDir(p) => format!("已生成默认配置文件：\n{}{tail}", p.display()),
-            FirstRun::UserDir(p) => {
-                format!("程序目录不可写，配置文件已生成到：\n{}{tail}", p.display())
-            }
-        }
-    }
-
-    /// 命令行形态：`[首次运行] {正文}`。
-    pub fn announce(&self) -> String {
-        format!("[{}] {}", self.title(), self.body())
-    }
-}
 
 // ============================================================
 // 错误
@@ -475,30 +441,5 @@ mod tests {
 
         let got = ensure_config_in(&app, None, TEMPLATE).unwrap();
         assert_eq!(got.notice, Some(FirstRun::AppDir(app.join(CONFIG_FILE))));
-    }
-
-    // ---------------- 提示文案 ----------------
-
-    #[test]
-    fn first_run_notice_matches_baseline_wording() {
-        let app = FirstRun::AppDir(PathBuf::from("/opt/app/config.yaml"));
-        assert_eq!(app.title(), "首次运行");
-        assert_eq!(
-            app.body(),
-            "已生成默认配置文件：\n/opt/app/config.yaml\n\n请修改后重启程序。\n\n（可在程序里点击「配置」按钮直接编辑）"
-        );
-        assert!(
-            app.announce()
-                .starts_with("[首次运行] 已生成默认配置文件：\n")
-        );
-
-        let user = FirstRun::UserDir(PathBuf::from("/home/me/.config/deploy_tool/config.yaml"));
-        assert_eq!(
-            user.body(),
-            "程序目录不可写，配置文件已生成到：\n/home/me/.config/deploy_tool/config.yaml\n\n请修改后重启程序。\n\n（可在程序里点击「配置」按钮直接编辑）"
-        );
-        // Go 的文案写的是「设置」按钮，基准写的是「配置」—— 按基准
-        assert!(user.announce().contains("「配置」按钮"));
-        assert!(!user.announce().contains("「设置」按钮"));
     }
 }
