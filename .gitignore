@@ -10,6 +10,12 @@ build/
 dist/
 *.spec.bak
 
+# Rust 构建缓存（refactor/rust-rewrite 分支的 cargo target/）
+# 这个仓库在同一个工作区里来回切分支，从 rust-rewrite 切回来以后
+# target/ 会以未跟踪目录的形式留在工作区里 —— 实测能长到 19G。
+# 不忽略的话，一次 `git add -A` 就把它整包提交进去了。
+/target/
+
 # 临时日志与缓存
 crash.log
 *.log
