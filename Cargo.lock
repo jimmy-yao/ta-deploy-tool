@@ -4552,6 +4552,7 @@ dependencies = [
  "ta-deploy-tool-config",
  "ta-deploy-tool-proc",
  "ta-deploy-tool-ui",
+ "tempfile",
 ]
 
 [[package]]

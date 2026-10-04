@@ -21,3 +21,6 @@ ta-deploy-tool-ui.workspace = true
 
 clap.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -13,7 +13,7 @@
 Go 版是在基准的某个中间快照上重写的，之后基准又前进了 20+ 个提交；
 Go 侧补了其中几个（并行构建 `7193695`、自动回滚 `2ec6dc7`、服务器分组、
 超时与路径加固），但**没有全部跟上**，且自身引入了一批新的行为偏差。
-逐条排查后共 28 项，见下文「基准 vs Go 差异」。
+逐条排查后共 29 项，见下文「基准 vs Go 差异」。
 
 Rust 版按基准实现，**不照抄 Go 的这些偏差**。
 
@@ -379,6 +379,24 @@ Go 用 `internal/` 让**编译器**强制分层：`internal/proc` 反向依赖
 - **Go**（`uiapp.go actionTitle`）：固定写 `selected services`，看不出跑的是谁。
 - **Rust**：照基准。
 
+### 29. `cli` 入口：配置定位与命令行开关
+
+基准 `main.py` 是个纯 GUI 入口，Go 的 `cmd/deploytool` 把它改成了控制台程序；
+`crates/cli` 保留 Go 的结构，但**行为逐条回到基准**。
+
+| 项 | 基准（`main.py`） | Go（`cmd/deploytool/main.go`） | Rust | 说明 |
+|---|---|---|---|---|
+| 命令行开关 | **没有** —— 只有 `sys.argv[1]` 当配置路径 | `-config` / `-check` / `-version` + 位置参数 | 保留 Go 的四个（clap 下写成 `-c/--config`、`--check`、`-v/--version`） | 开关是 CLI 层补的结构，不是行为差异：**位置参数仍然可用**，语义与基准逐字一致（只是多了 trim 空白） |
+| 配置定位候选 | 程序目录 → 用户目录，两级 | 多一个**工作目录**，并用 `isTempDir` 跳过 `go run` 落在临时目录的二进制 | **按基准**：程序目录 → 用户目录 | Rust 的 `cargo run` 二进制在 `target/debug`，那就是「程序目录」；引入 cwd 会让同一份 checkout 在不同 cwd 下定位到不同的配置。见 `locate.rs` |
+| `config.yaml` 是目录 | `Path.exists()` → 算命中，后续 `load_config` 报「读取失败」 | `!st.IsDir()` → 跳过、落到下一级 | 按基准 `Path::exists()` | 单测 `file_exists_follows_baseline_path_exists` 钉死这条 |
+| 模板缺失 | `找不到模板文件：…\n\n请重新安装程序。`（`QMessageBox.critical`） | 模板 `//go:embed`，不可达 | 模板 `include_bytes!`，**不可达** | 不设该错误分支 |
+| 程序目录不存在 | `_is_dir_writable` 直接 OSError → 判不可写，**不**先 `mkdir` | 对每个候选都 `MkdirAll` | 按基准：只给**用户目录**建父目录 | 单测 `app_dir_missing_is_treated_as_unwritable` |
+| 首启提示 | `QMessageBox`，标题 `首次运行`，正文点名「**配置**」按钮 | stdout 打 `[首次运行] …（也可在程序内点击「设置」直接编辑）` | 复刻**基准**正文；`cli` 打印，`FirstRun::title()/body()` 原样留给 `ui` 弹窗 | Go 的「设置」既换了词、也换了落点 |
+| 定位失败的退出码 | `ensure_config()` 返 `None` → `main()` 正常返回，**退出码 0** | `fatal` → stderr + 1 | stderr `[错误] {err}` + 1（与 Go 一致） | 控制台程序必须非 0；基准那种「弹完窗静默退出」只在 GUI 下才合理 |
+| `--check` | 不存在 | 有 | 有，**环境按声明序**打印 | Go 遍历 `map[string]…` 是字母序（差异 22）；Rust 走 `IndexMap` |
+| 版本行 | 不存在 | `TA-DEPLOY-TOOL x (linux/amd64)` | `TA-DEPLOY-TOOL x (linux/x86_64)` | 架构名各随生态（Go `GOARCH=amd64` vs Rust `ARCH=x86_64`），文案结构一致 |
+| 崩溃兜底 `show_native_error`（写 `crash.log` + 原生弹窗） | 有（`main.py` 的 `__main__` 守卫） | 无 | **推迟到里程碑 8** | 属于 GUI 层，`ui` 落地时一并补上 |
+
 ---
 
 ## 有意偏离基准的地方（读取宽容化 + 保存加强）
@@ -570,5 +588,5 @@ shell 里两者等价）。
 | 4 | `deployer` | `internal/deployer` | ✅ |
 | 5 | `pipeline` | `internal/pipeline` | ✅ |
 | 6 | `viewmodel` | `internal/uiapp` | ✅ |
-| 7 | `cli` | `cmd/deploytool` | |
+| 7 | `cli` | `cmd/deploytool` | ✅（`ui::run` 接线留给 8） |
 | 8 | `ui`（egui） | `ui` | |
