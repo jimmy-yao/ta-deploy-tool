@@ -41,6 +41,22 @@
 #    （已实测：非 root 起 sshd + 私钥认证 + SFTP 子系统全通，不需要 sudo，
 #     也不需要 /run/sshd —— 测试里那句 create_dir 只在 root 启动时才卡。）
 #
+# ④ Windows 专属 cfg 的代码，Linux 上**根本不会被编译**，clippy 是瞎的。
+#    第一次 CI 就在这上面翻了两次车，都是只在 Windows 才有的错：
+#      · `crates/config/src/detect.rs`  winreg 0.56 的 enum_keys() 直接返回
+#        迭代器，我却写了 `let Ok(..) = .. else` → E0308
+#      · `crates/ui/src/lib.rs`         edition 2024 要求 `unsafe extern`
+#      · 另有 3 个 `unused import / unused variable`（只有 #[cfg(unix)] 分支才用得到）
+#    所以 windows job 里先跑一遍 clippy 再 build —— 否则「clippy 零警告」
+#    这条标准在 Windows 代码上形同虚设。
+#
+#    **本地就能提前抓到，不必等 CI**（交叉 `cargo check` 不链接，不需要 MSVC）：
+#      apt-get install -y gcc-mingw-w64-x86-64 nasm     # aws-lc-sys 要编 C 和 x86 汇编
+#      rustup target add x86_64-pc-windows-gnu
+#      cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
+#    ⚠ 用 `x86_64-pc-windows-msvc` 是**不行**的：aws-lc-sys 明确拒绝
+#      "GNU compiler is not supported for this target"，而本机没有 MSVC。
+#
 # ── 成本（私有仓库：ubuntu 1x / windows 2x / **macos 10x**，Free 每月 2000）
 #
 #   build 矩阵三台并行是最大的开销项。mac 那台尤其贵。
@@ -166,6 +182,17 @@ jobs:
       - uses: actions/checkout@v7
 
       - uses: Swatinem/rust-cache@v2
+
+      # Windows 专属 cfg 的 clippy —— 理由见文件头 ④。放在 build 之前，
+      # 让这类错快速失败，不必等 release 编完才看见。
+      # 代价是多一次 debug profile 编译；嫌贵删掉这步即可，但那样
+      # `#[cfg(windows)]` 里的警告就没人管了（errors 仍会被 build 抓到）。
+      # `if` 限定在 windows：另外两台跑了也只是重复 gates 的活，
+      # 而 macos 按 10x 计费，白烧没意义（仓库里没有 target_os = "macos"
+      # 专属代码，`#[cfg(unix)]` 那些 Linux 的 clippy 已经覆盖到）。
+      - name: clippy（Windows 专属 cfg）
+        if: matrix.name == 'windows'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: release 构建
         run: cargo build --release --locked

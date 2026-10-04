@@ -83,6 +83,9 @@ pub fn kill_tree(pid: Pid) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 下面用到 `Command` 的测试全是 `#[cfg(unix)]`，Windows 上这个 import
+    // 就没人用 —— 会 `unused_imports`。同样只有交叉 check 才看得见。
+    #[cfg(unix)]
     use tokio::process::Command;
 
     /// configure 之后 spawn 出来的进程必须属于独立进程组 ——

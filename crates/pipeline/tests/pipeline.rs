@@ -109,6 +109,9 @@ fn have_git() -> bool {
         .unwrap_or(false)
 }
 
+/// Windows 上没有 chmod 语义，函数体是空的 —— `p` 会没人用。
+/// 只在 `cargo check --target windows` 下才报，Linux clippy 看不见。
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn chmod_x(p: &Path) {
     #[cfg(unix)]
     {

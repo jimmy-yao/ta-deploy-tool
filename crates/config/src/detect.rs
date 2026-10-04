@@ -308,9 +308,11 @@ fn registry_java_home() -> Option<String> {
         let Ok(key) = hklm.open_subkey_with_flags(key_path, KEY_READ) else {
             continue;
         };
-        let Ok(subkeys) = key.enum_keys().filter_map(Result::ok).collect::<Vec<_>>() else {
-            continue;
-        };
+        // winreg 0.56 的 `enum_keys()` **直接返回迭代器**（Item = io::Result<String>），
+        // 不是 Result —— 所以这里不能再套 `let Ok(..) = .. else`，那会 E0308
+        // （expected Vec<String>, found Result）。这条只在 Windows 上编译，
+        // 本地 Linux 跑 `cargo check` 抓不到，是 CI 第一次跑才暴露的。
+        let subkeys: Vec<String> = key.enum_keys().filter_map(Result::ok).collect();
         for ver in subkeys {
             let Ok(sub) = key.open_subkey_with_flags(&ver, KEY_READ) else {
                 continue;

@@ -254,11 +254,17 @@ fn app_dir() -> Option<PathBuf> {
     resolved.parent().map(Path::to_path_buf)
 }
 
-/// `user32.MessageBoxW` —— 不引 `windows-sys`，直接声明符号：
-/// 这个函数几十年没变过，为一个调用拉进整张 Win32 API 面不划算。
+// `user32.MessageBoxW` —— 不引 `windows-sys`，直接声明符号：
+// 这个函数几十年没变过，为一个调用拉进整张 Win32 API 面不划算。
+//
+// 用 `//` 而不是 `///`：doc comment 挂在 extern 块上会报
+// `unused doc comment`（rustc 认为 extern 块本身没文档可出）。
+// **必须写 `unsafe extern`** —— edition 2024 起 extern 块强制 unsafe
+// （`error: extern blocks must be unsafe`）。这段是 `#[cfg(windows)]`，
+// Linux 上的 clippy 看不见，是交叉 `cargo check` 才抓到的。
 #[cfg(windows)]
 #[link(name = "user32")]
-extern "system" {
+unsafe extern "system" {
     fn MessageBoxW(
         hwnd: *mut core::ffi::c_void,
         text: *const u16,
