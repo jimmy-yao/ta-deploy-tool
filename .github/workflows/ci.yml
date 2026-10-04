@@ -1,48 +1,86 @@
-# Rust workspace 的门禁 CI。
+# Rust 分支的门禁 + 三平台产物。
 #
-# 改之前先读这几条，①②③ 是实测出来的，不是想当然：
+# ══════════════════════════════════════════════════════════════════════
+# 为什么这个文件里一个 Python / Go 步骤都没有（这是有意的）
+# ══════════════════════════════════════════════════════════════════════
+# 仓库里确实还躺着两套旧 workflow，但它们**够不着这个分支**：
+#
+#   origin/main                      .github/workflows/build.yml
+#     push: [main, master] + tags v* + workflow_dispatch  → PyInstaller / Nuitka
+#   origin/refactor/modular-structure .github/workflows/build.yml
+#     push: [refactor/modular-structure, 'refactor/*']    → 同上（多一个通配）
+#
+# 看着 `refactor/*` 像会连累本分支，实际不会 —— GitHub 的规则是：
+#   · `push` 事件只认**被推那个 ref 上存在的** workflow 文件。
+#     `refactor/rust-rewrite` 上根本没有 build.yml，所以推这个分支时它压根不会被读到。
+#   · `pull_request` 事件跑在 `refs/pull/N/merge`（head 并进 base 的合并提交）上，
+#     所以本分支的 ci.yml 能在 PR 里跑；而 main / modular-structure 的 build.yml
+#     **都没有 `pull_request` 触发器**，只有 push —— PR 也不会把它们带起来。
+#   · `workflow_dispatch`（手动按钮）要求 workflow 文件在**默认分支**上，
+#     而默认分支是 main，那里只有 build.yml。想在 UI 里手动触发本文件，
+#     得先把它合进默认分支。
+#
+# 一句话：只推 `refactor/rust-rewrite`，就只会跑 Rust。下面的 `paths-ignore`
+# 是第二道保险 —— 只动 Go / Python / 文档的提交干脆不触发，省分钟数。
+#
+# ── 三条实测结论（改之前先读）─────────────────────────────────────────
 #
 # ① 工具链不用装。`rust-toolchain.toml` 锁 1.98.1 并列了 rustfmt / clippy，
 #    runner 上的 rustup 在 checkout 后第一次跑 cargo 就会自动装齐，
 #    所以这里既没有 dtolnay/rust-toolchain 也不用 `rustup component add`。
 #
-# ② `Cargo.lock` 已跟踪（二进制项目必须跟踪）→ 一律加 `--locked`，
-#    上游依赖发新版不会让 CI 无缘无故变红。
-#    全 workspace 无 `build.rs`，构建期不联网。
+# ② `Cargo.lock` 已跟踪（二进制项目必须跟踪）→ 一律加 `--locked`，上游依赖
+#    发新版不会让 CI 无缘无故变红。全 workspace 无 `build.rs`，构建期不联网。
+#    clippy 必须显式 `-D warnings` —— `--all-targets` 本身不会让警告变红，
+#    本地那句「0 warning」靠的是人看输出，CI 里没人看。
 #
-# ③ ubuntu job **必须显式装 openssh-server**。
-#    `crates/deployer/tests` 要在本机起一个 sshd，但它的策略是「起不来就
-#    `eprintln!` 一句跳过然后 `return`」—— **测试照样算通过**。镜像里没有
-#    sshd 的话，SSH 那层覆盖会悄悄掉光而 CI 依然全绿。装上它才会真跑。
+# ③ ubuntu job **必须显式装 openssh-server**。`crates/deployer/tests` 要在本机
+#    起一个 sshd，但它的策略是「起不来就 `eprintln!` 一句跳过然后 `return`」——
+#    **测试照样算通过**。镜像里没有 sshd 的话，SSH 那层覆盖会悄悄掉光而 CI
+#    依然全绿。装上它才会真跑。
 #    （已实测：非 root 起 sshd + 私钥认证 + SFTP 子系统全通，不需要 sudo，
 #     也不需要 /run/sshd —— 测试里那句 create_dir 只在 root 启动时才卡。）
 #
-# ④ Windows 上集成测试**根本不编译**：`crates/deployer/tests` 与
-#    `crates/builder/tests` 都是 `#![cfg(unix)]`。所以 windows job 只跑单测
-#    + build --release，跑 clippy/fmt 是重复劳动（ubuntu 已经跑过）。
+# ── 成本（私有仓库：ubuntu 1x / windows 2x / **macos 10x**，Free 每月 2000）
 #
-# ⑤ 私有仓库要烧分钟数：ubuntu 1x / windows 2x / macos 10x（Free 每月 2000）。
-#    想省就把 windows job 整个删掉 —— 四道门禁在 ubuntu 上已经是完整的，
-#    windows job 的价值只在于「主目标平台真的编得过、单测也过」。
+#   build 矩阵三台并行是最大的开销项。mac 那台尤其贵。
+#   要省：把 macos 那行删掉，或者给 build 加 `needs: gates`（门禁挂了就不开
+#   三台机器，代价是拿不到产物）。默认没加，为的是门禁和构建并行、尽快出件。
 #
-# ⑥ 没有 GUI 冒烟。界面行为由 `crates/ui` 的 80 个无头测试覆盖
-#    （`egui::Context::run_ui` 驱动，不需要显示器）；「真的开一个窗口」这一步
-#    有意不做。要加的话见文件末尾注释掉的 xvfb 片段。
-#
-# ── 本地复现（顺序就是下面 job 里的顺序，先跑便宜的）─────────────────────
+# ── 本地复现（顺序即 gates job 里的顺序，先跑便宜的）──────────────────
 #   cargo fmt --all --check
 #   python3 scripts/check_layering.py
 #   cargo clippy --workspace --all-targets --locked -- -D warnings
 #   cargo test  --workspace --locked
 #
-# 注意 `cargo clippy --all-targets` 本身**不会**让警告变红，必须显式
-# `-D warnings` —— 本地那句「0 warning」靠的是人看输出，CI 里没人看。
+# 注意 check_layering.py 是**Rust 门禁的一部分**，不是 Python 构建 ——
+# 它只是用 cargo metadata 断言 crate 依赖方向，跑完就退出，不产出任何东西。
 
 name: CI
 
 on:
   push:
     branches: ["**"]
+    # 只动这些路径的提交不触发（改了 crates/、Cargo.*、config.template.yaml、
+    # scripts/、assets/ 的照常触发）。
+    # ⚠ 如果配了分支保护要求 status check，纯文档 PR 会因为「没有检查可报」
+    #   而卡住合并 —— 那种情况把 `**.md` 和 `docs/**` 这两行删掉。
+    paths-ignore:
+      # Python（已归档，不参与本分支构建）
+      - "legacy-python/**"
+      # Go（源码留在仓库里仅供对照，不是本分支的构建目标）
+      - "cmd/**"
+      - "internal/**"
+      - "ui/**" # 顶层 ui/ 是 Go Fyne；Rust 的在 crates/ui/，不受影响
+      - "go.mod"
+      - "go.sum"
+      - "embed.go"
+      - "embed_test.go"
+      - "stdio_android.go"
+      - "stdio_other.go"
+      # 文档
+      - "**.md"
+      - "docs/**"
   pull_request:
   workflow_dispatch:
 
@@ -61,10 +99,10 @@ env:
 
 jobs:
   # ------------------------------------------------------------------
-  # 四道门禁。这是这个仓库唯一的"正确性"信号。
+  # 四道门禁（全部是 Rust）。这是这个分支唯一的"正确性"信号。
   # ------------------------------------------------------------------
   gates:
-    name: 门禁 · ubuntu
+    name: 门禁 · linux
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -99,56 +137,60 @@ jobs:
         run: cargo run --locked -p ta-deploy-tool-cli -- --version
 
   # ------------------------------------------------------------------
-  # 主目标平台。集成测试在这里不编译（文件头 ④），价值在"编得过 + 单测过"。
-  # 计 2x 分钟，要省可整段删除。
+  # 三平台 release 构建 → 单 exe 产物。三台并行。
+  #
+  # 这里只 build、不 test：测试已经在 gates 上跑过，而 test 走 debug profile、
+  # build 走 release profile，**两者是两套完全独立的编译**，矩阵里再跑一遍
+  # test 会让每台机器的时间翻倍（mac 那台按 10x 计费）。
+  # 要跨平台单测的话，把下面那行注释放开即可。
   # ------------------------------------------------------------------
-  windows:
-    name: 构建 · windows
-    runs-on: windows-latest
+  build:
+    name: 构建 · ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    strategy:
+      # 一台挂了不连累另外两台 —— 三个平台要各自报错
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-latest
+            bin: deploytool
+          - name: windows
+            os: windows-latest
+            bin: deploytool.exe
+          - name: macos
+            os: macos-latest # Apple Silicon（arm64）
+            bin: deploytool
     steps:
       - uses: actions/checkout@v7
 
       - uses: Swatinem/rust-cache@v2
 
-      # 单测：config / builder / proc / cli 里已有成体系的 #[cfg(windows)] 分支，
-      # 但**这条 job 没在本机实跑过**（开发机是 linux/aarch64）——
-      # 第一次 push 上去如果有平台相关的单测红了，是发现而不是回归。
-      - name: 测试（单测）
-        run: cargo test --workspace --locked
-
-      - name: release 构建（单 exe）
+      - name: release 构建
         run: cargo build --release --locked
 
-      - name: 冒烟
-        shell: pwsh
-        run: .\target\release\deploytool.exe --version
+      # 想要跨平台单测就把这行放开（会额外编一次 debug profile）：
+      # - name: 测试（单测；deployer/builder 是 #![cfg(unix)]，Windows 上不编译）
+      #   run: cargo test --workspace --locked
+
+      # 产物名用**运行时真实的 host 三元组**，而不是写死。
+      # 好处：macos-latest 哪天换了架构、或者 runner 镜像换代，文件名自动跟着变，
+      # 不会出现「标着 aarch64 实际是 x86_64」这种误导。bash 在 windows-latest
+      # 上由 Git Bash 提供，所以三台都能用同一步。
+      # 写成块标量而不是单行：单行里 `s/^host: //p` 的「冒号+空格」会被 YAML
+      # 当成映射分隔符，直接报 "mapping values are not allowed here"。
+      - name: 取 host 三元组
+        id: host
+        shell: bash
+        run: |
+          echo "triple=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"
 
       # 产物只留 7 天，方便下载看一眼。要按 tag 发 Release 资产另建一个
       # workflow，别塞在这里 —— 门禁和发版的触发条件不一样。
       - uses: actions/upload-artifact@v7
         with:
-          name: deploytool-windows
-          path: target/release/deploytool.exe
+          name: deploytool-${{ steps.host.outputs.triple }}
+          path: target/release/${{ matrix.bin }}
           retention-days: 7
-
-# ── 可选：GUI 真开窗口的冒烟（默认不加，理由见文件头 ⑥）─────────────────
-#
-# ubuntu 上要真开窗口得有 X server，用 xvfb 虚一个：
-#
-#       - name: 装 xvfb
-#         run: sudo apt-get install -y -q xvfb
-#       - name: GUI 冒烟（能撑过 5 秒没崩就算过）
-#         run: |
-#           set +e
-#           xvfb-run -a ./target/debug/deploytool &
-#           pid=$!
-#           sleep 5
-#           if kill -0 $pid 2>/dev/null; then
-#             echo "窗口起来了"; kill $pid; exit 0
-#           else
-#             echo "5 秒内就退了"; cat crash.log 2>/dev/null; exit 1
-#           fi
-#
-# 风险：egui/wgpu 在纯软件渲染（llvmpipe）下首次初始化较慢，5 秒阈值可能
-# 需要放宽；另外 CI 是私有仓库，xvfb 本身不额外计费但会多花 1~2 分钟。
+          if-no-files-found: error
