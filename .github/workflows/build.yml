@@ -1,4 +1,23 @@
-name: Build Windows EXE
+name: Build EXE (win / mac / linux)
+
+# ───────────────────────────────────────────────────────────────
+# 三平台产物矩阵（私有仓库计费：ubuntu 1x / windows 2x / macos 10x）
+#
+#   PyInstaller · linux    1x   dist/TA_DEPLOY_TOOL        → .tar.gz
+#   PyInstaller · windows  2x   dist/TA_DEPLOY_TOOL.exe    → 原样
+#   PyInstaller · macos   10x   dist/TA_DEPLOY_TOOL.app    → ditto zip
+#   Nuitka      · windows  2x   TA-DEPLOY-TOOL.exe         → 原样
+#
+# 为什么 linux / mac 不直接上传产物目录，要先 tar / ditto 打一层：
+#   upload-artifact 打的 zip **不保证保留 Unix 可执行位和符号链接**。
+#   丢可执行位 → linux 下载下来 Permission denied；
+#   丢符号链接 → .app 里 Qt 的 dylib 链断掉，dyld 直接起不来。
+#   tar 和 ditto 是各自平台的权威打包器，会把这些属性显式写进内层文件，
+#   外层那个 zip 再怎么动都碰不到里面。代价只是用户多解一层。
+#
+# macOS 为什么不跟 win/linux 一样出单文件：见 TA_DEPLOY_TOOL.spec 顶部注释
+# （BUNDLE 包 onefile EXE 是 PyInstaller 的弃用路径）。
+# ───────────────────────────────────────────────────────────────
 
 'on':
   push:
@@ -12,39 +31,81 @@ name: Build Windows EXE
   workflow_dispatch:
 
 jobs:
-  build-pyinstaller:
-    name: Build with PyInstaller (Stable GUI)
-    runs-on: windows-latest
+  pyinstaller:
+    name: PyInstaller · ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 一台挂了不要连坐取消另外两台 —— 三个平台的失败原因通常互不相干
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-latest
+            build: dist/TA_DEPLOY_TOOL
+            upload: dist/TA_DEPLOY_TOOL.tar.gz
+          - name: windows
+            os: windows-latest
+            build: dist/TA_DEPLOY_TOOL.exe
+            upload: dist/TA_DEPLOY_TOOL.exe
+          - name: macos
+            os: macos-latest
+            build: dist/TA_DEPLOY_TOOL.app
+            upload: dist/TA_DEPLOY_TOOL.app.zip
+
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.10'
 
+      # Pillow 是构建依赖、不是运行依赖：macOS 的 .app 图标只有 .ico，
+      # PyInstaller 要靠 Pillow 把它转成 .icns（不装的话 spec 里的
+      # mac_bundle_icon() 会退回 PyInstaller 自带图标，不会失败）。
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install PySide6 qasync asyncssh pyyaml ruamel.yaml pyinstaller
+          pip install -r requirements.txt pyinstaller Pillow
 
-      - name: Build EXE with PyInstaller
+      - name: PyInstaller 打包
+        run: pyinstaller --noconfirm TA_DEPLOY_TOOL.spec
+
+      - name: 打 tar.gz（保可执行位）
+        if: matrix.name == 'linux'
+        shell: bash
+        run: tar -C dist -czf dist/TA_DEPLOY_TOOL.tar.gz TA_DEPLOY_TOOL
+
+      - name: 打 ditto zip（保可执行位 + 符号链接）
+        if: matrix.name == 'macos'
+        shell: bash
+        run: ditto -c -k --keepParent dist/TA_DEPLOY_TOOL.app dist/TA_DEPLOY_TOOL.app.zip
+
+      # 显式断言两级产物都在。pyinstaller 静默失败时 dist/ 会是空的，
+      # 而 upload-artifact 默认只是 warning 不报错 —— 那样会上传一个空 artifact。
+      - name: 产物自检
+        shell: bash
         run: |
-          pyinstaller TA_DEPLOY_TOOL.spec
+          ls -la dist
+          test -e "${{ matrix.build }}" || { echo "::error::PyInstaller 未产出 ${{ matrix.build }}"; exit 1; }
+          test -e "${{ matrix.upload }}" || { echo "::error::打包未产出 ${{ matrix.upload }}"; exit 1; }
 
-      - name: Upload PyInstaller Artifact
-        uses: actions/upload-artifact@v6
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
         with:
-          name: TA-DEPLOY-TOOL-PyInstaller
-          path: dist/TA_DEPLOY_TOOL.exe
+          name: TA-DEPLOY-TOOL-pyinstaller-${{ matrix.name }}
+          path: ${{ matrix.upload }}
+          if-no-files-found: error
 
-  build-nuitka:
-    name: Build with Nuitka
+  # ── Nuitka 只跑 Windows（Linux/macOS 上 PySide6 onefile 编译极慢，
+  #    且 macOS 还要额外处理签名/工具链），按你的决定保留为 Windows 备选产物。──
+  nuitka:
+    name: Nuitka · windows
     runs-on: windows-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -56,6 +117,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install PySide6 qasync asyncssh pyyaml ruamel.yaml nuitka zstandard
 
+      # 默认 shell 是 pwsh，行尾反引号是 PowerShell 的续行符 —— 别改这步的 shell
       - name: Build EXE with Nuitka
         run: |
           python -m nuitka `
@@ -74,8 +136,15 @@ jobs:
             --output-filename=TA-DEPLOY-TOOL.exe `
             main.py
 
-      - name: Upload Nuitka Artifact
-        uses: actions/upload-artifact@v6
+      - name: 产物自检
+        shell: bash
+        run: |
+          test -e TA-DEPLOY-TOOL.exe || { echo "::error::Nuitka 未产出 TA-DEPLOY-TOOL.exe"; exit 1; }
+          ls -la TA-DEPLOY-TOOL.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
         with:
-          name: TA-DEPLOY-TOOL-Nuitka
+          name: TA-DEPLOY-TOOL-nuitka-windows
           path: TA-DEPLOY-TOOL.exe
+          if-no-files-found: error
