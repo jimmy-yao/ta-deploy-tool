@@ -710,7 +710,7 @@ class MainWindow(QMainWindow):
         # 等解析结果回来（_on_branch_resolved）再重建。
         self._branch_task = asyncio.ensure_future(self._refresh_branches_async())
 
-    def _rebuild_branch_combo(self):
+    def _rebuild_branch_combo(self, keep_current: bool = False):
         self.branch_combo.blockSignals(True)
         current = self.branch_combo.currentData()
         self.branch_combo.clear()
@@ -720,6 +720,12 @@ class MainWindow(QMainWindow):
                 self.branch_combo.addItem(br, br)
         if current:
             idx = self.branch_combo.findData(current)
+            if idx < 0 and keep_current:
+                # 分支刷新进行中：缓存刚被清空、解析结果还没收齐，当前选择
+                # 暂时不在候选里。必须把它保底塞回下拉，否则会跌回「(自动)」，
+                # 接着被下面这行写成 override=None，静默改掉用户锁定的分支。
+                self.branch_combo.addItem(current, current)
+                idx = self.branch_combo.count() - 1
             if idx >= 0:
                 self.branch_combo.setCurrentIndex(idx)
         self.branch_combo.blockSignals(False)
@@ -729,7 +735,8 @@ class MainWindow(QMainWindow):
 
     def _on_branch_resolved(self, name: str, branch: str):
         self._resolved_branches[name] = branch
-        self._rebuild_branch_combo()
+        # keep_current=True：解析过程中的中间态重建不能丢用户已锁定的分支
+        self._rebuild_branch_combo(keep_current=True)
 
     # ============================================================
     # 日志
@@ -1061,7 +1068,8 @@ class MainWindow(QMainWindow):
         if branch:
             self._service_branch_overrides[service_name] = branch
             self._resolved_branches[service_name] = branch
-            self._rebuild_branch_combo()
+            # 重建只为让新分支进候选，不能顺带把用户已锁定的全局选择重置掉
+            self._rebuild_branch_combo(keep_current=True)
             self._append_log(f"[分支] {service_name} 手动指定为: {branch}（打包时使用）")
         elif self._service_branch_overrides.pop(service_name, None):
             self._append_log(f"[分支] {service_name} 已清除手动指定，恢复自动解析")
@@ -1131,8 +1139,12 @@ class MainWindow(QMainWindow):
     # 关闭
     # ============================================================
     def closeEvent(self, event):
-        if self.pipeline and self._task and not self._task.done():
-            self.pipeline.cancel()
+        # 回滚任务不经过 self.pipeline（只有部署会设置它），所以不能拿
+        # pipeline 当“有没有任务在跑”的前提：否则本次会话只做过回滚就关窗，
+        # SSH 回滚协程不会被取消。pipeline 有值时才需要它的协作式取消。
+        if self._task and not self._task.done():
+            if self.pipeline:
+                self.pipeline.cancel()
             self._task.cancel()
         if self._branch_task and not self._branch_task.done():
             self._branch_task.cancel()
