@@ -1062,17 +1062,21 @@ class MainWindow(QMainWindow):
             config_path=self.config_path,
         )
 
+        # 最终结果（[结果]/[取消]/[失败] 日志、失败弹窗、卡片文案）统一带上
+        # 本次选中的服务名——多服务并行时一眼看清这行说的是谁
+        result_scope = f"（服务: {', '.join(selected)}）"
+
         async def runner():
             try:
                 await pipeline.run()
-                self.done_signal.emit(task_id, True, "操作完成")
+                self.done_signal.emit(task_id, True, f"操作完成{result_scope}")
             except asyncio.CancelledError:
                 log("[取消] 任务已被用户取消")
-                self.done_signal.emit(task_id, False, "操作已被用户取消")
+                self.done_signal.emit(task_id, False, f"操作已被用户取消{result_scope}")
             except Exception as e:
                 if not is_known_error(e):
                     log(traceback.format_exc())
-                self.done_signal.emit(task_id, False, f"操作失败: {e}")
+                self.done_signal.emit(task_id, False, f"操作失败: {e}{result_scope}")
 
         task = asyncio.ensure_future(runner())
         self._tasks[task_id] = {
