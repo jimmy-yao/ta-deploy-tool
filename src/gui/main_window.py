@@ -1,6 +1,7 @@
 # ui.py
 import asyncio
 import html as _html
+import os
 import traceback
 from pathlib import Path
 
@@ -40,8 +41,8 @@ from src.gui.rollback_dialog import RollbackDialog, ManualBranchDialog
 # ============================================================
 class MainWindow(QMainWindow):
     log_signal = Signal(str)
-    progress_signal = Signal(int, int, str)
-    done_signal = Signal(bool, str)
+    progress_signal = Signal(int, int, int, str)   # (task_id, current, total, status)
+    done_signal = Signal(int, bool, str)           # (task_id, ok, msg)
     branch_signal = Signal(str, str)
 
     def __init__(self, config_path: str):
@@ -66,8 +67,13 @@ class MainWindow(QMainWindow):
 
         self.config_path = config_path
         self.cfg = load_config(config_path)
-        self.pipeline = None
-        self._task = None
+        # 并行任务注册表：task_id -> {"task", "pipeline"(回滚为 None),
+        # "services", "do_build"}。服务名不重叠（构建另要求 project_dir
+        # 不同）即可同时开跑多个任务，冲突则在启动前明确拒绝。
+        self._tasks = {}
+        self._next_task_id = 1
+        # 每个任务的最新进度 (current, total, status)，进度条按总和聚合显示
+        self._progress_by_task = {}
         self._branch_task = None
         self._resolved_branches = {}
         self._service_items = {}
@@ -809,11 +815,18 @@ class MainWindow(QMainWindow):
     # ============================================================
     # 进度回调
     # ============================================================
-    def _update_progress(self, current, total, status):
-        if total <= 0:
+    def _update_progress(self, task_id, current, total, status):
+        # 迟到的进度（任务已收尾）不再入账，避免注册表越积越大
+        if task_id in self._tasks:
+            self._progress_by_task[task_id] = (current, total, status)
+
+        # 并行任务聚合：进度条反映所有运行中任务的总体完成度
+        agg_cur = sum(c for c, t, _s in self._progress_by_task.values())
+        agg_tot = sum(t for _c, t, _s in self._progress_by_task.values())
+        if agg_tot <= 0:
             pct = 0
         else:
-            pct = int(round(current * 100 / total))
+            pct = int(round(agg_cur * 100 / agg_tot))
             pct = max(0, min(100, pct))
 
         if status:
@@ -863,19 +876,12 @@ class MainWindow(QMainWindow):
     # ============================================================
     # 任务完成
     # ============================================================
-    def _on_done(self, ok, msg):
-        self.build_btn.setEnabled(True)
-        self.deploy_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
-
-        self.action_card.finish(ok, msg)
-
+    def _on_done(self, task_id, ok, msg):
+        # 只收尾本任务：弹出注册表项，其它并行任务的徽章/按钮状态不能动
+        info = self._tasks.pop(task_id, None)
+        self._progress_by_task.pop(task_id, None)
+        services = info["services"] if info else []
         is_cancel_msg = "已取消" in msg or "取消" in msg
-
-        # 按启动时记录的运行集收尾：徽章可能已被筛选/重载重建过（跌回
-        # Idle），继续按 badge.text() 判断会漏掉这些服务的最终状态
-        running = list(self._running_badges)
-        self._running_badges.clear()
 
         if ok:
             self._append_log(f"[结果] {msg}")
@@ -887,10 +893,26 @@ class MainWindow(QMainWindow):
             self._append_log(f"[失败] {msg}")
             final = ("critical", "Critical")
 
-        for name in running:
+        # 按启动时记录的运行集收尾：徽章可能已被筛选/重载重建过（跌回
+        # Idle），继续按 badge.text() 判断会漏掉这些服务的最终状态；
+        # 已在中途进终态（_note_badge 摘除）的服务保持它自己的终态
+        for name in services:
+            if name not in self._running_badges:
+                continue
+            self._running_badges.pop(name, None)
             w = self._service_items.get(name)
             if w is not None:
                 w.set_status(*final)
+
+        if self._tasks:
+            # 还有并行任务在跑：卡片/取消按钮保持运行态
+            self._append_log(f"[任务] 仍有 {len(self._tasks)} 个任务在运行")
+            return
+
+        self.build_btn.setEnabled(True)
+        self.deploy_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.action_card.finish(ok, msg)
 
         if not ok and not is_cancel_msg:
             QMessageBox.critical(self, "失败", msg)
@@ -916,17 +938,70 @@ class MainWindow(QMainWindow):
         })
         return overrides
 
+    def _task_conflicts(self, selected, do_build, env_name) -> list:
+        """新任务与运行中任务的冲突说明列表；空表表示可以并行开跑。
+
+        - 服务名与运行中任务重叠：同一服务不能同时跑两个任务
+        - 构建另查 project_dir：同一工作目录并发跑 Maven 会互踩 target/
+        """
+        conflicts = []
+        occupied = set()
+        for info in self._tasks.values():
+            occupied.update(info["services"])
+        overlap = [n for n in selected if n in occupied]
+        if overlap:
+            conflicts.append("服务已在运行任务中: " + ", ".join(overlap))
+
+        if do_build:
+            env = self.cfg.environments.get(env_name)
+            if env:
+                def norm(p):
+                    return os.path.normcase(os.path.normpath(p)) if p else ""
+
+                mine = {}
+                for n in selected:
+                    s = env.services.get(n)
+                    d = norm(s.project_dir) if s else ""
+                    if d:
+                        mine.setdefault(d, []).append(n)
+
+                running_dirs = set()
+                for info in self._tasks.values():
+                    if not info.get("do_build"):
+                        continue
+                    for n in info["services"]:
+                        s = env.services.get(n)
+                        if s and s.project_dir:
+                            running_dirs.add(norm(s.project_dir))
+
+                clash = [n for d, ns in mine.items() if d in running_dirs
+                         for n in ns]
+                if clash:
+                    conflicts.append(
+                        "project_dir 与运行中构建相同: " + ", ".join(clash)
+                    )
+        return conflicts
+
     def _start_task(self, do_build: bool, do_deploy: bool, services=None):
         """启动任务。services 传入显式服务列表（右键单服务任务），
-        为 None 时按侧边栏勾选状态执行。"""
-        if self._task and not self._task.done():
-            self._append_log("[任务] 已有任务进行中，忽略本次请求")
-            return
+        为 None 时按侧边栏勾选状态执行。
 
+        支持并行：服务与运行中任务不重叠即可同时开跑（打包按钮不再因为
+        有任务在跑而拒绝/禁用），真正冲突时明确列出冲突项并拒绝。"""
         env_name = self.env_combo.currentText()
         selected = list(services) if services is not None else self._selected_services()
         if not selected:
             QMessageBox.warning(self, "提示", "请至少选择一个服务")
+            return
+
+        conflicts = self._task_conflicts(selected, do_build, env_name)
+        if conflicts:
+            self._append_log("[任务] 无法开始（冲突）: " + "；".join(conflicts))
+            QMessageBox.warning(
+                self, "无法开始",
+                "与运行中的任务冲突：\n\n"
+                + "\n".join("  · " + c for c in conflicts)
+            )
             return
 
         if do_build:
@@ -942,9 +1017,11 @@ class MainWindow(QMainWindow):
                 )
                 return
 
-        self.build_btn.setEnabled(False)
-        self.deploy_btn.setEnabled(False)
+        # 并行期间不禁用打包/部署按钮：允许随时发起新任务（冲突由上面拦截）
         self.cancel_btn.setEnabled(True)
+
+        task_id = self._next_task_id
+        self._next_task_id += 1
 
         scope = ", ".join(selected) if services is not None else "selected services"
         if do_build and do_deploy:
@@ -968,12 +1045,15 @@ class MainWindow(QMainWindow):
         overrides = self._build_branch_overrides(selected)
 
         def log(text):
+            # 并行期间多任务日志交错，加任务号才分得清；单任务保持原样
+            if len(self._tasks) > 1:
+                text = f"[T{task_id}] {text}"
             self.log_signal.emit(text)
 
         def progress(cur, tot, status=""):
-            self.progress_signal.emit(cur, tot, status)
+            self.progress_signal.emit(task_id, cur, tot, status)
 
-        self.pipeline = DeployPipeline(
+        pipeline = DeployPipeline(
             self.cfg, env_name, selected, log, progress,
             use_git=True,
             branch_overrides=overrides,
@@ -984,17 +1064,23 @@ class MainWindow(QMainWindow):
 
         async def runner():
             try:
-                await self.pipeline.run()
-                self.done_signal.emit(True, "操作完成")
+                await pipeline.run()
+                self.done_signal.emit(task_id, True, "操作完成")
             except asyncio.CancelledError:
-                self.log_signal.emit("[取消] 任务已被用户取消")
-                self.done_signal.emit(False, "操作已被用户取消")
+                log("[取消] 任务已被用户取消")
+                self.done_signal.emit(task_id, False, "操作已被用户取消")
             except Exception as e:
                 if not is_known_error(e):
-                    self.log_signal.emit(traceback.format_exc())
-                self.done_signal.emit(False, f"操作失败: {e}")
+                    log(traceback.format_exc())
+                self.done_signal.emit(task_id, False, f"操作失败: {e}")
 
-        self._task = asyncio.ensure_future(runner())
+        task = asyncio.ensure_future(runner())
+        self._tasks[task_id] = {
+            "task": task,
+            "pipeline": pipeline,
+            "services": list(selected),
+            "do_build": do_build,
+        }
 
     def _on_build_clicked(self):
         self._start_task(do_build=True, do_deploy=False)
@@ -1011,12 +1097,20 @@ class MainWindow(QMainWindow):
         self._start_task(do_build=False, do_deploy=True, services=[service_name])
 
     def _on_cancel_clicked(self):
-        if self.pipeline:
-            self.pipeline.cancel()
-        if self._task and not self._task.done():
-            self._task.cancel()
+        running = [
+            info for info in self._tasks.values()
+            if info["task"] and not info["task"].done()
+        ]
+        if not running:
+            return
+        for info in running:
+            if info["pipeline"]:
+                info["pipeline"].cancel()
+            info["task"].cancel()
         self.cancel_btn.setEnabled(False)
-        self.action_card.status_label.setText("已请求取消...")
+        self.action_card.status_label.setText(
+            f"已请求取消 {len(running)} 个任务..."
+        )
 
     # ============================================================
     # 一键回滚
@@ -1126,11 +1220,18 @@ class MainWindow(QMainWindow):
         self._log_dialogs = [d for d in self._log_dialogs if d is not dlg]
 
     def _on_rollback_service(self, service_name: str):
-        if self._task and not self._task.done():
-            QMessageBox.warning(self, "提示", "已有任务在运行中，请稍后再试")
+        env_name = self.env_combo.currentText()
+        # 只拦真正冲突（该服务已在别的任务里），其它服务并行跑不受影响
+        conflicts = self._task_conflicts([service_name], False, env_name)
+        if conflicts:
+            self._append_log("[回滚] 无法开始（冲突）: " + "；".join(conflicts))
+            QMessageBox.warning(
+                self, "无法回滚",
+                "与运行中的任务冲突：\n\n"
+                + "\n".join("  · " + c for c in conflicts)
+            )
             return
 
-        env_name = self.env_combo.currentText()
         dlg = RollbackDialog(self.cfg, env_name, service_name, self)
         if dlg.exec() != QDialog.Accepted or not dlg.selected_backup:
             return
@@ -1147,9 +1248,11 @@ class MainWindow(QMainWindow):
         ) != QMessageBox.Yes:
             return
 
-        self.build_btn.setEnabled(False)
-        self.deploy_btn.setEnabled(False)
+        # 并行期间不禁用打包/部署按钮；取消按钮统一管所有运行中任务
         self.cancel_btn.setEnabled(True)
+
+        task_id = self._next_task_id
+        self._next_task_id += 1
 
         w = self._service_items.get(service_name)
         if w:
@@ -1159,6 +1262,8 @@ class MainWindow(QMainWindow):
         self.action_card.start(f"Rollbacking {service_name}")
 
         def log(text):
+            if len(self._tasks) > 1:
+                text = f"[T{task_id}] {text}"
             self.log_signal.emit(text)
 
         async def runner():
@@ -1170,28 +1275,35 @@ class MainWindow(QMainWindow):
                     server, svc, backup_file, log,
                     default_restart_script=self.cfg.default_restart_script
                 )
-                self.done_signal.emit(True, f"服务 {service_name} 回滚完成")
+                self.done_signal.emit(task_id, True, f"服务 {service_name} 回滚完成")
             except asyncio.CancelledError:
-                self.log_signal.emit(f"[取消] 服务 {service_name} 回滚已被用户取消")
-                self.done_signal.emit(False, f"服务 {service_name} 回滚已取消")
+                log(f"[取消] 服务 {service_name} 回滚已被用户取消")
+                self.done_signal.emit(task_id, False, f"服务 {service_name} 回滚已取消")
             except Exception as e:
                 if not is_known_error(e):
-                    self.log_signal.emit(traceback.format_exc())
-                self.done_signal.emit(False, f"服务 {service_name} 回滚失败: {e}")
+                    log(traceback.format_exc())
+                self.done_signal.emit(task_id, False, f"服务 {service_name} 回滚失败: {e}")
 
-        self._task = asyncio.ensure_future(runner())
+        task = asyncio.ensure_future(runner())
+        self._tasks[task_id] = {
+            "task": task,
+            "pipeline": None,   # 回滚不走 DeployPipeline
+            "services": [service_name],
+            "do_build": False,
+        }
 
     # ============================================================
     # 关闭
     # ============================================================
     def closeEvent(self, event):
-        # 回滚任务不经过 self.pipeline（只有部署会设置它），所以不能拿
-        # pipeline 当“有没有任务在跑”的前提：否则本次会话只做过回滚就关窗，
-        # SSH 回滚协程不会被取消。pipeline 有值时才需要它的协作式取消。
-        if self._task and not self._task.done():
-            if self.pipeline:
-                self.pipeline.cancel()
-            self._task.cancel()
+        # 取消所有并行任务。回滚任务不经过 DeployPipeline（pipeline 为
+        # None），所以逐任务判断：pipeline 有值时才做协作式取消。
+        for info in list(self._tasks.values()):
+            task = info.get("task")
+            if task and not task.done():
+                if info.get("pipeline"):
+                    info["pipeline"].cancel()
+                task.cancel()
         if self._branch_task and not self._branch_task.done():
             self._branch_task.cancel()
         # 还开着的远程日志窗逐个 close：走它们自己的 closeEvent 取消 tail
