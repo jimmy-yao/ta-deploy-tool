@@ -75,6 +75,12 @@ class MainWindow(QMainWindow):
         self._groups = {}
         self._group_widgets = {}
         self.service_check_states = {}
+        # 本轮任务处于「运行态」的徽章：{服务名: (style, text)}。
+        # 任务结束按它收尾、筛选/重建控件后按它恢复——badge 文本不可靠
+        #（筛选/重载会把控件重建回 Idle），丢了它收尾判断会漏掉服务
+        self._running_badges = {}
+        # 打开的远程日志窗引用，关主窗时逐个 close 以取消 tail 任务
+        self._log_dialogs = []
         self._global_branch_override = None
         # 服务级「手动指定分支」：{服务名: 分支/commit}，仅本次会话生效，不写入配置文件
         self._service_branch_overrides = {}
@@ -382,6 +388,11 @@ class MainWindow(QMainWindow):
                 child.setSizeHint(0, QSize(0, 60))
                 self.service_list.setItemWidget(child, 0, w)
                 self._service_items[name] = w
+                # 任务运行中重建控件（筛选/重载）：恢复运行态徽章，
+                # 否则界面跌回 Idle，任务结束时 _on_done 也无从收尾
+                running = self._running_badges.get(name)
+                if running is not None:
+                    w.set_status(*running)
 
         self.service_list.expandAll()
         self._refresh_group_headers()
@@ -472,13 +483,14 @@ class MainWindow(QMainWindow):
                     w.blockSignals(False)
         else:
             # 无筛选过滤，或点击全不选
-            for name, w in self._service_items.items():
-                w.set_checked(checked)
+            # 有筛选时也必须把「被过滤隐藏」的服务一并写 state：勾选状态取值
+            # 走全量 service_check_states，只清可见项会留下「隐藏服务仍勾选」
+            # 的半选态——用户以为全不选了，打包/部署却还带着隐藏服务
+            #（与全选分支显式处理隐藏项的行为保持对称）
+            for name in env.services.keys():
                 self.service_check_states[name] = checked
-
-            if not checked and not keyword:
-                for name in env.services.keys():
-                    self.service_check_states[name] = False
+            for w in self._service_items.values():
+                w.set_checked(checked)
 
         self._refresh_group_headers()
 
@@ -817,18 +829,36 @@ class MainWindow(QMainWindow):
             return
 
         if "失败" in status or "错误" in status:
-            w.set_status("critical", "Critical")
+            style, text = "critical", "Critical"
         elif ("构建完成" in status or "部署完成" in status or "重启完成" in status
               or "上传完成" in status or "回滚完成" in status):
-            w.set_status("healthy", "Healthy")
+            style, text = "healthy", "Healthy"
         elif "回滚" in status:
-            w.set_status("deploying", "Rollbacking...")
+            style, text = "deploying", "Rollbacking..."
         elif "上传" in status or "重启" in status:
             # 部署阶段（上传 jar / 执行重启命令）：标为部署中，
             # 此前误落到「构建」分支显示 Building，单服务部署时尤其明显
-            w.set_status("deploying", "Deploying...")
+            style, text = "deploying", "Deploying..."
         elif "构建" in status or "更新分支" in status or "更新完成" in status:
-            w.set_status("building", "Building...")
+            style, text = "building", "Building..."
+        else:
+            return
+
+        w.set_status(style, text)
+        self._note_badge(svc_name, style, text)
+
+    def _note_badge(self, name, style, text):
+        """把徽章变化同步进 _running_badges 运行集。
+
+        进入终态（Healthy/Critical）说明该服务本轮已收尾，从运行集摘除，
+        任务整体结束时不再覆盖它的终态；仍在运行态则更新为最新相位。
+        """
+        if name not in self._running_badges:
+            return
+        if style in ("healthy", "critical"):
+            self._running_badges.pop(name, None)
+        else:
+            self._running_badges[name] = (style, text)
 
     # ============================================================
     # 任务完成
@@ -842,21 +872,27 @@ class MainWindow(QMainWindow):
 
         is_cancel_msg = "已取消" in msg or "取消" in msg
 
+        # 按启动时记录的运行集收尾：徽章可能已被筛选/重载重建过（跌回
+        # Idle），继续按 badge.text() 判断会漏掉这些服务的最终状态
+        running = list(self._running_badges)
+        self._running_badges.clear()
+
         if ok:
             self._append_log(f"[结果] {msg}")
-            for w in self._service_items.values():
-                if w.badge.text().lower() in ("building...", "deploying...", "rollbacking..."):
-                    w.set_status("healthy", "Healthy")
+            final = ("healthy", "Healthy")
         elif is_cancel_msg:
             self._append_log(f"[取消] {msg}")
-            for w in self._service_items.values():
-                if w.badge.text().lower() in ("building...", "deploying...", "rollbacking..."):
-                    w.set_status("idle", "Idle")
+            final = ("idle", "Idle")
         else:
             self._append_log(f"[失败] {msg}")
-            for w in self._service_items.values():
-                if w.badge.text().lower() in ("building...", "deploying...", "rollbacking..."):
-                    w.set_status("critical", "Critical")
+            final = ("critical", "Critical")
+
+        for name in running:
+            w = self._service_items.get(name)
+            if w is not None:
+                w.set_status(*final)
+
+        if not ok and not is_cancel_msg:
             QMessageBox.critical(self, "失败", msg)
 
     # ============================================================
@@ -919,13 +955,13 @@ class MainWindow(QMainWindow):
             title = f"Deploying {scope}"
         self.action_card.start(title)
 
+        style = "building" if do_build else "deploying"
+        text = "Building..." if do_build else "Deploying..."
         for name in selected:
+            self._running_badges[name] = (style, text)
             w = self._service_items.get(name)
             if w is not None:
-                w.set_status(
-                    "building" if do_build else "deploying",
-                    "Building..." if do_build else "Deploying..."
-                )
+                w.set_status(style, text)
 
         # 分支决策：服务级手动指定 > 顶部分支下拉 > 无（打包阶段实时解析最新分支）
         # _resolved_branches 仅用于界面展示，不参与决策
@@ -1078,7 +1114,16 @@ class MainWindow(QMainWindow):
     def _on_view_remote_log(self, service_name: str):
         env_name = self.env_combo.currentText()
         dlg = RemoteLogDialog(self.cfg, env_name, service_name, self)
+        self._log_dialogs.append(dlg)
+        # 正常关闭会经 WA_DeleteOnClose 销毁；这里同步摘引用，
+        # 不让引用表攒下已删除的包装对象
+        dlg.destroyed.connect(
+            lambda *_, d=dlg: self._forget_log_dialog(d)
+        )
         dlg.show()
+
+    def _forget_log_dialog(self, dlg):
+        self._log_dialogs = [d for d in self._log_dialogs if d is not dlg]
 
     def _on_rollback_service(self, service_name: str):
         if self._task and not self._task.done():
@@ -1109,6 +1154,7 @@ class MainWindow(QMainWindow):
         w = self._service_items.get(service_name)
         if w:
             w.set_status("deploying", "Rollbacking...")
+        self._running_badges[service_name] = ("deploying", "Rollbacking...")
 
         self.action_card.start(f"Rollbacking {service_name}")
 
@@ -1148,4 +1194,11 @@ class MainWindow(QMainWindow):
             self._task.cancel()
         if self._branch_task and not self._branch_task.done():
             self._branch_task.cancel()
+        # 还开着的远程日志窗逐个 close：走它们自己的 closeEvent 取消 tail
+        # 任务（子窗随主窗销毁不会触发 closeEvent，tail 会变成孤儿任务）
+        for dlg in list(self._log_dialogs):
+            try:
+                dlg.close()
+            except RuntimeError:
+                pass  # C++ 对象已被销毁
         super().closeEvent(event)
