@@ -22,6 +22,28 @@ from src.models.config import (
 class ConfigEditorDialog(QDialog):
     """可视化编辑 config.yaml。样式跟随全局主题。"""
 
+    # 控件 deleteLater() 之后 Python 属性并不会消失（hasattr 恒为 True），
+    # 真正调用其方法时才会抛 RuntimeError。凡随详情区一起销毁的属性，
+    # 销毁时必须同步 delattr，否则“删除环境后再点保存”会崩在
+    # _commit_table_edits（它在 try 之外）→ 保存按钮点了没反应。
+    _ENV_DETAIL_ATTRS = (
+        "env_default_host", "env_default_port", "env_default_user",
+        "env_default_password", "env_default_key",
+        "servers_table", "services_list",
+        "svc_detail_holder", "svc_detail_layout",
+    )
+    _SVC_DETAIL_ATTRS = (
+        "svc_server_combo", "svc_project_dir", "svc_local_jar",
+        "svc_remote_dir", "svc_remote_name", "svc_build_args",
+        "svc_restart_cmd", "svc_depends_on", "svc_git_branch",
+        "svc_log_path",
+    )
+
+    def _drop_attrs(self, names):
+        for attr in names:
+            if hasattr(self, attr):
+                delattr(self, attr)
+
     def __init__(self, cfg: AppConfig, config_path: str, parent=None,
                  focus_env=None, focus_service=None):
         super().__init__(parent)
@@ -316,6 +338,8 @@ class ConfigEditorDialog(QDialog):
             w = item.widget()
             if w is not None:
                 w.deleteLater()
+        # 详情区（含服务详情）整体失效：属性同步摘除
+        self._drop_attrs(self._ENV_DETAIL_ATTRS + self._SVC_DETAIL_ATTRS)
 
         if not env_name:
             return
@@ -499,19 +523,14 @@ class ConfigEditorDialog(QDialog):
             self._clear_service_detail()
 
     def _clear_service_detail(self):
-        while self.svc_detail_layout.count():
-            item = self.svc_detail_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-
-        for attr in (
-            "svc_server_combo", "svc_project_dir", "svc_local_jar",
-            "svc_remote_dir", "svc_remote_name", "svc_build_args",
-            "svc_restart_cmd", "svc_depends_on", "svc_git_branch",
-        ):
-            if hasattr(self, attr):
-                delattr(self, attr)
+        layout = getattr(self, "svc_detail_layout", None)
+        if layout is not None:
+            while layout.count():
+                item = layout.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
+        self._drop_attrs(self._SVC_DETAIL_ATTRS)
 
     def _load_service_detail(self, svc_name):
         self._clear_service_detail()
@@ -972,10 +991,20 @@ class ConfigEditorDialog(QDialog):
                 name = self._cell_text(self.servers_table, row, 0)
                 if not name:
                     continue
+                port_text = self._cell_text(self.servers_table, row, 2)
                 try:
-                    port = int(self._cell_text(self.servers_table, row, 2) or "22")
+                    port = int(port_text) if port_text else 22
                 except ValueError:
-                    port = 22
+                    # 静默回退成 22 等于悄悄改配置：明确报错让保存中止
+                    raise ValueError(
+                        f"服务器表格第 {row + 1} 行（{name}）的端口不是整数: "
+                        f"{port_text!r}"
+                    ) from None
+                if not 1 <= port <= 65535:
+                    raise ValueError(
+                        f"服务器表格第 {row + 1} 行（{name}）的端口越界: "
+                        f"{port}（应为 1-65535）"
+                    )
                 new_servers[name] = ServerConfig(
                     name=name,
                     host=self._cell_text(self.servers_table, row, 1),
@@ -999,6 +1028,10 @@ class ConfigEditorDialog(QDialog):
         try:
             self._sync_current_env()
             self._sync_global_and_git()
+        except ValueError as e:
+            # 用户输入问题（如端口非整数/越界）：只给结论，不砸堆栈
+            QMessageBox.warning(self, "配置有误", str(e))
+            return
         except Exception:
             QMessageBox.critical(
                 self, "内部错误",

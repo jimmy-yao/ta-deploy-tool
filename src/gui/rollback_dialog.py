@@ -56,6 +56,7 @@ class RollbackDialog(QDialog):
         self.env_name = env_name
         self.service_name = service_name
         self.selected_backup = None
+        self._task = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -79,7 +80,17 @@ class RollbackDialog(QDialog):
         box.rejected.connect(self.reject)
         layout.addWidget(box)
 
-        asyncio.ensure_future(self._load_backups_async())
+        self._task = asyncio.ensure_future(self._load_backups_async())
+
+    def done(self, r):
+        # 任何退出路径（确定/取消/Esc/X）都要收掉后台查询任务：
+        # 否则 exec() 返回后 SSH 查询继续跑、把对话框对象吊住，
+        # 且右键一次就常驻一份实例；父窗口销毁后任务还会写已删除控件。
+        # deleteLater 排队销毁，exec() 返回后调用方仍可同步读 selected_backup。
+        if self._task and not self._task.done():
+            self._task.cancel()
+        super().done(r)
+        self.deleteLater()
 
     async def _load_backups_async(self):
         env = self.cfg.environments.get(self.env_name)

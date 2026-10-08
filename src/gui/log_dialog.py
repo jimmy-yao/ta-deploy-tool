@@ -1,7 +1,7 @@
 # log_dialog.py
 import asyncio
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, Qt
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QCheckBox, QPlainTextEdit, QComboBox
 )
@@ -27,6 +27,9 @@ class RemoteLogDialog(QDialog):
         self.service_name = service_name
         self._task = None
         self._is_paused = False
+        # show() 的对话框由 Qt 父子关系持有：不加此属性，关闭后只藏不删，
+        # 每打开一次就常驻一份实例（closeEvent 已负责取消 tail 任务）
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -37,9 +40,18 @@ class RemoteLogDialog(QDialog):
 
         env = self.cfg.environments.get(env_name)
         svc = env.services.get(service_name) if env else None
-        server = env.resolve_server(svc) if (env and svc) else None
+        server = None
+        server_label = "未知"
+        if env and svc:
+            try:
+                server = env.resolve_server(svc)
+                server_label = server.host
+            except KeyError:
+                # 侧边栏支持展示「⚠ 未匹配服务器」组的服务，
+                # 打开日志窗不能因为 server 引用未定义就静默失败
+                server_label = "⚠ 未匹配服务器"
 
-        info_str = f"服务: <b>{service_name}</b> | 服务器: <b>{server.host if server else '未知'}</b>"
+        info_str = f"服务: <b>{service_name}</b> | 服务器: <b>{server_label}</b>"
         top_bar.addWidget(QLabel(info_str))
 
         top_bar.addStretch()
@@ -131,7 +143,16 @@ class RemoteLogDialog(QDialog):
         if not svc:
             self._append_log("[错误] 未找到服务配置")
             return
-        server = env.resolve_server(svc)
+        try:
+            server = env.resolve_server(svc)
+        except KeyError as e:
+            # 引用未定义的 server（「⚠ 未匹配服务器」组）：给出可见原因，
+            # 而不是让异常穿透把点击变成“毫无反应”
+            self._append_log(
+                f"[错误] 服务 {self.service_name} 的 server 引用未定义，"
+                f"无法连接实时日志（{e}）"
+            )
+            return
 
         custom_path = self.path_edit.text().strip()
 
