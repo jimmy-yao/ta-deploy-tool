@@ -763,6 +763,39 @@ def _dump_config_doc(doc, path: str) -> None:
         raise
 
 
+def persist_service_fields(path: str, env_name: str, updates: Dict[str, Dict[str, object]]) -> None:
+    """只把指定服务的指定字段合并回磁盘文档（读-改-写，保留注释）。
+
+    与 save_config 的区别：不触碰其他任何字段。管线打包结束写回 local_jar
+    时，用户可能已经在任务运行期间重新加载/编辑过配置——整份 save_config
+    会用启动时捕获的旧对象覆盖这些并发编辑，而本函数只改它该改的键。
+    """
+    if not os.path.exists(path):
+        raise ConfigError(f"配置文件不存在，无法写回: {path}")
+
+    doc = _load_config_doc(path)
+    if doc is None:
+        raise ConfigError(f"配置文件无法解析，无法写回: {path}")
+
+    envs = doc.get("environments")
+    if not isinstance(envs, dict) or not isinstance(envs.get(env_name), dict):
+        raise ConfigError(f"配置文件中不存在环境: {env_name}")
+
+    services = envs[env_name].get("services")
+    if not isinstance(services, dict):
+        raise ConfigError(f"环境 {env_name} 的 services 段格式错误，无法写回")
+
+    for svc_name, fields in updates.items():
+        svc_doc = services.get(svc_name)
+        if not isinstance(svc_doc, dict):
+            raise ConfigError(
+                f"环境 {env_name} / 服务 {svc_name} 不在配置文件中，无法写回"
+            )
+        svc_doc.update(fields)
+
+    _dump_config_doc(doc, path)
+
+
 def _preserve_path_placeholders(data: dict, doc: dict):
     """加载时 _expand 会把 $VAR / ~ 展开成具体路径；保存时若用户并未真正
     改动该字段（cfg 值仍等于文档值的展开结果），就保留文档里的原始写法，

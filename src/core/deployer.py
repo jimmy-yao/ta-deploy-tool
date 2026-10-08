@@ -431,13 +431,23 @@ async def deploy_service(
     else:
         log(f"[重启] {svc.name} 禁用重启或未配置重启脚本，跳过")
 
+    # 与 list_remote_backups / rollback_service 同一兜底：空 remote_name 会让
+    # 上传目标变成 "{remote_dir}/"（目录本身），备份/替换会误伤远端目录
+    remote_name = svc.remote_name or (
+        os.path.basename(svc.local_jar) if svc.local_jar else ""
+    )
+    if not remote_name:
+        raise DeployExecuteError(
+            f"{svc.name}: remote_name 为空，且 local_jar 推导不出文件名"
+        )
+
     try:
         async with asyncssh.connect(**connect_kwargs) as conn:
             if phase_cb:
                 phase_cb("upload_start")
 
             await _upload_jar(
-                conn, local_jar, svc.remote_dir, svc.remote_name, log,
+                conn, local_jar, svc.remote_dir, remote_name, log,
                 progress_cb=progress_cb,
                 backup_keep=backup_keep,
             )

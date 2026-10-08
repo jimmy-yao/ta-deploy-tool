@@ -4,7 +4,7 @@ import os
 from typing import Callable, List, Dict, Optional
 
 from src.core.builder import build_service, prepare_repo
-from src.models.config import AppConfig, topo_sort, topo_sort_layers, save_config
+from src.models.config import AppConfig, topo_sort, topo_sort_layers, persist_service_fields
 from src.core.deployer import deploy_service
 from src.models.exceptions import BuildError, DeployExecuteError
 
@@ -53,6 +53,17 @@ class DeployPipeline:
 
             order = topo_sort(env.services, self.selected)
             self.log(f"执行顺序: {' -> '.join(order)}")
+
+            # 选中服务依赖了未勾选的服务：依赖不会被构建/部署，先亮出来，
+            # 否则用户只能从「执行顺序少了谁」里倒推（配置校验只保证依赖存在）
+            selected_set = set(self.selected)
+            for name in order:
+                for dep in env.services[name].depends_on:
+                    if dep in env.services and dep not in selected_set:
+                        self.log(
+                            f"[警告] {name} 依赖 {dep}，但 {dep} 未被勾选，"
+                            f"本次不会构建/部署它"
+                        )
 
             # git.enabled=false 时整体跳过 Git 阶段
             has_git = self.do_build and self.use_git and self.cfg.git.enabled
@@ -316,7 +327,8 @@ class DeployPipeline:
     # 自动识别结果回写
     # ============================================================
     def _persist_discovered_jars(self, env, discovered: Dict[str, str]):
-        updated = False
+        # 只收集发生变化的字段，最后字段级写回（见 persist_service_fields）
+        updates: Dict[str, Dict[str, object]] = {}
 
         for name, jar_abs in discovered.items():
             svc = env.services.get(name)
@@ -331,7 +343,7 @@ class DeployPipeline:
             if svc.local_jar != rel:
                 self.log(f"[更新] {name}.local_jar: {svc.local_jar or '(空)'} -> {rel}")
                 svc.local_jar = rel
-                updated = True
+                updates.setdefault(name, {})["local_jar"] = rel
 
             jar_basename = os.path.basename(jar_abs)
             if svc.remote_name != jar_basename:
@@ -339,11 +351,11 @@ class DeployPipeline:
                 if not old:
                     svc.remote_name = jar_basename
                     self.log(f"[更新] {name}.remote_name: (空) -> {jar_basename}")
-                    updated = True
+                    updates.setdefault(name, {})["remote_name"] = jar_basename
                 elif self.cfg.auto_remote_name:
                     svc.remote_name = jar_basename
                     self.log(f"[更新] {name}.remote_name: {old} -> {jar_basename}")
-                    updated = True
+                    updates.setdefault(name, {})["remote_name"] = jar_basename
                 else:
                     self.log(
                         f"[保留] {name}.remote_name: {old} "
@@ -351,7 +363,7 @@ class DeployPipeline:
                         f"如需自动更新请开启 auto_remote_name）"
                     )
 
-        if not updated:
+        if not updates:
             return
 
         if not self.config_path:
@@ -359,7 +371,9 @@ class DeployPipeline:
             return
 
         try:
-            save_config(self.cfg, self.config_path)
+            # 字段级写回：任务运行期间用户可能重新加载/编辑配置并换掉主窗口
+            # 持有的 cfg 对象，整份 save_config(self.cfg) 会用旧对象覆盖它们
+            persist_service_fields(self.config_path, self.env_name, updates)
             self.log(f"[配置] 已写回: {self.config_path}")
         except Exception as e:
             self.log(f"[警告] 写回配置失败: {e}")
