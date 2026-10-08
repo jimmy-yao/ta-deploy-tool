@@ -164,6 +164,45 @@ async def _cleanup_old_backups(
             log(f"清理旧备份失败 {name}: {e}")
 
 
+async def _restore_backup(sftp, backup_path: str, remote_final: str, log: LogFn):
+    """新文件未能就位时，把备份恢复回原名，避免线上 jar 缺失导致服务起不来。
+
+    取消（CancelledError）可能正好落在“备份 rename”这个 await 上——服务端
+    已改名、客户端还没收到确认，此时调用方记录的备份路径是否真的存在是不确定的，
+    所以一律以 stat 结果为准，而不是靠调用方传入的标记。
+    """
+    try:
+        await sftp.stat(backup_path)
+    except asyncssh.SFTPError:
+        # 备份从未建立 → 旧文件仍在原位，无需恢复
+        return
+
+    try:
+        await sftp.stat(remote_final)
+        final_exists = True
+    except asyncssh.SFTPError:
+        final_exists = False
+
+    if final_exists:
+        log(f"[信息] 线上 {remote_final} 仍在，备份保留在 {backup_path}")
+        return
+
+    try:
+        await sftp.rename(backup_path, remote_final)
+        log(f"[回滚] 新文件未能就位，已恢复原文件: {remote_final}")
+    except asyncio.CancelledError:
+        log(
+            f"[严重] 恢复原文件被取消中断：线上 {remote_final} 缺失，"
+            f"请手动从 {backup_path} 恢复"
+        )
+        raise
+    except Exception as e:
+        log(
+            f"[严重] 恢复原文件失败: {e}。"
+            f"线上 {remote_final} 当前缺失，请手动处理备份: {backup_path}"
+        )
+
+
 async def _upload_jar(
     conn,
     local_jar: str,
@@ -197,31 +236,38 @@ async def _upload_jar(
         else:
             await sftp.put(local_jar, remote_tmp)
 
-        backup_path = None
+        # “旧文件是否存在”与“备份是否成功”必须分开判断：
+        # stat 失败 = 没有旧文件（正常首传）；rename 失败 = 有旧文件却备不上，
+        # 若此时继续覆盖就是“无备份裸奔”，必须中止上传。
+        old_exists = True
         try:
             await sftp.stat(remote_final)
-            ts = _timestamp_ms()
-            backup_name = f"{remote_name}.bak.{ts}"
-            backup_path = f"{remote_dir}/{backup_name}"
-            await sftp.rename(remote_final, backup_path)
-            log(f"已备份旧文件: {backup_path}")
         except asyncssh.SFTPError:
-            backup_path = None
+            old_exists = False
+
+        candidate_backup = (
+            f"{remote_dir}/{remote_name}.bak.{_timestamp_ms()}"
+            if old_exists
+            else None
+        )
 
         try:
-            await sftp.rename(remote_tmp, remote_final)
-        except Exception:
-            # 旧文件已被改名为备份、新文件却未能就位时，
-            # 把备份恢复回原名，避免线上 jar 缺失导致服务无法启动。
-            if backup_path:
+            if candidate_backup:
                 try:
-                    await sftp.rename(backup_path, remote_final)
-                    log(f"[回滚] 新文件替换失败，已恢复原文件: {remote_final}")
-                except Exception as e2:
-                    log(
-                        f"[严重] 新文件替换失败且恢复原文件失败: {e2}。"
-                        f"线上 {remote_final} 当前缺失，请手动处理备份: {backup_path}"
-                    )
+                    await sftp.rename(remote_final, candidate_backup)
+                except asyncssh.SFTPError as e:
+                    raise DeployExecuteError(
+                        f"备份线上旧文件失败，已中止本次上传（原文件未改动）"
+                        f"以免无备份覆盖: {e}"
+                    ) from e
+                log(f"已备份旧文件: {candidate_backup}")
+            await sftp.rename(remote_tmp, remote_final)
+        except BaseException:
+            # 必须接 BaseException：CancelledError（用户点取消）继承自它。
+            # 只接 Exception 的话，取消恰好落在 rename 上时，
+            # “备份已建/可能已建、新文件未就位”的线上 jar 缺失状态永远无人恢复。
+            if candidate_backup:
+                await _restore_backup(sftp, candidate_backup, remote_final, log)
             raise
 
         log(f"上传完成: {remote_final}")
