@@ -4,6 +4,7 @@ import os
 import shutil
 import sys
 import traceback
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +16,7 @@ from qasync import QEventLoop
 from src.gui.main_window import MainWindow
 from src.gui.widgets import find_app_icon
 from src.gui.theme import apply_theme
+from src.models.config import load_config, validate_config
 
 
 SETTINGS_ORG = "ta-deploy-tool"
@@ -142,6 +144,8 @@ def main():
     # ---------- 事件循环 ----------
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
+    # 槽/任务异常兜底：无控制台时它们默认不可见（详见 install_excepthook）
+    install_excepthook(loop)
 
     # ---------- 配置文件 ----------
     if len(sys.argv) > 1:
@@ -151,6 +155,9 @@ def main():
         if config_path is None:
             return
 
+    if preflight_config(config_path) is None:
+        return
+
     window = MainWindow(str(config_path))
     window.showMaximized()
 
@@ -158,13 +165,20 @@ def main():
         loop.run_forever()
 
 
-def show_native_error(title: str, text: str):
-    """当程序崩溃或无法启动时写入 crash.log 并弹出原生 Windows 提示框。"""
+def _append_crash_log(title: str, text: str):
+    """带时间戳追加写 crash.log（覆盖写会把上一次现场冲掉）。"""
     try:
         log_file = app_dir() / "crash.log"
-        log_file.write_text(f"{title}\n{text}\n", encoding="utf-8", errors="ignore")
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_file, "a", encoding="utf-8", errors="ignore") as f:
+            f.write(f"===== {title} @ {stamp} =====\n{text}\n")
     except Exception:
         pass
+
+
+def show_native_error(title: str, text: str):
+    """当程序崩溃或无法启动时写入 crash.log 并弹出原生 Windows 提示框。"""
+    _append_crash_log(title, f"{title}\n{text}")
 
     if sys.platform == "win32":
         try:
@@ -180,6 +194,72 @@ def show_native_error(title: str, text: str):
         QMessageBox.critical(None, title, text)
     except Exception:
         pass
+
+
+def install_excepthook(loop=None):
+    """无控制台窗口下，Qt 槽/asyncio 任务里的异常默认只写 stderr —— 没人看得到，
+    表现就是「按钮点了没反应」。统一落到 crash.log + 原生错误框。"""
+
+    def hook(exc_type, exc, tb):
+        if issubclass(exc_type, (SystemExit, KeyboardInterrupt)):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        show_native_error(
+            "TA-DEPLOY-TOOL 未处理异常",
+            "".join(traceback.format_exception(exc_type, exc, tb)),
+        )
+
+    sys.excepthook = hook
+
+    if loop is not None:
+        def on_task_error(loop_, context):
+            exc = context.get("exception")
+            msg = context.get("message", "后台任务异常")
+            if exc is not None:
+                text = msg + "\n" + "".join(
+                    traceback.format_exception(type(exc), exc, exc.__traceback__)
+                )
+            else:
+                text = f"{msg}\n{context!r}"
+            show_native_error("TA-DEPLOY-TOOL 后台任务异常", text)
+
+        loop.set_exception_handler(on_task_error)
+
+
+def preflight_config(config_path) -> Optional[object]:
+    """启动前解析并体检配置：
+
+    - 畸形 YAML：给出可读原因（详细堆栈进 crash.log），不再砸一段启动崩溃堆栈
+    - validate_config 的问题：列清单后让用户决定是否仍要启动
+    返回 cfg；不可解析、或用户选择不启动 → None。
+    """
+    try:
+        cfg = load_config(str(config_path))
+    except Exception:
+        tb = traceback.format_exc()
+        _append_crash_log("配置文件无法解析", tb)
+        reason = tb.strip().splitlines()[-1]
+        QMessageBox.critical(
+            None, "配置文件无法解析",
+            f"配置文件无法解析：\n{config_path}\n\n"
+            f"{reason}\n\n"
+            "请修复 YAML 语法后重新启动（详细堆栈见 crash.log）。"
+        )
+        return None
+
+    errors = validate_config(cfg)
+    if errors:
+        detail = "\n".join(f"• {e}" for e in errors)
+        answer = QMessageBox.question(
+            None, "配置有误",
+            f"配置存在 {len(errors)} 个问题：\n\n{detail}\n\n"
+            "仍要启动吗？（打包/部署前请先在「配置」里修正）",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return None
+    return cfg
 
 
 if __name__ == "__main__":

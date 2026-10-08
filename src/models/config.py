@@ -763,6 +763,37 @@ def _dump_config_doc(doc, path: str) -> None:
         raise
 
 
+def _preserve_path_placeholders(data: dict, doc: dict):
+    """加载时 _expand 会把 $VAR / ~ 展开成具体路径；保存时若用户并未真正
+    改动该字段（cfg 值仍等于文档值的展开结果），就保留文档里的原始写法，
+    避免一次自动保存（如打包后写回 local_jar）把占位符永久固化成硬编码。"""
+    for key in ("maven", "java_home", "workspace"):
+        raw = doc.get(key)
+        if isinstance(raw, str) and data.get(key) == _expand(raw):
+            data[key] = raw
+
+    def keep_key(d_data, d_doc):
+        raw = d_doc.get("key")
+        if isinstance(raw, str) and d_data.get("key") == _expand(raw):
+            d_data["key"] = raw
+
+    doc_envs = doc.get("environments")
+    doc_envs = doc_envs if isinstance(doc_envs, dict) else {}
+    for env_name, env_data in (data.get("environments") or {}).items():
+        doc_env = doc_envs.get(env_name)
+        if not isinstance(doc_env, dict):
+            continue
+        if isinstance(env_data.get("default_server"), dict) and isinstance(
+            doc_env.get("default_server"), dict
+        ):
+            keep_key(env_data["default_server"], doc_env["default_server"])
+        doc_servers = doc_env.get("servers")
+        doc_servers = doc_servers if isinstance(doc_servers, dict) else {}
+        for srv_name, srv in (env_data.get("servers") or {}).items():
+            if isinstance(doc_servers.get(srv_name), dict):
+                keep_key(srv, doc_servers[srv_name])
+
+
 def save_config(cfg: AppConfig, path: str):
     data = {
         "maven": cfg.maven,
@@ -826,6 +857,7 @@ def save_config(cfg: AppConfig, path: str):
     if doc is None:
         doc = data
     else:
+        _preserve_path_placeholders(data, doc)
         _merge_config(doc, data)
     _dump_config_doc(doc, path)
 
@@ -878,6 +910,11 @@ def validate_config(cfg: AppConfig) -> list:
                 errors.append(
                     f"环境 {env_name} / 默认服务器: 既没有 password 也没有 key"
                 )
+        if not 1 <= env.default_server.port <= 65535:
+            errors.append(
+                f"环境 {env_name} / 默认服务器: port 越界"
+                f"（{env.default_server.port}，应为 1-65535）"
+            )
 
         for srv_name, srv in env.servers.items():
             if not srv_name:
@@ -891,6 +928,11 @@ def validate_config(cfg: AppConfig) -> list:
                 errors.append(
                     f"环境 {env_name} / 服务器 {srv_name}: "
                     f"既没有 password 也没有 key"
+                )
+            if not 1 <= srv.port <= 65535:
+                errors.append(
+                    f"环境 {env_name} / 服务器 {srv_name}: port 越界"
+                    f"（{srv.port}，应为 1-65535）"
                 )
 
         for svc_name, svc in env.services.items():
