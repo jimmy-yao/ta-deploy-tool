@@ -106,6 +106,8 @@ class AppConfig:
     max_parallel_builds: int = 3
     default_restart_script: str = "bin/start.sh"
     auto_remote_name: bool = True
+    # 重启失败时自动把部署前的版本放回去并重新重启（关闭则只报错，不动线上文件）
+    auto_rollback: bool = True
     git: GitConfig = field(default_factory=GitConfig)
     environments: Dict[str, EnvironmentConfig] = field(default_factory=dict)
 
@@ -341,6 +343,7 @@ def load_config(path: str) -> AppConfig:
         max_parallel_builds=int(raw.get("max_parallel_builds", 3)),
         default_restart_script=raw.get("default_restart_script", "bin/start.sh"),
         auto_remote_name=bool(raw.get("auto_remote_name", True)),
+        auto_rollback=bool(raw.get("auto_rollback", True)),
         git=git_cfg,
         detected_maven=detected_maven,
         detected_java_home=detected_java_home,
@@ -837,6 +840,7 @@ def save_config(cfg: AppConfig, path: str):
         "max_parallel_builds": cfg.max_parallel_builds,
         "default_restart_script": cfg.default_restart_script,
         "auto_remote_name": cfg.auto_remote_name,
+        "auto_rollback": cfg.auto_rollback,
         "git": {
             "enabled": cfg.git.enabled,
             "branch_mode": cfg.git.branch_mode,

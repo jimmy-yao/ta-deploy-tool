@@ -23,5 +23,10 @@ scratch/
 *.swp
 .DS_Store
 
-# 本地部署配置：含服务器明文密码，禁止入库
+# 本地机密配置（含服务器明文口令，严禁提交）
 config.yaml
+config.local.yaml
+*.secret.yaml
+.env
+.env.*
+secrets/
