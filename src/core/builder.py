@@ -1,6 +1,7 @@
 # builder.py
 import asyncio
 import os
+import shlex
 import subprocess
 import sys
 from typing import Callable, List, Optional, Tuple
@@ -14,6 +15,53 @@ LogFn = Callable[[str], None]
 # 取消标志的轮询间隔（秒）：Maven 下载依赖 / 注解处理时可能长时间不产生
 # 任何 stdout，取消检查不能只挂在“读到一行输出”上，否则点“停止”毫无反应。
 CANCEL_POLL_INTERVAL = 0.2
+
+# cmd.exe 回退命令行里必须加引号保护的字符：空白、引号、管道/重定向/
+# 转义符、括号。不包起来的话 cmd 把它们当语法而非字面值
+# （`-Dmsg=a&b` 会被拆成两条命令）。
+_SHELL_UNSAFE = ' \t"&|<>^()'
+
+
+def _split_build_args(build_args: str) -> List[str]:
+    """按 shell 规则切分 build_args，供无 shell 的 exec 直接当 argv 用。
+
+    与 ``str.split()`` 的区别：`-Dmsg="a b"` 是**一个**参数且引号被剥掉——
+    原来裸 split 会把引号内的空格当分隔符、引号字符还残留在参数里。
+    反斜杠显式设为非转义符（posix shlex 默认转义），否则 Windows 路径
+    `C:\\work\\bin` 会被吃成 `C:workbin`。
+    引号不闭合时抛 ValueError，由 `_resolve_build_args` 降级处理。
+    """
+    lex = shlex.shlex(build_args, posix=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    lex.escape = ""
+    return list(lex)
+
+
+def _resolve_build_args(build_args: str, log: LogFn) -> List[str]:
+    """切分 build_args；引号写坏了不阻断构建，降级按空白切分并告警。"""
+    try:
+        return _split_build_args(build_args)
+    except ValueError as e:
+        log(f"[警告] build_args 解析失败（{e}），已按空白切分: {build_args}")
+        return build_args.split()
+
+
+def _cmd_quote(arg: str) -> str:
+    """把单个参数包成 cmd.exe 命令行里的安全片段。
+
+    仅在含空白/引号/cmd 元字符时才加引号，无特殊字符的保持原样（日志
+    可读）。内部双引号转义为 `\\"`；参数若以反斜杠结尾再补一根，避免
+    MSVCRT 把结尾的 `\\"` 解析成「转义引号」导致引号不闭合。
+    """
+    if arg == "":
+        return '""'
+    if not any(ch in arg for ch in _SHELL_UNSAFE):
+        return arg
+    escaped = arg.replace('"', '\\"')
+    if escaped.endswith("\\"):
+        escaped += "\\"
+    return f'"{escaped}"'
 
 
 async def _await_with_cancel_poll(fut: "asyncio.Future", is_cancelled: Optional[Callable[[], bool]]):
@@ -197,7 +245,9 @@ async def build_service(
             log("[警告] 未配置 JAVA_HOME，Maven 可能启动失败")
 
     maven_cmd = os.path.normpath(maven) if sys.platform == "win32" else maven
-    args = [maven_cmd] + svc.build_args.split()
+    # shlex 级切分：引号成组且剥除；写坏引号则降级 split 并告警
+    extra_args = _resolve_build_args(svc.build_args, log)
+    args = [maven_cmd] + extra_args
 
     kwargs = {}
     if sys.platform == "win32":
@@ -213,8 +263,12 @@ async def build_service(
             **kwargs,
         )
     except (FileNotFoundError, OSError):
+        # Windows 上 mvn 是 .cmd/.bat，CreateProcess 起不了批文件，这条
+        # shell 回退是**常规路径**而非罕见兜底。命令行交给 cmd.exe 解释，
+        # 元字符（& | < > ^ 等）不加引号会被当语法而不是字面值，
+        # list2cmdline 只按空格/引号决定加不加引号，挡不住这一层。
         proc = await asyncio.create_subprocess_shell(
-            subprocess.list2cmdline(args),
+            " ".join(_cmd_quote(a) for a in args),
             cwd=svc.project_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
