@@ -248,6 +248,12 @@ async def update_repo(
         ["rev-parse", "--short", "HEAD"],
         project_dir, log=None, encoding=encoding, silent=True,
     )
+    if code != 0:
+        # 必须检查退出码：否则会把 "fatal: ..." 这类错误文本当成 commit 返回
+        raise GitError(
+            f"git rev-parse HEAD 失败 (exit={code}): "
+            f"{commit.strip() or '无输出'}"
+        )
     commit_id = commit.strip()
     _l(f"[git] 当前 commit: {commit_id}")
     return commit_id
