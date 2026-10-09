@@ -654,6 +654,20 @@ async def deploy_service(
     log(f"=== [部署完成] {svc.name} ===")
 
 
+def _safe_log_cb(log_cb: Callable[[str], None], text: str) -> None:
+    """tail 收尾回调容错：回调目标（日志窗）可能已随关闭销毁。
+
+    收尾行发生在 except 分支里，回调抛错会**顶掉后面的 raise**——
+    CancelledError 被吞、任务以 RuntimeError 结束，fire-and-forget 下
+    变成「Task exception was never retrieved」弹窗。收尾行是尽力而为，
+    丢弃即可，异常必须照常传播。
+    """
+    try:
+        log_cb(text)
+    except Exception:
+        pass
+
+
 async def tail_remote_log(
     server: ServerConfig,
     svc: ServiceConfig,
@@ -705,8 +719,8 @@ async def tail_remote_log(
                 async for line in proc.stdout:
                     log_cb(line.rstrip("\r\n"))
     except asyncio.CancelledError:
-        log_cb("\n[连接断开] 实时日志监听已停止")
+        _safe_log_cb(log_cb, "\n[连接断开] 实时日志监听已停止")
         raise
     except Exception as e:
-        log_cb(f"\n[日志异常] {e}")
+        _safe_log_cb(log_cb, f"\n[日志异常] {e}")
         raise

@@ -27,6 +27,9 @@ class RemoteLogDialog(QDialog):
         self.service_name = service_name
         self._task = None
         self._is_paused = False
+        # 关窗后 tail 任务可能还活着（取消是异步送达的）：置旗让收尾回调
+        # 静默丢弃，配合 _emit_line 的 RuntimeError 兜底
+        self._closed = False
         # show() 的对话框由 Qt 父子关系持有：不加此属性，关闭后只藏不删，
         # 每打开一次就常驻一份实例（closeEvent 已负责取消 tail 任务）
         self.setAttribute(Qt.WA_DeleteOnClose, True)
@@ -131,6 +134,23 @@ class RemoteLogDialog(QDialog):
             sb = self.log_text.verticalScrollBar()
             sb.setValue(sb.maximum())
 
+    def _emit_line(self, line: str):
+        """日志行发射，容忍宿主已销毁。
+
+        WA_DeleteOnClose 让「窗口已死」与「tail 任务还活」天然并存：
+        取消送达时的收尾回调、销毁后的下一行日志都会打到已删除的
+        C++ 对象上（RuntimeError: Signal source has been deleted），
+        异常抛回任务会变成「Task exception was never retrieved」弹窗。
+        """
+        if self._closed:
+            return
+        try:
+            self.log_signal.emit(line)
+        except RuntimeError:
+            # 对象已删（父窗销毁不一定走 closeEvent，_closed 可能没置上）：
+            # 行直接丢弃
+            pass
+
     def _start_tail(self):
         if self._task and not self._task.done():
             self._task.cancel()
@@ -157,7 +177,7 @@ class RemoteLogDialog(QDialog):
         custom_path = self.path_edit.text().strip()
 
         def cb(line):
-            self.log_signal.emit(line)
+            self._emit_line(line)
 
         async def runner():
             try:
@@ -172,6 +192,8 @@ class RemoteLogDialog(QDialog):
         self._task = asyncio.ensure_future(runner())
 
     def closeEvent(self, event):
+        # 先立旗再取消：取消是异步送达的，送达时的收尾回调必须被静默丢弃
+        self._closed = True
         if self._task and not self._task.done():
             self._task.cancel()
         super().closeEvent(event)
