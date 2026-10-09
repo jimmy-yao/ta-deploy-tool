@@ -665,7 +665,7 @@ class ConfigEditorDialog(QDialog):
         if hasattr(self, "svc_build_args"):
             svc.build_args = (
                 self.svc_build_args.text().strip()
-                or "clean install -DskipTests"
+                or "clean install -Dmaven.test.skip=true"
             )
         if hasattr(self, "svc_restart_cmd"):
             txt = self.svc_restart_cmd.text().strip()
@@ -777,7 +777,7 @@ class ConfigEditorDialog(QDialog):
                 local_jar="",
                 remote_dir=f"/data/deploy/envs/tgfw-xc/{dir_name}",
                 remote_name="",
-                build_args="clean install -DskipTests",
+                build_args="clean install -Dmaven.test.skip=true",
             )
             new_services.append(dir_name)
             used_dirs.add(dir_norm)
@@ -895,7 +895,7 @@ class ConfigEditorDialog(QDialog):
             local_jar="",
             remote_dir=f"/data/deploy/envs/tgfw-xc/{name}",
             remote_name="",
-            build_args="clean install -DskipTests",
+            build_args="clean install -Dmaven.test.skip=true",
         )
         self.services_list.addItem(name)
         self.services_list.setCurrentRow(self.services_list.count() - 1)

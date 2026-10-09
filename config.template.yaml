@@ -37,7 +37,7 @@ environments:
     services:
       example-service:
         project_dir: D:/work/example-service
-        build_args: clean install -DskipTests
+        build_args: clean install -Dmaven.test.skip=true
         local_jar: ""
         remote_dir: /data/deploy/envs/tgfw-xc/example-service
         remote_name: ""

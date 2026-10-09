@@ -57,7 +57,7 @@ class ServiceConfig:
     remote_name: str
     restart_cmd: Optional[str] = None
     depends_on: List[str] = field(default_factory=list)
-    build_args: str = "clean install -DskipTests"
+    build_args: str = "clean install -Dmaven.test.skip=true"
     git_branch: Optional[str] = None
     server: Optional[str] = None
     log_path: Optional[str] = None
@@ -374,7 +374,7 @@ def load_config(path: str) -> AppConfig:
                 restart_cmd=_parse_restart_cmd(svc_raw.get("restart_cmd")),
                 depends_on=list(svc_raw.get("depends_on", [])),
                 build_args=svc_raw.get(
-                    "build_args", "clean install -DskipTests"
+                    "build_args", "clean install -Dmaven.test.skip=true"
                 ),
                 git_branch=svc_raw.get("git_branch") or None,
                 server=svc_raw.get("server") or None,
