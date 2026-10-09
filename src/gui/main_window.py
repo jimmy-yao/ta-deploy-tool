@@ -250,11 +250,6 @@ class MainWindow(QMainWindow):
         self.none_btn.clicked.connect(lambda: self._set_all_checked(False))
         btn_row.addWidget(self.none_btn, 1)
 
-        self.only_btn = QPushButton("仅选当前")
-        self.only_btn.setObjectName("GhostButton")
-        self.only_btn.clicked.connect(self._set_only_current)
-        btn_row.addWidget(self.only_btn, 1)
-
         layout.addLayout(btn_row)
 
         return panel
@@ -497,24 +492,6 @@ class MainWindow(QMainWindow):
                 self.service_check_states[name] = checked
             for w in self._service_items.values():
                 w.set_checked(checked)
-
-        self._refresh_group_headers()
-
-    def _set_only_current(self):
-        env_name = self.env_combo.currentText()
-        env = self.cfg.environments.get(env_name)
-        if env is None:
-            return
-
-        visible_names = set(self._service_items.keys())
-        for name in env.services.keys():
-            is_checked = (name in visible_names)
-            self.service_check_states[name] = is_checked
-            w = self._service_items.get(name)
-            if w:
-                w.blockSignals(True)
-                w.set_checked(is_checked)
-                w.blockSignals(False)
 
         self._refresh_group_headers()
 
