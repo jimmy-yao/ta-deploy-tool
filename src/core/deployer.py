@@ -359,6 +359,14 @@ async def _rollback_restore(
     return failed_path
 
 
+def _kill_remote_process(process) -> None:
+    """尽力中断远端进程，任何失败都吞掉——它只用于超时/取消的收尾。"""
+    try:
+        process.kill()
+    except Exception:
+        pass
+
+
 async def _run_remote_cmd(
     conn, cmd: str, log: LogFn,
     timeout: int = REMOTE_CMD_TIMEOUT,
@@ -375,30 +383,41 @@ async def _run_remote_cmd(
     if tail_wait > 0:
         remote_cmd = f"{cmd}; __rc=$?; sleep {int(tail_wait)}; exit $__rc"
 
+    # 流式收集：边跑边逐行回显，而不是跑完再整块输出。
+    # 好处是长时间命令（重启脚本、超时上限 300s）在界面上有实时反馈，
+    # 操作者能立刻看到卡在哪一步；且超时/取消时已打印的输出不会丢。
+    # encoding 显式指定以免拿到 bytes；errors=replace 让远端脏字节
+    # 只表现为替换符，不会让整条命令中途炸掉。
+    process = await conn.create_process(
+        remote_cmd, encoding="utf-8", errors="replace",
+    )
+
+    async def _pump(reader, prefix=""):
+        while True:
+            line = await reader.readline()
+            if not line:  # EOF
+                return
+            log(prefix + line.rstrip("\r\n"))
+
+    stdout_task = asyncio.ensure_future(_pump(process.stdout))
+    stderr_task = asyncio.ensure_future(_pump(process.stderr, "[stderr] "))
+
     try:
-        result = await conn.run(remote_cmd, check=False, timeout=timeout)
+        await asyncio.wait_for(
+            asyncio.gather(stdout_task, stderr_task), timeout
+        )
     except asyncio.TimeoutError as e:
-        # asyncssh 的 TimeoutError 继承自 asyncio.TimeoutError，
-        # 并携带超时前已收集到的 stdout/stderr，先回显便于定位卡在哪一步。
-        stdout = getattr(e, "stdout", None)
-        stderr = getattr(e, "stderr", None)
-        if stdout:
-            for line in str(stdout).splitlines():
-                log(line)
-        if stderr:
-            for line in str(stderr).splitlines():
-                log(f"[stderr] {line}")
+        # 输出已实时打印过，此处不必再回显；只需中断远端进程并报错。
+        _kill_remote_process(process)
         raise DeployExecuteError(
             f"远程命令超时（超过 {timeout}s 未退出，已中断）: {cmd}"
         ) from e
+    except asyncio.CancelledError:
+        # 用户取消：远端可能仍在跑，主动中断，避免留下失控进程。
+        _kill_remote_process(process)
+        raise
 
-    if result.stdout:
-        for line in str(result.stdout).splitlines():
-            log(line)
-    if result.stderr:
-        for line in str(result.stderr).splitlines():
-            log(f"[stderr] {line}")
-
+    result = await process.wait()
     if result.exit_status != 0:
         raise DeployExecuteError(f"远程命令失败，退出码 {result.exit_status}: {cmd}")
 
