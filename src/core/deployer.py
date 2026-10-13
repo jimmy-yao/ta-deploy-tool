@@ -24,6 +24,9 @@ PhaseCb = Callable[[str], None]
 CONNECT_TIMEOUT = 30    # TCP 建连超时
 LOGIN_TIMEOUT = 60      # SSH 握手与认证超时（asyncssh 默认 120，这里收紧）
 REMOTE_CMD_TIMEOUT = 300  # 单条远程命令（如重启脚本）最长执行时间
+# 远端命令结束后额外等待的秒数：见 _run_remote_cmd 里的说明，
+# 用来保证启动脚本末尾 nohup 后台化那几行输出不被 sshd 关通道丢掉。
+REMOTE_CMD_TAIL_WAIT = 1
 
 # 含通配符的日志路径必须原样交给 shell 展开，无法整体加引号，
 # 因此只放行无需转义的字符（空格、引号、; & | $ ` 等一律拒绝）。
@@ -357,11 +360,23 @@ async def _rollback_restore(
 
 
 async def _run_remote_cmd(
-    conn, cmd: str, log: LogFn, timeout: int = REMOTE_CMD_TIMEOUT
+    conn, cmd: str, log: LogFn,
+    timeout: int = REMOTE_CMD_TIMEOUT,
+    tail_wait: int = REMOTE_CMD_TAIL_WAIT,
 ):
     log(f"$ {cmd}")
+    # 启动脚本最后一条常是 `nohup java ... &`：bash 打完 set -x 跟踪行就
+    # 后台化并立刻退出，sshd 随之关闭通道，管道里还没被读走推上线路的
+    # 最后几行 stderr 会随通道关闭被丢掉（表现就是日志缺最后的 nohup 命令）。
+    # 这里在远端命令后追加一次短暂 sleep，让远端 shell 多存活一会儿，
+    # 给 sshd 时间把管道剩余输出全部读走转发完，再关通道。
+    # 退出码用 __rc 存下来再透出，避免被 sleep 的 0 掩盖真实的重启失败。
+    remote_cmd = cmd
+    if tail_wait > 0:
+        remote_cmd = f"{cmd}; __rc=$?; sleep {int(tail_wait)}; exit $__rc"
+
     try:
-        result = await conn.run(cmd, check=False, timeout=timeout)
+        result = await conn.run(remote_cmd, check=False, timeout=timeout)
     except asyncio.TimeoutError as e:
         # asyncssh 的 TimeoutError 继承自 asyncio.TimeoutError，
         # 并携带超时前已收集到的 stdout/stderr，先回显便于定位卡在哪一步。
