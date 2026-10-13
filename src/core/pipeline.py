@@ -4,6 +4,7 @@ import os
 from typing import Callable, List, Dict, Optional
 
 from src.core.builder import build_service, prepare_repo
+from src.core.pom_deps import derive_cross_project_edges
 from src.models.config import AppConfig, topo_sort, topo_sort_layers, persist_service_fields
 from src.core.deployer import deploy_service
 from src.models.exceptions import BuildError, DeployExecuteError
@@ -127,8 +128,35 @@ class DeployPipeline:
                         f"本次构建使用自动检测值: {java_home}"
                     )
 
-                layers = topo_sort_layers(env.services, self.selected)
-                max_concurrency = max(1, self.cfg.max_parallel_builds)
+                # 跨工程 api 依赖：从各工程 pom 推导构建顺序边。没有它时并发
+                # 构建会出现「A 的 api 还在写共享本地仓库、B 已经去读」的竞态，
+                # 表现为 corrupted zip（多选失败、单选成功）。若推导出的边与
+                # 手写 depends_on 打架成环，分层给不出可行顺序，就丢弃这些
+                # 自动边并整轮串行——顺序可以不最优，但绝不能出竞态。
+                auto = derive_cross_project_edges(env.services, self.selected)
+                if auto.cycle:
+                    self.log(
+                        f"[警告] pom 推导的跨工程依赖存在循环: "
+                        f"{' -> '.join(auto.cycle)}，已丢弃这些边，"
+                        f"本次回退为串行构建"
+                    )
+                    auto_edges: Dict[str, List[str]] = {}
+                    force_serial = True
+                else:
+                    auto_edges = auto.edges
+                    force_serial = False
+                    for consumer, provider, gav in auto.matched:
+                        self.log(
+                            f"[依赖] {consumer} 依赖 {provider} 产出的 {gav}，"
+                            f"先构建 {provider}"
+                        )
+
+                layers = topo_sort_layers(
+                    env.services, self.selected, extra_edges=auto_edges
+                )
+                max_concurrency = (
+                    1 if force_serial else max(1, self.cfg.max_parallel_builds)
+                )
                 sem = asyncio.Semaphore(max_concurrency)
 
                 if len(layers) > 1 or any(len(layer) > 1 for layer in layers):

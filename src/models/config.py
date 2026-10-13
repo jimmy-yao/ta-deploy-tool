@@ -490,10 +490,19 @@ def topo_sort(services: Dict[str, ServiceConfig], selected: List[str]) -> List[s
     return result
 
 
-def topo_sort_layers(services: Dict[str, ServiceConfig], selected: List[str]) -> List[List[str]]:
+def topo_sort_layers(
+    services: Dict[str, ServiceConfig],
+    selected: List[str],
+    extra_edges: Optional[Dict[str, List[str]]] = None,
+) -> List[List[str]]:
     """
     对已选服务进行拓扑分层，无依赖关系的服务将被归入同一层级，可进行并发构建。
     返回: List[List[str]]，如 [["common"], ["user-service", "order-service"], ["gateway"]]
+
+    extra_edges: 额外的依赖边 {服务: [需先构建它的服务]}，与 depends_on 合并计入
+    分层，语义完全一致——键指向的提供方所在层必须先于键本身跑完。用于注入从
+    pom 推导出的跨工程 api 依赖（见 src/core/pom_deps）：没有它时，A 的 api
+    还在往共享本地仓库写、B 就并发去读，会出现 corrupted zip。
     """
     services = _check_selected_safety(services, selected)
 
@@ -503,7 +512,17 @@ def topo_sort_layers(services: Dict[str, ServiceConfig], selected: List[str]) ->
 
     for name in selected_set:
         svc = services.get(name)
-        deps_in_selected = [d for d in (svc.depends_on if svc else []) if d in selected_set]
+        # 去重是必须的：同一依赖若在 depends_on 与 extra_edges 里各出现一次而
+        # 不去重，in_degree 与 graph[dep] 会一并重复计数，虽能自洽但环检测的
+        # 口径会与下面 pom_deps 的合并图对不上。
+        deps_in_selected: List[str] = []
+        for d in (svc.depends_on if svc else []):
+            if d in selected_set and d not in deps_in_selected:
+                deps_in_selected.append(d)
+        if extra_edges:
+            for d in extra_edges.get(name, []):
+                if d in selected_set and d not in deps_in_selected:
+                    deps_in_selected.append(d)
         in_degree[name] = len(deps_in_selected)
         for dep in deps_in_selected:
             graph[dep].append(name)
