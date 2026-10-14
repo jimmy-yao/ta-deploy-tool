@@ -37,7 +37,11 @@ async def _run_git(
     encoding: str = "utf-8",
     timeout: Optional[int] = None,
     silent: bool = False,
+    echo_output: bool = True,
 ) -> Tuple[int, str]:
+    # echo_output 只管“逐行回显 stdout”，与 silent（连命令行都不打）分开：
+    # ls-remote 的输出是远端每一个分支 ref，几十上百行会把日志刷屏，
+    # 但命令行那一行还得留着，否则既看不出跑过什么、超时也少了上下文。
     cmd = ["git"] + args
     if log and not silent:
         log(f"$ (cd {cwd}) {' '.join(cmd)}")
@@ -73,7 +77,7 @@ async def _run_git(
             except UnicodeDecodeError:
                 text = raw.decode("gbk", errors="ignore").rstrip()
             if text:
-                if log and not silent:
+                if log and not silent and echo_output:
                     log(text)
                 lines.append(text)
 
@@ -103,6 +107,9 @@ async def list_remote_branches(
     code, out = await _run_git(
         ["ls-remote", "--heads", remote],
         project_dir, log, encoding, timeout=timeout,
+        # 远端有多少分支就回显多少行，逐行打没有价值（分支名下面自己解析），
+        # 只留上面那行命令回显；分支数直接体现在“解析到最新迭代分支”里。
+        echo_output=False,
     )
     if code != 0:
         raise GitError(f"git ls-remote --heads {remote} 失败")
