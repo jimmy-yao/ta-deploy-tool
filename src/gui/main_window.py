@@ -796,6 +796,9 @@ class MainWindow(QMainWindow):
         # 迟到的进度（任务已收尾）不再入账，避免注册表越积越大
         if task_id in self._tasks:
             self._progress_by_task[task_id] = (current, total, status)
+            # 必须排在徽章判定之前：本阶段完成会先释放占用，下面的终态
+            # 判断才拿得到“该服务已在本任务收尾”的事实
+            self._release_service(task_id, status)
 
         # 并行任务聚合：进度条反映所有运行中任务的总体完成度
         agg_cur = sum(c for c, t, _s in self._progress_by_task.values())
@@ -808,9 +811,9 @@ class MainWindow(QMainWindow):
 
         if status:
             self.action_card.update_progress(pct, status)
-            self._update_service_status_from_text(status)
+            self._update_service_status_from_text(status, task_id)
 
-    def _update_service_status_from_text(self, status: str):
+    def _update_service_status_from_text(self, status: str, task_id=None):
         if ":" not in status:
             return
         svc_name = status.split(":", 1)[0].strip()
@@ -834,6 +837,16 @@ class MainWindow(QMainWindow):
         else:
             return
 
+        if style in ("healthy", "critical") and self._service_pending(
+            svc_name, task_id
+        ):
+            # 终态，但本任务还没轮到它的最后一个阶段——典型是打包+部署任务
+            # 里的「构建完成」。此时置 Healthy 是提前报喜，更麻烦的是
+            # _note_badge 会把它摘出运行集，导致 _on_done 之后不再管它：
+            # 部署阶段真失败时徽章会永远停在 Healthy。
+            # 跳过本次显示，等最后一个阶段完成或任务收尾再定终态。
+            return
+
         w.set_status(style, text)
         self._note_badge(svc_name, style, text)
 
@@ -851,6 +864,57 @@ class MainWindow(QMainWindow):
             self._running_badges[name] = (style, text)
 
     # ============================================================
+    # 任务内按服务收尾（占用释放）
+    # ============================================================
+    @staticmethod
+    def _task_pending(info) -> set:
+        """任务里尚未收尾的服务集。
+
+        `_task_conflicts` 原来读的是启动时写死的 `services` 名单，整个任务
+        生命周期都不释放：2 个服务打包、先完成的那个想单独部署，会被判
+        “服务已在运行任务中”。改用运行期维护的 `pending` 才能反映真实占用。
+
+        没有 `pending` 键的条目（外部/老代码手工构造的）退回整份 `services`，
+        按“整个任务生命周期占用”保守处理，宁可拒绝也不放行。
+        """
+        if not info:
+            return set()
+        if "pending" in info:
+            return info["pending"]
+        return set(info.get("services") or ())
+
+    def _service_pending(self, name, task_id) -> bool:
+        """该服务在指定任务里是否还没走到最后一个阶段。"""
+        if task_id is None:
+            return False
+        return name in self._task_pending(self._tasks.get(task_id))
+
+    def _release_service(self, task_id, status):
+        """本任务对该服务的最后一个阶段跑完，把它从占用集摘除。
+
+        释放时机必须是本任务的**最后一个阶段**：只打包看「构建完成」，
+        含部署要等到「部署完成」。若按「构建完成」就放行，打包+部署任务
+        会把还没部署的服务放出去并发部署——同一个 jar 两次上传、两次重启。
+
+        同理 project_dir 那条检查也读 `pending`：打包+部署任务里 A 构建完
+        但部署未跑时，重建 A 会被拦下，否则重建会在任务上传到一半时把
+        jar 换掉，那是真竞态。
+        """
+        info = self._tasks.get(task_id)
+        if not info:
+            return
+        pending = info.get("pending")
+        if not pending or not status or ":" not in status:
+            return
+        name, rest = status.split(":", 1)
+        name = name.strip()
+        if name not in pending:
+            return
+        marker = "部署完成" if info.get("do_deploy") else "构建完成"
+        if marker in rest:
+            pending.discard(name)
+
+    # ============================================================
     # 任务完成
     # ============================================================
     def _on_done(self, task_id, ok, msg):
@@ -859,6 +923,14 @@ class MainWindow(QMainWindow):
         self._progress_by_task.pop(task_id, None)
         services = info["services"] if info else []
         is_cancel_msg = "已取消" in msg or "取消" in msg
+
+        # 本任务已释放、又被别的运行中任务接管的服务：徽章归那个任务管。
+        # 不拦这一下，这里会把新任务刚写进去的徽章摘掉并强置成本任务的
+        # 终态（_start_task 会把接管服务重新写回 _running_badges）。
+        # 注册表里 task_id 已弹出，剩下的都是并行任务。
+        claimed = set()
+        for other in self._tasks.values():
+            claimed.update(other.get("services") or ())
 
         if ok:
             self._append_log(f"[结果] {msg}")
@@ -874,6 +946,8 @@ class MainWindow(QMainWindow):
         # Idle），继续按 badge.text() 判断会漏掉这些服务的最终状态；
         # 已在中途进终态（_note_badge 摘除）的服务保持它自己的终态
         for name in services:
+            if name in claimed:
+                continue
             if name not in self._running_badges:
                 continue
             self._running_badges.pop(name, None)
@@ -920,11 +994,14 @@ class MainWindow(QMainWindow):
 
         - 服务名与运行中任务重叠：同一服务不能同时跑两个任务
         - 构建另查 project_dir：同一工作目录并发跑 Maven 会互踩 target/
+
+        两处占用都按 `pending`（本任务尚未收尾的服务）判定，而不是启动时
+        的 `services` 名单：多服务打包时先完成的那个应该能被右键单独部署。
         """
         conflicts = []
         occupied = set()
         for info in self._tasks.values():
-            occupied.update(info["services"])
+            occupied.update(self._task_pending(info))
         overlap = [n for n in selected if n in occupied]
         if overlap:
             conflicts.append("服务已在运行任务中: " + ", ".join(overlap))
@@ -946,7 +1023,7 @@ class MainWindow(QMainWindow):
                 for info in self._tasks.values():
                     if not info.get("do_build"):
                         continue
-                    for n in info["services"]:
+                    for n in self._task_pending(info):
                         s = env.services.get(n)
                         if s and s.project_dir:
                             running_dirs.add(norm(s.project_dir))
@@ -1061,6 +1138,10 @@ class MainWindow(QMainWindow):
             "pipeline": pipeline,
             "services": list(selected),
             "do_build": do_build,
+            # pending = 本任务尚未收尾的服务，随进度释放；冲突判定读它。
+            # do_deploy 决定释放时机（部署是最后一个阶段，要等「部署完成」）
+            "do_deploy": do_deploy,
+            "pending": set(selected),
         }
 
     def _on_build_clicked(self):
@@ -1271,6 +1352,10 @@ class MainWindow(QMainWindow):
             "pipeline": None,   # 回滚不走 DeployPipeline
             "services": [service_name],
             "do_build": False,
+            "do_deploy": True,
+            # 回滚不发进度回调，pending 到任务结束都不会释放——回滚是
+            # 单服务原子操作，本就该占到它自己结束为止
+            "pending": {service_name},
         }
 
     # ============================================================
