@@ -90,6 +90,14 @@ class MainWindow(QMainWindow):
         self._global_branch_override = None
         # 服务级「手动指定分支」：{服务名: 分支/commit}，仅本次会话生效，不写入配置文件
         self._service_branch_overrides = {}
+        # 「打包完自动部署」队列：[(env_name, 服务名)]。构建仍并行，但部署
+        # 之间排队串行——同一时刻只跑一个自动部署，谁先打包完先排前面
+        self._auto_queue = []
+        self._auto_busy = False
+        # 用户点过「取消」置位：队列作废且不再入队，下次手动发起任务时复位
+        self._auto_stop = False
+        # 已经报过「暂缓」的服务，避免同一条原因在多次触发里刷屏
+        self._auto_skip_logged = set()
 
         self._build_ui()
         self._load_services()
@@ -184,6 +192,16 @@ class MainWindow(QMainWindow):
         layout.addWidget(reload_btn)
 
         layout.addStretch()
+
+        # 打包完成自动部署：勾选后，打包任务里某服务构建完成就接着部署它。
+        # 不记住状态、每次启动默认不勾——这是会改变行为的开关
+        self.auto_deploy_check = QCheckBox("打包完自动部署")
+        self.auto_deploy_check.setToolTip(
+            "勾选后，打包任务里某服务打包完成就自动部署该服务。\n"
+            "多个服务时谁先打包完先部署，部署之间排队串行。\n"
+            "同 project_dir 还有服务在打包时会先暂缓（Maven 会换掉这个 jar）。"
+        )
+        layout.addWidget(self.auto_deploy_check)
 
         # Build / Deploy / Cancel
         self.build_btn = QPushButton("🔨  打包")
@@ -793,12 +811,13 @@ class MainWindow(QMainWindow):
     # 进度回调
     # ============================================================
     def _update_progress(self, task_id, current, total, status):
+        released = None
         # 迟到的进度（任务已收尾）不再入账，避免注册表越积越大
         if task_id in self._tasks:
             self._progress_by_task[task_id] = (current, total, status)
             # 必须排在徽章判定之前：本阶段完成会先释放占用，下面的终态
             # 判断才拿得到“该服务已在本任务收尾”的事实
-            self._release_service(task_id, status)
+            released = self._release_service(task_id, status)
 
         # 并行任务聚合：进度条反映所有运行中任务的总体完成度
         agg_cur = sum(c for c, t, _s in self._progress_by_task.values())
@@ -812,6 +831,11 @@ class MainWindow(QMainWindow):
         if status:
             self.action_card.update_progress(pct, status)
             self._update_service_status_from_text(status, task_id)
+            # 放最后：此刻徽章刚按打包任务收尾（Healthy + 摘除运行集），
+            # 自动部署起起来后 _start_task 会把它重新写成「部署中」，
+            # 不会被这里的终态判定中途抹掉
+            if released:
+                self._maybe_auto_deploy(task_id, released)
 
     def _update_service_status_from_text(self, status: str, task_id=None):
         if ":" not in status:
@@ -899,20 +923,115 @@ class MainWindow(QMainWindow):
         同理 project_dir 那条检查也读 `pending`：打包+部署任务里 A 构建完
         但部署未跑时，重建 A 会被拦下，否则重建会在任务上传到一半时把
         jar 换掉，那是真竞态。
+
+        返回本次被释放的服务名（没释放则为 None），供「打包完自动部署」
+        识别刚收尾的那一个。
         """
         info = self._tasks.get(task_id)
         if not info:
-            return
+            return None
         pending = info.get("pending")
         if not pending or not status or ":" not in status:
-            return
+            return None
         name, rest = status.split(":", 1)
         name = name.strip()
         if name not in pending:
-            return
+            return None
         marker = "部署完成" if info.get("do_deploy") else "构建完成"
         if marker in rest:
             pending.discard(name)
+            return name
+        return None
+
+    # ============================================================
+    # 打包完成自动部署（串行队列）
+    # ============================================================
+    def _auto_deploy_blocked(self, env_name, name) -> str:
+        """暂时不能自动部署的原因；空串表示放行。"""
+        conflicts = self._task_conflicts([name], False, env_name)
+        if conflicts:
+            return "；".join(conflicts)
+        env = self.cfg.environments.get(env_name)
+        if not env:
+            return ""
+
+        def norm(p):
+            return os.path.normcase(os.path.normpath(p)) if p else ""
+
+        mine = norm(getattr(env.services.get(name), "project_dir", ""))
+        if not mine:
+            return ""
+        # _task_conflicts 的 project_dir 那条只在 do_build 时走，而自动部署
+        # 是部署任务（do_build=False），得自己查：同目录还有服务在打包，
+        # 它的 Maven 构建会把这个 jar 换掉，正在上传的就是个换了一半的文件
+        for info in self._tasks.values():
+            if not info.get("do_build"):
+                continue
+            for n in self._task_pending(info):
+                if n == name:
+                    continue
+                other = env.services.get(n)
+                if other and norm(other.project_dir) == mine:
+                    return f"同 project_dir 的 {n} 还在打包"
+        return ""
+
+    def _drain_auto_queue(self):
+        """放行队列里第一个真正跑得起来的自动部署。
+
+        起不来的留在队里转到队尾——不做无限重试，一次最多扫一遍，等下一次
+        有任务收尾再扫（那时被卡住的目录可能已经空出来了）。
+        """
+        if not hasattr(self, "_auto_queue"):
+            return
+        if self._auto_busy or not self._auto_queue:
+            return
+        if self._auto_stop:
+            self._auto_queue.clear()
+            return
+        for _ in range(len(self._auto_queue)):
+            env_name, name = self._auto_queue.pop(0)
+            reason = self._auto_deploy_blocked(env_name, name)
+            if reason:
+                self._auto_queue.append((env_name, name))
+                if (name, reason) not in self._auto_skip_logged:
+                    self._auto_skip_logged.add((name, reason))
+                    self._append_log(f"[自动部署] 暂缓 {name}: {reason}")
+                continue
+            if self._start_task(do_build=False, do_deploy=True,
+                                 services=[name], auto=True):
+                self._auto_busy = True
+            return
+
+    def _maybe_auto_deploy(self, task_id, name):
+        """只打包任务里某服务刚构建完成 → 排进自动部署队列。
+
+        只对「只打包」任务生效：打包+部署任务自己会接着部署，这里再插一脚
+        就变成同一个 jar 上传两次、重启两次。
+        """
+        if not hasattr(self, "_auto_queue"):
+            return
+        chk = getattr(self, "auto_deploy_check", None)
+        if chk is None or not chk.isChecked():
+            return
+        info = self._tasks.get(task_id)
+        if not info:
+            return
+        if not info.get("do_build") or info.get("do_deploy"):
+            return
+        env_name = self.env_combo.currentText()
+        # 手工构造的任务条目可能没有 env，那时不拦
+        task_env = info.get("env")
+        if task_env is not None and env_name != task_env:
+            # 打包中途切了环境：自动部署会把包推到另一个环境去，不代劳
+            self._append_log(
+                f"[自动部署] 跳过 {name}：环境已从 {task_env} 切到 {env_name}")
+            return
+        if self._auto_stop:
+            return
+        self._auto_queue.append((env_name, name))
+        self._append_log(
+            f"[自动部署] {name} 打包完成，已入队（第 {len(self._auto_queue)} 位）")
+        self._drain_auto_queue()
 
     # ============================================================
     # 任务完成
@@ -954,6 +1073,15 @@ class MainWindow(QMainWindow):
             w = self._service_items.get(name)
             if w is not None:
                 w.set_status(*final)
+
+        # 自动部署是串行队列：派生任务收尾就放行下一个。这里不区分收尾的是
+        # 不是自动任务——打包任务结束也该把队列往下推一格（被「同 project_dir
+        # 还在打包」卡住的项就是等这一刻）。
+        # 排在「仍有任务在跑」之前：新起的部署任务会把 self._tasks 重新填上，
+        # 卡片和取消按钮据此保持运行态，不会提前收工。
+        if info and info.get("auto"):
+            self._auto_busy = False
+        self._drain_auto_queue()
 
         if self._tasks:
             # 还有并行任务在跑：卡片/取消按钮保持运行态
@@ -1036,27 +1164,37 @@ class MainWindow(QMainWindow):
                     )
         return conflicts
 
-    def _start_task(self, do_build: bool, do_deploy: bool, services=None):
+    def _start_task(self, do_build: bool, do_deploy: bool, services=None,
+                    auto: bool = False) -> bool:
         """启动任务。services 传入显式服务列表（右键单服务任务），
         为 None 时按侧边栏勾选状态执行。
 
         支持并行：服务与运行中任务不重叠即可同时开跑（打包按钮不再因为
-        有任务在跑而拒绝/禁用），真正冲突时明确列出冲突项并拒绝。"""
+        有任务在跑而拒绝/禁用），真正冲突时明确列出冲突项并拒绝。
+
+        auto=True 表示这是「打包完自动部署」队列派生的任务：冲突不再弹框
+        （调用方已做过静默预检）。返回是否真正启动。
+        """
+        if not auto:
+            # 用户主动发起任务：上一轮点「取消」对自动部署队列的作废到此为止。
+            # 用 setattr 兼容只建了部分属性的测试桩
+            setattr(self, "_auto_stop", False)
         env_name = self.env_combo.currentText()
         selected = list(services) if services is not None else self._selected_services()
         if not selected:
             QMessageBox.warning(self, "提示", "请至少选择一个服务")
-            return
+            return False
 
         conflicts = self._task_conflicts(selected, do_build, env_name)
         if conflicts:
             self._append_log("[任务] 无法开始（冲突）: " + "；".join(conflicts))
-            QMessageBox.warning(
-                self, "无法开始",
-                "与运行中的任务冲突：\n\n"
-                + "\n".join("  · " + c for c in conflicts)
-            )
-            return
+            if not auto:
+                QMessageBox.warning(
+                    self, "无法开始",
+                    "与运行中的任务冲突：\n\n"
+                    + "\n".join("  · " + c for c in conflicts)
+                )
+            return False
 
         if do_build:
             env = self.cfg.environments[env_name]
@@ -1069,7 +1207,7 @@ class MainWindow(QMainWindow):
                     self, "提示",
                     "以下服务未配置 project_dir：\n\n  " + "\n  ".join(missing)
                 )
-                return
+                return False
 
         # 并行期间不禁用打包/部署按钮：允许随时发起新任务（冲突由上面拦截）
         self.cancel_btn.setEnabled(True)
@@ -1142,7 +1280,11 @@ class MainWindow(QMainWindow):
             # do_deploy 决定释放时机（部署是最后一个阶段，要等「部署完成」）
             "do_deploy": do_deploy,
             "pending": set(selected),
+            "auto": auto,
+            # 任务归属的环境：自动部署时环境被切了就不再代劳
+            "env": env_name,
         }
+        return True
 
     def _on_build_clicked(self):
         self._start_task(do_build=True, do_deploy=False)
@@ -1159,6 +1301,10 @@ class MainWindow(QMainWindow):
         self._start_task(do_build=False, do_deploy=True, services=[service_name])
 
     def _on_cancel_clicked(self):
+        # 自动部署队列也一并作废：这些还没起跑，pipeline.cancel() 摸不到它们
+        setattr(self, "_auto_stop", True)
+        if hasattr(self, "_auto_queue"):
+            self._auto_queue.clear()
         running = [
             info for info in self._tasks.values()
             if info["task"] and not info["task"].done()
