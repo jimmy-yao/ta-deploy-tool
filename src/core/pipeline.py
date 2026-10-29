@@ -7,7 +7,9 @@ from src.core.builder import build_service, prepare_repo
 from src.core.pom_deps import derive_cross_project_edges
 from src.models.config import AppConfig, topo_sort, topo_sort_layers, persist_service_fields
 from src.core.deployer import deploy_service
-from src.models.exceptions import BuildError, DeployExecuteError
+from src.models.exceptions import (
+    BuildError, DeployExecuteError, ServiceCancelled,
+)
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int, str], None]
@@ -41,9 +43,82 @@ class DeployPipeline:
         self.do_deploy = do_deploy
         self.config_path = config_path
         self._cancelled = False
+        # 单服务取消：任务内被单独取消的服务名。只增不减，三个阶段都查它，
+        # 所以中途取消的服务在后续阶段也会一并跳过。
+        self._cancel_services = set()
+        # run() 收尾时回填，供 GUI 在完成消息里说明「其中哪几个没做」
+        self.cancelled_services: List[str] = []
 
     def cancel(self):
+        """整任务取消：三个阶段的循环都会停，并且外部还会 task.cancel()。"""
         self._cancelled = True
+
+    def cancel_service(self, name: str):
+        """只取消任务里的某一个服务，其余服务照常跑完。
+
+        只做协作式标记——不能取消外层任务，那会把其余服务一起带走。
+        真正的中断由 ``_run_cancellable`` 在长操作中途轮询到该标记后完成。
+        """
+        self._cancel_services.add(name)
+        self.log(f"[取消] 已请求取消服务 {name}（其余服务继续）")
+
+    def is_service_cancelled(self, name: str) -> bool:
+        """该服务是否已被单独取消（整任务取消视为所有服务都取消）。"""
+        return self._cancelled or name in self._cancel_services
+
+    async def _watch_service_cancel(self, name: str):
+        """阻塞到该服务被取消为止；只给 ``_run_cancellable`` 当取消信号源。
+
+        用轮询而不是 Event：标记是在 GUI 线程里直接改的集合，轮询不必管理
+        每个服务一个 Event 的创建/销毁，0.1s 的响应延迟也察觉不到。
+        """
+        while not self.is_service_cancelled(name):
+            await asyncio.sleep(0.1)
+
+    async def _run_cancellable(self, name: str, coro):
+        """跑某个服务的一段长操作，使 ``cancel_service(name)`` 能在中途打断它。
+
+        整任务取消走外部 ``task.cancel()``，在当前 await 处立刻抛
+        CancelledError，不经这里；单服务取消只能把「取消该服务」转成对这段
+        操作本身的取消，内层各自收尾：
+
+          - 构建：build_service 收到取消后杀掉 mvn 进程树
+          - 上传：放弃 SFTP；远端正式 jar 是先写 .tmp 再 rename，不受影响
+        """
+        fut = asyncio.ensure_future(coro)
+        watcher = None
+        try:
+            if self.is_service_cancelled(name):
+                raise ServiceCancelled(name)
+            watcher = asyncio.ensure_future(self._watch_service_cancel(name))
+            done, _ = await asyncio.wait(
+                {fut, watcher}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if fut in done:
+                # 正常返回值；内层的真实异常也从这里原样抛出
+                return fut.result()
+            raise ServiceCancelled(name)
+        finally:
+            if watcher is not None:
+                watcher.cancel()
+            if not fut.done():
+                fut.cancel()
+                # 等内层收尾跑完（杀进程树/放弃 SFTP），别把清理丢给事件循环
+                try:
+                    await fut
+                except BaseException:
+                    pass
+
+    def _skip_cancelled(self, name: str, step: int, total_units: int) -> int:
+        """单服务被取消：推进它的进度配额并上报，返回新的 step。
+
+        取消是「跳过」而不是「中断」——必须把该服务的配额记上，否则后续服务
+        的 base_val 会塌缩，整批进度条收尾时还会回跳。
+        """
+        self.log(f"[取消] {name} 已被取消，跳过后续阶段")
+        step += UNITS_PER_STAGE
+        self._emit(step, total_units, f"{name}: 已取消")
+        return step
 
     def _emit(self, current: int, total: int, status: str = ""):
         self.on_progress(current, total, status)
@@ -87,6 +162,10 @@ class DeployPipeline:
                         self.log("已取消")
                         self._emit(step, total_units, "已取消")
                         return
+                    if self.is_service_cancelled(name):
+                        # 单服务取消：跳过它并照常推进进度，其余服务继续
+                        step = self._skip_cancelled(name, step, total_units)
+                        continue
                     svc = env.services[name]
                     override = self.branch_overrides.get(name)
 
@@ -95,12 +174,18 @@ class DeployPipeline:
                     try:
                         # 分支在此处实时解析（iteration 模式现查远程最新分支），
                         # 不使用界面上的预解析缓存，保证拿到打包瞬间的最新分支。
-                        branch, _commit = await prepare_repo(
-                            svc, self.cfg.git, self.log,
-                            self.cfg.log_encoding,
-                            enable_git=self.cfg.git.enabled,
-                            branch_override=override,
+                        branch, _commit = await self._run_cancellable(
+                            name,
+                            prepare_repo(
+                                svc, self.cfg.git, self.log,
+                                self.cfg.log_encoding,
+                                enable_git=self.cfg.git.enabled,
+                                branch_override=override,
+                            ),
                         )
+                    except ServiceCancelled:
+                        step = self._skip_cancelled(name, step, total_units)
+                        continue
                     except Exception as e:
                         if not isinstance(e, asyncio.CancelledError):
                             self.log(f"[错误] {name} 代码更新失败: {e}")
@@ -176,21 +261,37 @@ class DeployPipeline:
 
                     async def _build_single(name: str):
                         nonlocal step
+                        if self.is_service_cancelled(name):
+                            step = self._skip_cancelled(name, step, total_units)
+                            return
                         async with sem:
                             if self._cancelled:
                                 raise asyncio.CancelledError()
+                            if self.is_service_cancelled(name):
+                                # 排队期间被取消：别再起 Maven
+                                step = self._skip_cancelled(name, step, total_units)
+                                return
                             svc = env.services[name]
                             self._emit(step, total_units, f"{name}: Maven 构建中")
                             try:
-                                jar_abs = await build_service(
-                                    maven, svc, self.log, self.cfg.log_encoding,
-                                    java_home=java_home,
-                                    is_cancelled=lambda: self._cancelled,
+                                jar_abs = await self._run_cancellable(
+                                    name,
+                                    build_service(
+                                        maven, svc, self.log, self.cfg.log_encoding,
+                                        java_home=java_home,
+                                        # 按服务判定：同层并发构建时只取消其中一个，
+                                        # 不能让别的服务的构建跟着一起停
+                                        is_cancelled=lambda: self.is_service_cancelled(name),
+                                    ),
                                 )
                                 if jar_abs:
                                     discovered_jars[name] = jar_abs
                                 step += UNITS_PER_STAGE
                                 self._emit(step, total_units, f"{name}: 构建完成")
+                            except ServiceCancelled:
+                                # 单服务取消不算构建失败，也绝不中断同层其余服务：
+                                # 这里吞掉并返回 None，gather 收到的就是成功
+                                step = self._skip_cancelled(name, step, total_units)
                             except Exception as e:
                                 if not isinstance(e, asyncio.CancelledError):
                                     self.log(f"[错误] {name} 构建失败: {e}")
@@ -210,6 +311,11 @@ class DeployPipeline:
                             )
                             failures = []
                             for name, res in zip(layer, results):
+                                if isinstance(res, ServiceCancelled):
+                                    # 正常情况下到不了这里（_build_single 已经
+                                    # 吞掉并推进了进度），但绝不能把它当构建失败
+                                    # 让单服务取消把整层拖下水
+                                    continue
                                 if isinstance(res, asyncio.CancelledError):
                                     # 外部取消 / 用户点停止：优先按取消处理，不当作构建失败
                                     raise res
@@ -243,6 +349,9 @@ class DeployPipeline:
             if has_deploy:
                 missing = []
                 for name in order:
+                    if self.is_service_cancelled(name):
+                        # 被取消的服务根本不会部署，不该再要求它的本地 jar
+                        continue
                     svc = env.services[name]
                     if not svc.local_jar:
                         missing.append((name, "(未识别，请先打包)"))
@@ -259,6 +368,8 @@ class DeployPipeline:
 
                 self.log("--- 部署目标 ---")
                 for name in order:
+                    if self.is_service_cancelled(name):
+                        continue
                     svc = env.services[name]
                     server = env.resolve_server(svc)
                     self.log(
@@ -272,6 +383,9 @@ class DeployPipeline:
                         self.log("已取消")
                         self._emit(step, total_units, "已取消")
                         return
+                    if self.is_service_cancelled(name):
+                        step = self._skip_cancelled(name, step, total_units)
+                        continue
                     svc = env.services[name]
                     server = env.resolve_server(svc)
                     local_jar = os.path.join(svc.project_dir, svc.local_jar)
@@ -338,14 +452,20 @@ class DeployPipeline:
                     phase_cb = _make_phase_cb(base_units, name, svc.remote_name)
 
                     try:
-                        await deploy_service(
-                            server, svc, local_jar, self.log,
-                            progress_cb=progress_cb,
-                            phase_cb=phase_cb,
-                            backup_keep=self.cfg.backup_keep,
-                            default_restart_script=self.cfg.default_restart_script,
-                            auto_rollback=self.cfg.auto_rollback,
+                        await self._run_cancellable(
+                            name,
+                            deploy_service(
+                                server, svc, local_jar, self.log,
+                                progress_cb=progress_cb,
+                                phase_cb=phase_cb,
+                                backup_keep=self.cfg.backup_keep,
+                                default_restart_script=self.cfg.default_restart_script,
+                                auto_rollback=self.cfg.auto_rollback,
+                            ),
                         )
+                    except ServiceCancelled:
+                        step = self._skip_cancelled(name, step, total_units)
+                        continue
                     except Exception as e:
                         if not isinstance(e, asyncio.CancelledError):
                             self.log(f"[错误] {name} 部署失败: {e}")
@@ -354,8 +474,22 @@ class DeployPipeline:
                     step += UNITS_PER_STAGE
                     self._emit(step, total_units, f"{name}: 部署完成")
 
-            self._emit(total_units, total_units, "全部完成")
-            self.log("=== 全部完成 ===")
+            self.cancelled_services = [
+                n for n in order if self.is_service_cancelled(n)
+            ]
+            if self.cancelled_services:
+                n_cancel = len(self.cancelled_services)
+                self.log(
+                    f"=== 完成，其中 {n_cancel} 个服务已取消: "
+                    f"{', '.join(self.cancelled_services)} ==="
+                )
+                self._emit(
+                    total_units, total_units,
+                    f"完成（{n_cancel} 个服务已取消）",
+                )
+            else:
+                self._emit(total_units, total_units, "全部完成")
+                self.log("=== 全部完成 ===")
         except asyncio.CancelledError:
             self._cancelled = True
             self.log("[取消] 任务已停止并取消")

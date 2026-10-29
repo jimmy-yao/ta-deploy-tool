@@ -216,7 +216,7 @@ class MainWindow(QMainWindow):
         self.deploy_btn.clicked.connect(self._on_deploy_clicked)
         layout.addWidget(self.deploy_btn)
 
-        self.cancel_btn = QPushButton("取消")
+        self.cancel_btn = QPushButton("全部取消")
         self.cancel_btn.setObjectName("DangerButton")
         self.cancel_btn.clicked.connect(self._on_cancel_clicked)
         self.cancel_btn.setEnabled(False)
@@ -828,8 +828,9 @@ class MainWindow(QMainWindow):
             self._update_service_status_from_text(status, task_id)
             # 放最后：此刻徽章刚按打包任务收尾（Healthy + 摘除运行集），
             # 自动部署起起来后 _start_task 会把它重新写成「部署中」，
-            # 不会被这里的终态判定中途抹掉
-            if released:
+            # 不会被这里的终态判定中途抹掉。
+            # 被取消的服务不入队——用户刚说不要它
+            if released and "已取消" not in status:
                 self._maybe_auto_deploy(task_id, released)
 
     @staticmethod
@@ -847,7 +848,12 @@ class MainWindow(QMainWindow):
         if w is None:
             return
 
-        if "失败" in status or "错误" in status:
+        if "已取消" in status:
+            # 单个服务被用户单独取消：不是失败，回到 Idle（整任务取消走
+            # _on_done 的 final，不经这里）。放在最前面判定，免得被下面
+            # 「失败/完成」的关键词抢先命中
+            style, text = "idle", "Idle"
+        elif "失败" in status or "错误" in status:
             style, text = "critical", "Critical"
         elif ("构建完成" in status or "部署完成" in status or "重启完成" in status
               or "上传完成" in status or "回滚完成" in status):
@@ -879,12 +885,13 @@ class MainWindow(QMainWindow):
     def _note_badge(self, name, style, text):
         """把徽章变化同步进 _running_badges 运行集。
 
-        进入终态（Healthy/Critical）说明该服务本轮已收尾，从运行集摘除，
+        进入终态（Healthy/Critical/Idle）说明该服务本轮已收尾，从运行集摘除，
         任务整体结束时不再覆盖它的终态；仍在运行态则更新为最新相位。
+        Idle 也算终态——单个服务被用户单独取消后它就不再归本任务管了。
         """
         if name not in self._running_badges:
             return
-        if style in ("healthy", "critical"):
+        if style in ("healthy", "critical", "idle"):
             self._running_badges.pop(name, None)
         else:
             self._running_badges[name] = (style, text)
@@ -928,6 +935,11 @@ class MainWindow(QMainWindow):
 
         返回本次被释放的服务名（没释放则为 None），供「打包完自动部署」
         识别刚收尾的那一个。
+
+        「已取消」也算释放：单个服务被用户单独取消后，它已经不占任何东西
+        了，必须马上让出占用，否则用户想立刻重跑这个服务会被判「已在运行
+        任务中」。调用方据此派发自动部署时要自己排除被取消的（见
+        _update_progress）。
         """
         info = self._tasks.get(task_id)
         if not info:
@@ -940,7 +952,7 @@ class MainWindow(QMainWindow):
         if name not in pending:
             return None
         marker = "部署完成" if info.get("do_deploy") else "构建完成"
-        if marker in rest:
+        if marker in rest or "已取消" in rest:
             pending.discard(name)
             return name
         return None
@@ -1228,8 +1240,14 @@ class MainWindow(QMainWindow):
             title = f"Building {scope}"
         else:
             title = f"Deploying {scope}"
-        # 每任务一张卡：标题跟着 task_id 走，不再由“最后启动的任务”覆盖全局
-        self.action_card.task_started(task_id, title)
+        # 每任务一张卡：标题跟着 task_id 走，不再由“最后启动的任务”覆盖全局。
+        # 卡上的取消入口直接接到 _cancel_task：右上角按钮取消整个任务，
+        # 多服务时逐行按钮只取消那一个服务
+        self.action_card.task_started(
+            task_id, title, services=selected,
+            on_cancel_task=self._cancel_task,
+            on_cancel_service=self._cancel_task,
+        )
 
         style = "building" if do_build else "deploying"
         text = "Building..." if do_build else "Deploying..."
@@ -1268,7 +1286,16 @@ class MainWindow(QMainWindow):
         async def runner():
             try:
                 await pipeline.run()
-                self.done_signal.emit(task_id, True, f"操作完成{result_scope}")
+                # 部分服务被单独取消时说清楚是哪几个——否则「操作完成」
+                # 会让人以为选中的服务全都部署好了
+                skipped = list(getattr(pipeline, "cancelled_services", ()) or ())
+                if skipped:
+                    self.done_signal.emit(
+                        task_id, True,
+                        f"操作完成（已取消: {', '.join(skipped)}）{result_scope}",
+                    )
+                else:
+                    self.done_signal.emit(task_id, True, f"操作完成{result_scope}")
             except asyncio.CancelledError:
                 log("[取消] 任务已被用户取消")
                 self.done_signal.emit(task_id, False, f"操作已被用户取消{result_scope}")
@@ -1308,22 +1335,75 @@ class MainWindow(QMainWindow):
         self._start_task(do_build=False, do_deploy=True, services=[service_name])
 
     def _on_cancel_clicked(self):
+        """工具栏「全部取消」：停掉所有运行中任务，并作废自动部署队列。
+
+        与单个取消（_cancel_task）的区别只在这里——全局取消意味着「这一批
+        都不要了」，所以还没起跑的自动部署也一并作废；单个取消不清队列。
+        """
         # 自动部署队列也一并作废：这些还没起跑，pipeline.cancel() 摸不到它们
         setattr(self, "_auto_stop", True)
         if hasattr(self, "_auto_queue"):
             self._auto_queue.clear()
         running = [
-            info for info in self._tasks.values()
+            tid for tid, info in self._tasks.items()
             if info["task"] and not info["task"].done()
         ]
         if not running:
             return
-        for info in running:
-            if info["pipeline"]:
-                info["pipeline"].cancel()
-            info["task"].cancel()
+        for tid in running:
+            self._cancel_task(tid)
         self.cancel_btn.setEnabled(False)
+        self.action_card.mark_all_cancelled()
         self.action_card.set_hint(f"已请求取消 {len(running)} 个任务...")
+
+    def _cancel_task(self, task_id, service_name=None):
+        """取消一个任务；service_name 给定时只取消该服务，其余服务照常跑完。
+
+        单服务取消只做协作式标记（pipeline.cancel_service），**不**
+        task.cancel()——那是 asyncio 级取消，会在当前 await 处把整任务连同
+        其余服务一起带走。也不碰 _auto_stop、不清自动部署队列：只停这一个，
+        队列里的下一个照常派出（_auto_busy 在收尾时自然复位）。
+
+        返回是否真的发起了取消。
+        """
+        info = self._tasks.get(task_id)
+        if not info or not info.get("task") or info["task"].done():
+            return False
+        pipe = info.get("pipeline")
+
+        if service_name and pipe is not None and hasattr(pipe, "cancel_service"):
+            if service_name not in self._task_pending(info):
+                # 已经收尾/不在本任务里：没什么可取消的
+                return False
+            pipe.cancel_service(service_name)
+            self._append_log(
+                f"[取消] T{task_id}: 已请求取消服务 {service_name}（其余服务继续）"
+            )
+            self.action_card.mark_service_cancelled(task_id, service_name)
+            return True
+
+        # 整任务取消；回滚任务不走 DeployPipeline（pipeline 为 None）也走这里
+        if pipe is not None:
+            pipe.cancel()
+        info["task"].cancel()
+        self._append_log(
+            f"[取消] 已请求取消任务 T{task_id}"
+            f"（{service_name or '全部服务'}）"
+        )
+        self.action_card.mark_task_cancelled(task_id)
+        return True
+
+    def _find_task_for_service(self, name):
+        """返回仍占用该服务的运行中任务号；没有则 None。
+
+        同一服务不会被两个任务同时占用（_task_conflicts 拦着），最多命中一个。
+        """
+        for tid, info in self._tasks.items():
+            if not info.get("task") or info["task"].done():
+                continue
+            if name in self._task_pending(info):
+                return tid
+        return None
 
     # ============================================================
     # 一键回滚
@@ -1359,6 +1439,14 @@ class MainWindow(QMainWindow):
         act_build.triggered.connect(lambda: self._on_build_service(svc_name))
         act_deploy = menu.addAction("🚀 部署此服务")
         act_deploy.triggered.connect(lambda: self._on_deploy_service(svc_name))
+        # 只有该服务正被某个任务占用时才有得取消；不在任何任务里就置灰
+        cancel_tid = self._find_task_for_service(svc_name)
+        act_cancel = menu.addAction("⏹ 取消此服务的任务")
+        act_cancel.setEnabled(cancel_tid is not None)
+        if cancel_tid is not None:
+            act_cancel.triggered.connect(
+                lambda: self._cancel_task(cancel_tid, svc_name)
+            )
 
         menu.addSeparator()
 
@@ -1473,7 +1561,9 @@ class MainWindow(QMainWindow):
         self._running_badges[service_name] = ("deploying", "Rollbacking...")
 
         self.action_card.task_started(
-            task_id, f"Rollbacking {service_name}", status="回滚中...")
+            task_id, f"Rollbacking {service_name}", status="回滚中...",
+            on_cancel_task=self._cancel_task,
+        )
 
         def log(text):
             if len(self._tasks) > 1:

@@ -275,7 +275,7 @@ class ServerGroupWidget(QFrame):
 
 import time
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QProgressBar
+from PySide6.QtWidgets import QProgressBar, QPushButton
 
 
 class TaskCard(QFrame):
@@ -283,13 +283,25 @@ class TaskCard(QFrame):
 
     多任务并行时一人一张——标题/进度/耗时/状态都只属于它自己，不会再出现
     「标题写着 A、状态行却是 B」的错配，耗时也不会被后来启动的任务重置。
+
+    取消入口：
+      - 右上角「取消」＝取消整个任务（单服务任务时它就等于取消该服务）
+      - 任务含多个服务时另列一行一个服务，各带「取消」＝只取消这一个，
+        其余服务照常跑完
     """
 
-    def __init__(self, title: str, status: str = "准备中...", parent=None):
+    # (task_id) / (task_id, service_name)；由 MainWindow 接住
+    cancel_task = Signal(int)
+    cancel_service = Signal(int, str)
+
+    def __init__(self, task_id: int, title: str, status: str = "准备中...",
+                 services=None, parent=None):
         super().__init__(parent)
         # 注意：不能叫 "Card"——外层容器已经是 #Card，同名会让两层套着的
         # 卡片共用同一条底色/圆角，看着像画错了；主题里单独给了 #TaskCard
         self.setObjectName("TaskCard")
+        self._task_id = task_id
+        self._svc_buttons = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 10, 14, 10)
@@ -304,6 +316,13 @@ class TaskCard(QFrame):
         self.elapsed_label = QLabel("Elapsed: 0s")
         self.elapsed_label.setObjectName("CardHint")
         top.addWidget(self.elapsed_label)
+        self.cancel_btn = QPushButton("取消")
+        self.cancel_btn.setObjectName("DangerButton")
+        self.cancel_btn.setFixedWidth(56)
+        self.cancel_btn.clicked.connect(
+            lambda: self.cancel_task.emit(self._task_id)
+        )
+        top.addWidget(self.cancel_btn)
         layout.addLayout(top)
 
         self.progress = QProgressBar()
@@ -317,6 +336,32 @@ class TaskCard(QFrame):
         self.status_label.setObjectName("CardHint")
         layout.addWidget(self.status_label)
 
+        # 多服务任务才逐个列出来：单服务任务标题已经写明是哪个服务，
+        # 再列一行「服务名 + 取消」纯属重复
+        services = list(services or ())
+        if len(services) > 1:
+            svc_box = QVBoxLayout()
+            svc_box.setSpacing(2)
+            for name in services:
+                row = QHBoxLayout()
+                row.setSpacing(6)
+                lbl = QLabel(name)
+                lbl.setObjectName("CardHint")
+                row.addWidget(lbl)
+                row.addStretch()
+                btn = QPushButton("取消")
+                btn.setObjectName("GhostButton")
+                btn.setFixedWidth(52)
+                btn.clicked.connect(
+                    lambda _=False, n=name: self.cancel_service.emit(
+                        self._task_id, n
+                    )
+                )
+                self._svc_buttons[name] = btn
+                row.addWidget(btn)
+                svc_box.addLayout(row)
+            layout.addLayout(svc_box)
+
         # 计时起点 = 这张卡被建出来的时刻，只属于本任务
         self._start_time = time.time()
         self._timer = QTimer(self)
@@ -328,6 +373,21 @@ class TaskCard(QFrame):
         self.progress.setValue(pct)
         if status_text:
             self.status_label.setText(status_text)
+
+    def mark_cancelled(self):
+        """整个任务已请求取消：按钮置灰，防重复点击。"""
+        self._disable(self.cancel_btn, "取消中…")
+
+    def mark_service_cancelled(self, service_name: str):
+        """某个服务已请求取消：只置灰它那一行的按钮。"""
+        self._disable(self._svc_buttons.get(service_name), "取消中…")
+
+    @staticmethod
+    def _disable(btn, text: str):
+        if btn is None:
+            return
+        btn.setEnabled(False)
+        btn.setText(text)
 
     def stop(self):
         """任务结束：停表并把最终耗时写死。"""
@@ -378,13 +438,39 @@ class CurrentActionCard(QFrame):
 
         self._cards = {}
 
-    def task_started(self, task_id, title: str, status: str = "准备中..."):
+    def task_started(self, task_id, title: str, status: str = "准备中...",
+                     services=None, on_cancel_task=None, on_cancel_service=None):
+        """登记一个新任务并建它的卡。
+
+        取消回调是可选的：不传就没有取消入口（测试桩/无取消语境）。
+        """
         if task_id in self._cards:
             return
-        card = TaskCard(title, status)
+        card = TaskCard(task_id, title, status, services=services)
+        if on_cancel_task is not None:
+            card.cancel_task.connect(on_cancel_task)
+        if on_cancel_service is not None:
+            card.cancel_service.connect(on_cancel_service)
         self._cards[task_id] = card
         self._cards_box.addWidget(card)
         self._refresh_title()
+
+    def mark_task_cancelled(self, task_id):
+        """整任务已请求取消：置灰该卡右上角的按钮。"""
+        card = self._cards.get(task_id)
+        if card is not None:
+            card.mark_cancelled()
+
+    def mark_service_cancelled(self, task_id, service_name):
+        """任务里的某个服务已请求取消：只置灰它那一行的按钮。"""
+        card = self._cards.get(task_id)
+        if card is not None:
+            card.mark_service_cancelled(service_name)
+
+    def mark_all_cancelled(self):
+        """全局取消：所有在跑任务的取消入口都置灰。"""
+        for card in self._cards.values():
+            card.mark_cancelled()
 
     def task_progress(self, task_id, pct: int, status_text: str = ""):
         card = self._cards.get(task_id)
