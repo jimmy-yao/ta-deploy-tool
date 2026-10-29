@@ -253,6 +253,12 @@ QTreeWidget#SidebarList::item:selected {
     border: 1px solid #C6D7C2;
     border-radius: 12px;
 }
+/* 容器内的单任务行：底色比容器浅，才看得出是一行一任务 */
+QFrame#TaskCard {
+    background: #FFFFFF;
+    border: 1px solid #C6D7C2;
+    border-radius: 10px;
+}
 #Card QLabel#CardTitle {
     color: #232E24;
     font-size: 15px;
@@ -855,6 +861,12 @@ QTreeWidget#SidebarList::item:selected {
     border: 1px solid #DBD4C5;
     border-radius: 12px;
 }
+/* 容器内的单任务行：底色比容器浅，才看得出是一行一任务 */
+QFrame#TaskCard {
+    background: #FFFDF8;
+    border: 1px solid #DBD4C5;
+    border-radius: 10px;
+}
 #Card QLabel#CardTitle {
     color: #2B2621;
     font-size: 15px;
@@ -1456,6 +1468,12 @@ QTreeWidget#SidebarList::item:selected {
     background: #1F2B3E;
     border: 1px solid #2D3D54;
     border-radius: 12px;
+}
+/* 容器内的单任务行：底色比容器浅，才看得出是一行一任务 */
+QFrame#TaskCard {
+    background: #25344B;
+    border: 1px solid #2D3D54;
+    border-radius: 10px;
 }
 #Card QLabel#CardTitle {
     color: #F8FAFC;

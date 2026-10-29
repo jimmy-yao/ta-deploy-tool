@@ -278,19 +278,33 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QProgressBar
 
 
-class CurrentActionCard(QFrame):
-    """右上角卡片：标题 + 渐变进度条 + 状态 + 耗时"""
-    def __init__(self, parent=None):
+class TaskCard(QFrame):
+    """单个运行中任务的卡片：标题 + 耗时 + 自己的进度条 + 自己的状态行。
+
+    多任务并行时一人一张——标题/进度/耗时/状态都只属于它自己，不会再出现
+    「标题写着 A、状态行却是 B」的错配，耗时也不会被后来启动的任务重置。
+    """
+
+    def __init__(self, title: str, status: str = "准备中...", parent=None):
         super().__init__(parent)
-        self.setObjectName("Card")
+        # 注意：不能叫 "Card"——外层容器已经是 #Card，同名会让两层套着的
+        # 卡片共用同一条底色/圆角，看着像画错了；主题里单独给了 #TaskCard
+        self.setObjectName("TaskCard")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(6)
 
-        self.title_label = QLabel("准备就绪")
-        self.title_label.setObjectName("CardTitle")
-        layout.addWidget(self.title_label)
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("CardSubtitle")
+        top.addWidget(self.title_label)
+        top.addStretch()
+        self.elapsed_label = QLabel("Elapsed: 0s")
+        self.elapsed_label.setObjectName("CardHint")
+        top.addWidget(self.elapsed_label)
+        layout.addLayout(top)
 
         self.progress = QProgressBar()
         self.progress.setObjectName("MainProgress")
@@ -299,64 +313,28 @@ class CurrentActionCard(QFrame):
         self.progress.setFormat("")
         layout.addWidget(self.progress)
 
-        info_row = QHBoxLayout()
-        info_row.setSpacing(8)
-
-        self.status_label = QLabel("等待操作")
+        self.status_label = QLabel(status)
         self.status_label.setObjectName("CardHint")
-        info_row.addWidget(self.status_label)
+        layout.addWidget(self.status_label)
 
-        info_row.addStretch()
-
-        self.elapsed_label = QLabel("")
-        self.elapsed_label.setObjectName("CardHint")
-        info_row.addWidget(self.elapsed_label)
-
-        layout.addLayout(info_row)
-
-        self._start_time = None
+        # 计时起点 = 这张卡被建出来的时刻，只属于本任务
+        self._start_time = time.time()
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._tick)
-
-    def start(self, title: str):
-        self._start_time = time.time()
-        self.title_label.setText(title)
-        self.progress.setValue(0)
-        self.status_label.setText("准备中...")
-        self.elapsed_label.setText("Elapsed: 0s")
         self._timer.start()
 
-    def update_progress(self, pct: int, status_text: str = ""):
+    def update(self, pct: int, status_text: str = ""):
         self.progress.setValue(pct)
         if status_text:
             self.status_label.setText(status_text)
 
-    def finish(self, ok: bool, message: str = ""):
+    def stop(self):
+        """任务结束：停表并把最终耗时写死。"""
         self._timer.stop()
-        if self._start_time is not None:
-            elapsed = time.time() - self._start_time
-            self.elapsed_label.setText(f"Elapsed: {self._fmt(elapsed)}")
-        else:
-            self.elapsed_label.setText("")
-        if ok:
-            self.progress.setValue(100)
-            self.status_label.setText("完成")
-        else:
-            self.status_label.setText(message or "失败")
-        self._start_time = None
-
-    def reset(self):
-        self._timer.stop()
-        self._start_time = None
-        self.title_label.setText("准备就绪")
-        self.progress.setValue(0)
-        self.status_label.setText("等待操作")
-        self.elapsed_label.setText("")
+        self._tick()
 
     def _tick(self):
-        if self._start_time is None:
-            return
         elapsed = time.time() - self._start_time
         self.elapsed_label.setText(f"Elapsed: {self._fmt(elapsed)}")
 
@@ -367,3 +345,82 @@ class CurrentActionCard(QFrame):
         if m:
             return f"{m}m {s}s"
         return f"{s}s"
+
+
+class CurrentActionCard(QFrame):
+    """右上角「当前任务」区域：空闲时两条提示，运行时一任务一张 TaskCard。
+
+    关键变化：卡片内容不再由某一次 start() 写死，而是按 task_id 分别登记。
+    原来的单卡有两条互不相干的写入链——标题由「最后启动的任务」写一次、
+    状态行由「最后 tick 的任务」每次都写——并行时必然错配。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Card")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(10)
+
+        self.title_label = QLabel("准备就绪")
+        self.title_label.setObjectName("CardTitle")
+        layout.addWidget(self.title_label)
+
+        # 运行中的任务卡都插在这里；空闲时它自然为空
+        self._cards_box = QVBoxLayout()
+        self._cards_box.setSpacing(8)
+        layout.addLayout(self._cards_box)
+
+        self.status_label = QLabel("等待操作")
+        self.status_label.setObjectName("CardHint")
+        layout.addWidget(self.status_label)
+
+        self._cards = {}
+
+    def task_started(self, task_id, title: str, status: str = "准备中..."):
+        if task_id in self._cards:
+            return
+        card = TaskCard(title, status)
+        self._cards[task_id] = card
+        self._cards_box.addWidget(card)
+        self._refresh_title()
+
+    def task_progress(self, task_id, pct: int, status_text: str = ""):
+        card = self._cards.get(task_id)
+        if card is None:
+            # 迟到的/没登记过的任务进度一律不写卡片，免得污染在跑的任务
+            return
+        card.update(pct, status_text)
+
+    def task_finished(self, task_id):
+        """摘掉某张卡。整批是否结束由 _on_done 的 finish() 另行表达。"""
+        card = self._cards.pop(task_id, None)
+        if card is None:
+            return
+        card.stop()
+        self._cards_box.removeWidget(card)
+        card.setParent(None)
+        card.deleteLater()
+        self._refresh_title()
+
+    def finish(self, ok: bool, message: str = ""):
+        """整批收尾（_on_done 里 _tasks 已空时才调）。卡片都摘了，结果落到提示行。
+
+        成功时显示完整 message 而不是笼统的「完成」：任务标题已经随卡片一起
+        消失，这行是唯一能说明「刚刚干完的是什么」的地方。
+        """
+        self.status_label.setText(message or ("完成" if ok else "失败"))
+
+    def set_hint(self, text: str):
+        self.status_label.setText(text)
+
+    def reset(self):
+        for task_id in list(self._cards):
+            self.task_finished(task_id)
+        self.title_label.setText("准备就绪")
+        self.status_label.setText("等待操作")
+
+    def _refresh_title(self):
+        n = len(self._cards)
+        self.title_label.setText(f"当前任务 ({n})" if n else "准备就绪")

@@ -819,23 +819,25 @@ class MainWindow(QMainWindow):
             # 判断才拿得到“该服务已在本任务收尾”的事实
             released = self._release_service(task_id, status)
 
-        # 并行任务聚合：进度条反映所有运行中任务的总体完成度
-        agg_cur = sum(c for c, t, _s in self._progress_by_task.values())
-        agg_tot = sum(t for _c, t, _s in self._progress_by_task.values())
-        if agg_tot <= 0:
-            pct = 0
-        else:
-            pct = int(round(agg_cur * 100 / agg_tot))
-            pct = max(0, min(100, pct))
-
-        if status:
-            self.action_card.update_progress(pct, status)
+        # 进度/徽章/自动部署都只认还在跑的任务：迟到的进度不该写进卡片
+        if status and task_id in self._tasks:
+            # 每任务一条进度条，用本任务自己的 current/total——原来跨任务求和，
+            # 条的百分比和标题指的任务毫无关系，且某任务收尾时会百分比回跳
+            self.action_card.task_progress(
+                task_id, self._task_pct(current, total), status)
             self._update_service_status_from_text(status, task_id)
             # 放最后：此刻徽章刚按打包任务收尾（Healthy + 摘除运行集），
             # 自动部署起起来后 _start_task 会把它重新写成「部署中」，
             # 不会被这里的终态判定中途抹掉
             if released:
                 self._maybe_auto_deploy(task_id, released)
+
+    @staticmethod
+    def _task_pct(current, total) -> int:
+        """单任务进度百分比。total<=0（如纯勾选不构建不部署）按 0 处理。"""
+        if total <= 0:
+            return 0
+        return max(0, min(100, int(round(current * 100 / total))))
 
     def _update_service_status_from_text(self, status: str, task_id=None):
         if ":" not in status:
@@ -1081,7 +1083,14 @@ class MainWindow(QMainWindow):
         # 卡片和取消按钮据此保持运行态，不会提前收工。
         if info and info.get("auto"):
             self._auto_busy = False
+        # 摘掉本任务那张卡；整批是否结束另由下面的 finish() 表达
+        self.action_card.task_finished(task_id)
         self._drain_auto_queue()
+
+        # 每个失败都得报：弹窗原来排在「仍有任务在跑」的 early return 之后，
+        # 并行时先失败的那个会被整段吞掉，等另一个成功结束卡片还显示「完成」
+        if not ok and not is_cancel_msg:
+            QMessageBox.critical(self, "失败", msg)
 
         if self._tasks:
             # 还有并行任务在跑：卡片/取消按钮保持运行态
@@ -1092,9 +1101,6 @@ class MainWindow(QMainWindow):
         self.deploy_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         self.action_card.finish(ok, msg)
-
-        if not ok and not is_cancel_msg:
-            QMessageBox.critical(self, "失败", msg)
 
     # ============================================================
     # 任务启动
@@ -1222,7 +1228,8 @@ class MainWindow(QMainWindow):
             title = f"Building {scope}"
         else:
             title = f"Deploying {scope}"
-        self.action_card.start(title)
+        # 每任务一张卡：标题跟着 task_id 走，不再由“最后启动的任务”覆盖全局
+        self.action_card.task_started(task_id, title)
 
         style = "building" if do_build else "deploying"
         text = "Building..." if do_build else "Deploying..."
@@ -1316,9 +1323,7 @@ class MainWindow(QMainWindow):
                 info["pipeline"].cancel()
             info["task"].cancel()
         self.cancel_btn.setEnabled(False)
-        self.action_card.status_label.setText(
-            f"已请求取消 {len(running)} 个任务..."
-        )
+        self.action_card.set_hint(f"已请求取消 {len(running)} 个任务...")
 
     # ============================================================
     # 一键回滚
@@ -1467,7 +1472,8 @@ class MainWindow(QMainWindow):
             w.set_status("deploying", "Rollbacking...")
         self._running_badges[service_name] = ("deploying", "Rollbacking...")
 
-        self.action_card.start(f"Rollbacking {service_name}")
+        self.action_card.task_started(
+            task_id, f"Rollbacking {service_name}", status="回滚中...")
 
         def log(text):
             if len(self._tasks) > 1:
