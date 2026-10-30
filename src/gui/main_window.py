@@ -37,6 +37,39 @@ from src.gui.rollback_dialog import RollbackDialog, ManualBranchDialog
 
 
 # ============================================================
+# 诊断护栏：模态框 × 任务 step
+# ============================================================
+# 正常运行时恒为空。留成模块级列表是为了让测试能直接断言——
+# 护栏自己没被测过，等于没装。
+modal_diag: list = []
+
+
+def _diag_modal_in_task_step(where: str) -> None:
+    """模态框若在 asyncio 任务 step 内弹出，就是线上
+    "Cannot enter into task ... while another task ... is being executed"
+    的源头：模态框转起嵌套 Qt 事件循环，qasync 再借它去跑别的任务的 step，
+    asyncio 的 _enter_task 见 _current_tasks[loop] 非空就抛错，
+    任务随之卡死在 pending，关窗时表现为 "Task was destroyed but it is pending!"。
+
+    三个信号改成排队连接后（_connect_signals），handler 一律在事件循环
+    空闲时执行，这里应当永远安静。一旦有人把接线改回 direct、或在任务里
+    直接弹框，这行会点名「哪一处、哪个任务」，而不是等用户贴一段看不懂的
+    traceback 来猜。
+    """
+    try:
+        cur = asyncio.current_task()
+    except RuntimeError:
+        cur = None
+    if cur is not None:
+        entry = f"{where}: 模态框在任务 step 内打开 [{cur.get_name()}]"
+        modal_diag.append(entry)
+        try:
+            print(f"[diag] {entry}", flush=True)
+        except Exception:
+            pass
+
+
+# ============================================================
 # 主窗口
 # ============================================================
 class MainWindow(QMainWindow):
@@ -103,12 +136,31 @@ class MainWindow(QMainWindow):
         self._load_services()
         self._install_shortcuts()
 
-        self.log_signal.connect(self._append_log)
-        self.progress_signal.connect(self._update_progress)
-        self.done_signal.connect(self._on_done)
-        self.branch_signal.connect(self._on_branch_resolved)
-
+        self._connect_signals()
+        # 这不是接线，是启动后台任务——留在 __init__ 里。测试调
+        # _connect_signals() 只该拿到接线，不该顺手把分支刷新跑起来
         self._branch_task = asyncio.ensure_future(self._refresh_branches_async())
+
+    def _connect_signals(self):
+        """信号接线。单独抽成方法，是为了让测试能直接调它——不这么做的话，
+        测试桩自己 connect 一遍就永远碰不到生产这几行，接线改坏了也没人发现。
+
+        三个信号一律排队连接（QueuedConnection）。
+        默认连接在同线程是 DirectConnection，emit() 会**同步**调用 handler——
+        而 runner() 是在 asyncio 任务的 __step 里 emit 的，于是 handler 连同
+        它内部的模态框（_on_done 的失败弹窗）全都跑在「该任务正在执行」的
+        窗口内。模态框会转起嵌套 Qt 事件循环，qasync 再借它去跑别的任务的
+        step，asyncio 的 _enter_task 见 _current_tasks[loop] 非空就抛
+        "Cannot enter into task ... while another task ... is being executed"，
+        __step 因此被打断、_leave_task 没执行，任务卡死在 pending，关窗时
+        就是 "Task was destroyed but it is pending!"。
+        排队连接把 handler 推到事件循环空闲时执行，此刻没有任何任务在 step，
+        模态框随便转嵌套循环也不会撞护栏。
+        """
+        self.log_signal.connect(self._append_log, Qt.QueuedConnection)
+        self.progress_signal.connect(self._update_progress, Qt.QueuedConnection)
+        self.done_signal.connect(self._on_done, Qt.QueuedConnection)
+        self.branch_signal.connect(self._on_branch_resolved)
 
     # ============================================================
     # UI 构建
@@ -1102,6 +1154,7 @@ class MainWindow(QMainWindow):
         # 每个失败都得报：弹窗原来排在「仍有任务在跑」的 early return 之后，
         # 并行时先失败的那个会被整段吞掉，等另一个成功结束卡片还显示「完成」
         if not ok and not is_cancel_msg:
+            _diag_modal_in_task_step("_on_done 失败弹窗")
             QMessageBox.critical(self, "失败", msg)
 
         if self._tasks:
