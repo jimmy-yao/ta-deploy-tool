@@ -878,6 +878,13 @@ class MainWindow(QMainWindow):
             self.action_card.task_progress(
                 task_id, self._task_pct(current, total), status)
             self._update_service_status_from_text(status, task_id)
+            # 本任务对它的最后一个阶段跑完了：这行的「取消」已经没有意义
+            # （_cancel_task 会因 pending 里没有它而拒绝，点了没反应），
+            # 置灰改文案——已打包完、正由另一个任务部署的服务，不该还在
+            # 打包卡里挂着可点的取消
+            if released:
+                self.action_card.mark_service_finished(
+                    task_id, released, cancelled="已取消" in status)
             # 放最后：此刻徽章刚按打包任务收尾（Healthy + 摘除运行集），
             # 自动部署起起来后 _start_task 会把它重新写成「部署中」，
             # 不会被这里的终态判定中途抹掉。

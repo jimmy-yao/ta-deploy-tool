@@ -382,6 +382,19 @@ class TaskCard(QFrame):
         """某个服务已请求取消：只置灰它那一行的按钮。"""
         self._disable(self._svc_buttons.get(service_name), "取消中…")
 
+    def mark_service_finished(self, service_name: str, cancelled: bool = False):
+        """服务在本任务内已到终点（跑完或被取消）：这行的取消入口撤下。
+
+        不改这一下，已打包完、正由另一个任务部署的服务，还在打包卡里挂着
+        可点的「取消」——_cancel_task 会因 pending 里没有它而拒绝，用户点了
+        没反应，只会以为按钮卡了。
+        """
+        btn = self._svc_buttons.get(service_name)
+        if btn is None:
+            return
+        btn.setEnabled(False)
+        btn.setText("已取消" if cancelled else "已完成")
+
     @staticmethod
     def _disable(btn, text: str):
         if btn is None:
@@ -466,6 +479,12 @@ class CurrentActionCard(QFrame):
         card = self._cards.get(task_id)
         if card is not None:
             card.mark_service_cancelled(service_name)
+
+    def mark_service_finished(self, task_id, service_name, cancelled=False):
+        """任务里某个服务已到终点：它那行的取消按钮撤下（已完成/已取消）。"""
+        card = self._cards.get(task_id)
+        if card is not None:
+            card.mark_service_finished(service_name, cancelled)
 
     def mark_all_cancelled(self):
         """全局取消：所有在跑任务的取消入口都置灰。"""
