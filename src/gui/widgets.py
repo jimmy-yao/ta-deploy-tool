@@ -318,7 +318,9 @@ class TaskCard(QFrame):
         top.addWidget(self.elapsed_label)
         self.cancel_btn = QPushButton("取消")
         self.cancel_btn.setObjectName("DangerButton")
-        self.cancel_btn.setFixedWidth(56)
+        # 只给下限、不锁死：固定宽度会把「取消中…」这类更长的文案裁掉
+        # （样式左右各 12px padding，52px 的按钮只剩 28px 放字）
+        self.cancel_btn.setMinimumWidth(56)
         self.cancel_btn.clicked.connect(
             lambda: self.cancel_task.emit(self._task_id)
         )
@@ -351,7 +353,9 @@ class TaskCard(QFrame):
                 row.addStretch()
                 btn = QPushButton("取消")
                 btn.setObjectName("GhostButton")
-                btn.setFixedWidth(52)
+                # 同上：宽度必须跟着文案走。「已完成」「已取消」都比「取消」宽，
+                # 固定 52px 会把字裁掉（截图里那个被切掉一半的「已完成」）
+                btn.setMinimumWidth(52)
                 btn.clicked.connect(
                     lambda _=False, n=name: self.cancel_service.emit(
                         self._task_id, n
