@@ -3,7 +3,7 @@ import asyncio
 import os
 from typing import Callable, List, Dict, Optional
 
-from src.core.builder import build_service, prepare_repo
+from src.core.builder import build_service, module_selection_conflict, prepare_repo
 from src.core.pom_deps import derive_cross_project_edges
 from src.models.config import AppConfig, topo_sort, topo_sort_layers, persist_service_fields
 from src.core.deployer import deploy_service
@@ -123,6 +123,108 @@ class DeployPipeline:
     def _emit(self, current: int, total: int, status: str = ""):
         self.on_progress(current, total, status)
 
+    async def _build_api_layer(
+        self,
+        env,
+        maven: str,
+        java_home: str,
+        api_plan: Dict[str, List[str]],
+        api_only: set,
+        layers: List[List[str]],
+        max_concurrency: int,
+        total_units: int,
+        step: int,
+        discovered_jars: Dict[str, str],
+    ):
+        """阶段一：按分层顺序安装各工程的 api 模块。
+
+        每层内部并发、层间串行——api 模块之间也可能互相依赖（A 的 api 被
+        B 的 api 依赖），顺序沿用阶段二那份全量边，宁可多等一层也不抢跑。
+
+        返回 (step, installed)：installed 是 api 层确实装好的服务名，阶段二
+        据此决定是否移除指向它的 api 依赖边。只含 api 模块的工程在这里就
+        已经产出可部署 jar，直接记入 discovered_jars 并推进构建进度，阶段二
+        不再重复构建。
+        """
+        sem = asyncio.Semaphore(max_concurrency)
+        installed: set = set()
+
+        async def _one(name: str):
+            nonlocal step
+            if self.is_service_cancelled(name):
+                # 进度留到阶段二统一按「已取消」结算，避免这里算一次、
+                # 阶段二再算一次导致进度条提前跑满
+                return
+            async with sem:
+                if self._cancelled:
+                    raise asyncio.CancelledError()
+                if self.is_service_cancelled(name):
+                    return
+                svc = env.services[name]
+                mods = api_plan[name]
+                self._emit(step, total_units, f"{name}: 安装 API 层")
+                try:
+                    jar_abs = await self._run_cancellable(
+                        name,
+                        build_service(
+                            maven, svc, self.log, self.cfg.log_encoding,
+                            java_home=java_home,
+                            modules=mods,
+                            is_cancelled=lambda: self.is_service_cancelled(name),
+                        ),
+                    )
+                except ServiceCancelled:
+                    # 同上：阶段二会把这次取消记进进度，这里不重复
+                    self.log(f"[API 层] {name}: api 层安装已取消")
+                    return
+                except Exception as e:
+                    if not isinstance(e, asyncio.CancelledError):
+                        self.log(f"[错误] {name} api 层安装失败: {e}")
+                    raise
+
+                installed.add(name)
+                if name in api_only:
+                    # 工程里只有 api 模块：阶段二排除掉就没有可构建的了，
+                    # 直接复用它刚刚装出来的产物
+                    if jar_abs:
+                        discovered_jars[name] = jar_abs
+                    step += UNITS_PER_STAGE
+                    self._emit(step, total_units, f"{name}: 构建完成")
+                else:
+                    self.log(f"[API 层] {name}: api 层已安装")
+
+        for layer_idx, layer in enumerate(layers, 1):
+            if self._cancelled:
+                raise asyncio.CancelledError()
+            targets = [n for n in layer if n in api_plan]
+            if not targets:
+                continue
+            if len(targets) == 1 or max_concurrency == 1:
+                for name in targets:
+                    await _one(name)
+                continue
+
+            self.log(
+                f"[API 层] 层级 {layer_idx} 并发安装: {', '.join(targets)}"
+            )
+            results = await asyncio.gather(
+                *[_one(n) for n in targets], return_exceptions=True)
+            failures = []
+            for name, res in zip(targets, results):
+                if isinstance(res, ServiceCancelled):
+                    continue
+                if isinstance(res, asyncio.CancelledError):
+                    raise res
+                if isinstance(res, BaseException):
+                    failures.append((name, res))
+            if failures:
+                raise BuildError(
+                    f"API 层安装失败: {', '.join(n for n, _ in failures)}"
+                    f"（详见上方错误日志）"
+                ) from failures[0][1]
+
+        return step, installed
+
     async def run(self):
         try:
             env = self.cfg.environments[self.env_name]
@@ -236,13 +338,99 @@ class DeployPipeline:
                             f"先构建 {provider}"
                         )
 
+                # ---------- 阶段C-1：先安装各工程的 api 模块 ----------
+                # 只装 api 层（-pl <api 模块> -am），装完后阶段二整包构建时
+                # 排除它们，消费方不必再等提供方的 service 模块构建完。
+                # build_args 自带 -pl/-f 的服务无法安全注入模块选择，跳过它，
+                # 退回原来的整包构建（阶段二也不移除指向它的边）。
+                api_plan: Dict[str, List[str]] = {}
+                api_only: set = set()
+                installed_api: set = set()
+                if not force_serial:
+                    for name, mods in auto.api_modules.items():
+                        svc = env.services.get(name)
+                        if svc is None or not mods:
+                            continue
+                        conflict = module_selection_conflict(svc.build_args)
+                        if conflict:
+                            self.log(
+                                f"[API 层] 跳过 {name}：build_args 已含 "
+                                f"{conflict}，不注入模块级构建"
+                            )
+                            continue
+                        api_plan[name] = mods
+                    api_only = {
+                        n for n in api_plan
+                        if set(api_plan[n]) == set(auto.modules.get(n, []))
+                    }
+                    if api_plan:
+                        self.log(
+                            f"[API 层] 阶段一：先安装 {len(api_plan)} 个工程的 "
+                            f"api 模块，阶段二整包构建时排除它们"
+                        )
+
+                if api_plan:
+                    api_layers = topo_sort_layers(
+                        env.services, self.selected, extra_edges=auto_edges
+                    )
+                    max_concurrency = max(1, self.cfg.max_parallel_builds)
+                    step, installed_api = await self._build_api_layer(
+                        env, maven, java_home, api_plan, api_only,
+                        api_layers, max_concurrency, total_units,
+                        step, discovered_jars,
+                    )
+                    if self._cancelled:
+                        self.log("已取消")
+                        self._emit(step, total_units, "已取消")
+                        return
+
+                # ---------- 阶段C-2：整包构建（api 层已装好的边可移除）----------
+                # 只移除“该条边对应的构件全是 api 产物”且提供方确实装好了的
+                # 边；非 api 依赖、提供方没装成的依赖一律保留——顺序不能抢跑。
+                phase2_edges = auto_edges
+                if installed_api and auto.matched:
+                    api_gav_str = {f"{g}:{a}" for g, a in auto.api_gavs}
+                    # 同一个 消费方-提供方 可能对应多个构件（既依赖它的 api 又
+                    # 依赖它的 service）。只有这条边的**全部**构件都是 api 产物、
+                    # 且提供方 api 层确实装好了，才能移除；否则消费方仍需要等
+                    # 提供方的整包构建。
+                    pair_gavs: Dict[tuple, List[str]] = {}
+                    for c, p, gav in auto.matched:
+                        pair_gavs.setdefault((c, p), []).append(gav)
+                    removable = {
+                        pair for pair, gavs in pair_gavs.items()
+                        if pair[1] in installed_api
+                        and all(g in api_gav_str for g in gavs)
+                    }
+                    if removable:
+                        phase2_edges = {}
+                        for consumer, providers in auto_edges.items():
+                            kept = [
+                                p for p in providers
+                                if (consumer, p) not in removable
+                            ]
+                            if kept:
+                                phase2_edges[consumer] = kept
+                        self.log(
+                            f"[API 层] 阶段二移除 {len(removable)} 条 api 依赖边"
+                            f"（对应提供方的 api 层已装好）"
+                        )
+
                 layers = topo_sort_layers(
-                    env.services, self.selected, extra_edges=auto_edges
+                    env.services, self.selected, extra_edges=phase2_edges
                 )
                 max_concurrency = (
                     1 if force_serial else max(1, self.cfg.max_parallel_builds)
                 )
                 sem = asyncio.Semaphore(max_concurrency)
+
+                # 阶段一已构建完的 api-only 工程：阶段二不再跑，进度已记过
+                api_done = api_only & installed_api
+                # 阶段一装好 api 层的工程：阶段二排除这些模块
+                api_exclude = {
+                    n: api_plan[n] for n in installed_api
+                    if n in api_plan and n not in api_done
+                }
 
                 if len(layers) > 1 or any(len(layer) > 1 for layer in layers):
                     self.log(
@@ -261,6 +449,9 @@ class DeployPipeline:
 
                     async def _build_single(name: str):
                         nonlocal step
+                        if name in api_done:
+                            # 只含 api 模块的工程在阶段一就构建完、进度也记过
+                            return
                         if self.is_service_cancelled(name):
                             step = self._skip_cancelled(name, step, total_units)
                             return
@@ -282,6 +473,7 @@ class DeployPipeline:
                                         # 按服务判定：同层并发构建时只取消其中一个，
                                         # 不能让别的服务的构建跟着一起停
                                         is_cancelled=lambda: self.is_service_cancelled(name),
+                                        exclude_modules=api_exclude.get(name),
                                     ),
                                 )
                                 if jar_abs:

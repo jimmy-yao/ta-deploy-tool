@@ -47,6 +47,33 @@ def _resolve_build_args(build_args: str, log: LogFn) -> List[str]:
         return build_args.split()
 
 
+# 这些参数会改变 Maven 的“构建哪些模块”语义。注入 -pl 会与它们打架，
+# 所以两阶段构建要能提前识别并跳过该服务（尤其是 -f 会换根 pom，
+# 相对模块路径就不再是同一个反应堆）。
+_MODULE_SELECT_FLAGS = ("-pl", "--projects", "-f", "--file")
+
+
+def module_selection_conflict(build_args: str) -> Optional[str]:
+    """build_args 自带模块/文件选择时返回那个参数名，否则 None。
+
+    两阶段构建靠 ``-pl`` 注入 api 模块选择；用户已在 build_args 里写了
+    ``-pl``/``--projects``/``-f``/``--file`` 时不能再追加，否则 Maven
+    会收到两个互相覆盖的模块列表。识别到就跳过该服务的两阶段优化，
+    退回原来的整包构建。
+    """
+    try:
+        args = _split_build_args(build_args)
+    except ValueError:
+        args = build_args.split()
+    for a in args:
+        if a in _MODULE_SELECT_FLAGS:
+            return a
+        for flag in ("--projects=", "--file="):
+            if a.startswith(flag):
+                return flag[:-1]
+    return None
+
+
 def _cmd_quote(arg: str) -> str:
     """把单个参数包成 cmd.exe 命令行里的安全片段。
 
@@ -222,7 +249,16 @@ async def build_service(
     encoding: str = "utf-8",
     java_home: str = "",
     is_cancelled: Optional[Callable[[], bool]] = None,
+    modules: Optional[List[str]] = None,
+    exclude_modules: Optional[List[str]] = None,
 ) -> Optional[str]:
+    """构建一个服务，返回识别到的可部署 jar（没有则 None）。
+
+    ``modules``：只构建这些子模块，并加 ``-am`` 带上反应堆内的上游
+    （阶段一安装 api 层用）。
+    ``exclude_modules``：整包构建时排除这些子模块（阶段二用，此时不能
+    同时给 ``-am``——它会把被排除的模块又拉回来）。
+    """
     log(f"=== [构建] {svc.name} ===")
 
     env = os.environ.copy()
@@ -247,7 +283,35 @@ async def build_service(
     maven_cmd = os.path.normpath(maven) if sys.platform == "win32" else maven
     # shlex 级切分：引号成组且剥除；写坏引号则降级 split 并告警
     extra_args = _resolve_build_args(svc.build_args, log)
-    args = [maven_cmd] + extra_args
+
+    # 模块选择参数。用户 build_args 自带 -pl/-f 时不注入（见
+    # module_selection_conflict）：两个 -pl 会互相覆盖，语义不可控。
+    module_args: List[str] = []
+    if modules or exclude_modules:
+        conflict = module_selection_conflict(svc.build_args)
+        if conflict:
+            log(
+                f"[警告] {svc.name} 的 build_args 已含 {conflict}，"
+                f"忽略本次模块选择，按整包构建"
+            )
+        elif modules and exclude_modules:
+            log(
+                f"[警告] {svc.name} 不能同时指定 modules 与 exclude_modules，"
+                f"按整包构建"
+            )
+        elif modules:
+            module_args = ["-pl", ",".join(modules), "-am"]
+            log(f"[模块] {svc.name} 仅构建: {', '.join(modules)}（-am 带上游）")
+        else:
+            # 阶段二：排除阶段一已装好的 api 模块，消费方不必等它们的
+            # service 模块；这里绝不能加 -am，否则被排除的模块会被拉回来。
+            module_args = ["-pl", ",".join("!" + m for m in exclude_modules or [])]
+            log(
+                f"[模块] {svc.name} 排除: "
+                f"{', '.join(exclude_modules or [])}"
+            )
+
+    args = [maven_cmd] + module_args + extra_args
 
     kwargs = {}
     if sys.platform == "win32":

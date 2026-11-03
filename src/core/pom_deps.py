@@ -19,6 +19,12 @@ A 往共享本地仓库写该 jar 的同时 B 正在编译期读它，会出现 
 - 只推导**本次勾选**服务之间的边。提供方没被勾选时无边可挂——那种情况的
   竞态来自消费方并发下载同一个冷依赖，顺序救不了，只能串行或预热仓库。
 - 没有 pom / 解析失败就当普通服务，不产生任何边，绝不阻断构建。
+
+在此基础上还提供两阶段构建所需的元数据：``scan_project`` 返回子模块清单
+（相对路径 / 坐标 / packaging），``derive_cross_project_edges`` 从中挑出 api
+模块（artifactId 以 ``-api`` 结尾，或目录末段为 ``api``）。调用方可以先
+``mvn install -pl <api 模块> -am`` 只装 api 层，再整包构建时用
+``-pl !<api 模块>`` 排除它们，消费方就不再需要等提供方的 service 模块。
 """
 import os
 import re
@@ -40,6 +46,12 @@ class EdgeResult(NamedTuple):
     matched: List[Tuple[str, str, str]]
     # 合并 depends_on 后出现的循环路径（首尾相同）；非 None 时 edges 应被丢弃
     cycle: Optional[List[str]]
+    # {服务: [api 模块相对路径, ...]}，供两阶段构建先单独安装 api 层
+    api_modules: Dict[str, List[str]] = {}
+    # {服务: [全部子模块相对路径, ...]}，用来判定“只含 api 模块的工程”
+    modules: Dict[str, List[str]] = {}
+    # 这些 api 模块会 install 的构件 (groupId, artifactId)，用于阶段二过滤边
+    api_gavs: Set[Gav] = set()
 
 
 # ============================================================
@@ -86,7 +98,7 @@ def _subst(value: Optional[str], props: Dict[str, str]) -> Optional[str]:
 
 
 def _parse_pom(pom_path: str) -> Optional[dict]:
-    """解析单个 pom，返回 {g, a, v, props, modules, deps}；失败返回 None。
+    """解析单个 pom，返回 {g, a, v, packaging, props, modules, deps}；失败返回 None。
 
     g/a/v 是**未做属性解析**的原始值，且可能继承自 <parent>。
     deps 只收 <project> 直接子级的 <dependencies>。
@@ -111,6 +123,8 @@ def _parse_pom(pom_path: str) -> Optional[dict]:
     g = _text(root, "groupId") or (_text(parent, "groupId") if parent is not None else None)
     a = _text(root, "artifactId")
     v = _text(root, "version") or (_text(parent, "version") if parent is not None else None)
+    # packaging 缺省是 jar；聚合/父 pom 写 pom，不是可部署模块
+    packaging = (_text(root, "packaging") or "jar").lower()
 
     modules: List[str] = []
     mnode = _child(root, "modules")
@@ -126,7 +140,10 @@ def _parse_pom(pom_path: str) -> Optional[dict]:
             if dg and da:
                 deps.append((dg, da))
 
-    return {"g": g, "a": a, "v": v, "props": props, "modules": modules, "deps": deps}
+    return {
+        "g": g, "a": a, "v": v, "packaging": packaging,
+        "props": props, "modules": modules, "deps": deps,
+    }
 
 
 def _scan_pom(
@@ -136,8 +153,14 @@ def _scan_pom(
     inherited_v: Optional[str],
     produces: Set[Gav],
     depends: Set[Gav],
+    rel_path: str = "",
+    modules_out: Optional[List[dict]] = None,
 ) -> None:
-    """递归解析一个 pom 及其 <modules>，累计产出构件与直接依赖。"""
+    """递归解析一个 pom 及其 <modules>，累计产出构件与直接依赖。
+
+    ``modules_out`` 非空时顺带收集子模块信息（相对路径 / 坐标 / packaging），
+    供两阶段构建挑选 api 模块、拼 ``-pl``。根 pom 自己不算子模块。
+    """
     info = _parse_pom(pom_path)
     if info is None:
         return
@@ -161,6 +184,15 @@ def _scan_pom(
     if g and a:
         produces.add((g, a))
 
+    if modules_out is not None and rel_path:
+        # 只有子模块才记；-pl 用它，相对路径一律用 /（Maven 两种都认，统一好读）
+        modules_out.append({
+            "path": rel_path.replace("\\", "/"),
+            "g": g,
+            "a": a,
+            "packaging": info["packaging"],
+        })
+
     if g:
         props["project.groupId"] = g
         props["pom.groupId"] = g
@@ -180,14 +212,19 @@ def _scan_pom(
     for mod in info["modules"]:
         mod_path = os.path.join(base, *mod.replace("\\", "/").split("/"), "pom.xml")
         if os.path.isfile(mod_path):
-            _scan_pom(mod_path, props, g, v, produces, depends)
+            child_rel = f"{rel_path}/{mod}" if rel_path else mod
+            _scan_pom(
+                mod_path, props, g, v, produces, depends,
+                child_rel, modules_out,
+            )
 
 
-def scan_project(project_dir: str) -> Optional[Dict[str, Set[Gav]]]:
-    """读取一个工程，返回 {"produces": ..., "depends": ...}。
+def scan_project(project_dir: str) -> Optional[Dict[str, object]]:
+    """读取一个工程，返回 {"produces", "depends", "modules"}。
 
     ``produces`` 是该工程（含所有子模块）会 ``install`` 进本地仓库的构件；
-    ``depends`` 是它声明的直接依赖（含子模块）。
+    ``depends`` 是它声明的直接依赖（含子模块）；``modules`` 是子模块清单
+    （每项 {path, g, a, packaging}），供两阶段构建挑 api 模块。
 
     没有 pom.xml 或解析后拿不到任何构件时返回 None——对应“普通服务 /
     非 Maven 工程”，不产生任何构建顺序边。
@@ -200,10 +237,11 @@ def scan_project(project_dir: str) -> Optional[Dict[str, Set[Gav]]]:
 
     produces: Set[Gav] = set()
     depends: Set[Gav] = set()
-    _scan_pom(pom, {}, None, None, produces, depends)
+    modules: List[dict] = []
+    _scan_pom(pom, {}, None, None, produces, depends, "", modules)
     if not produces:
         return None
-    return {"produces": produces, "depends": depends}
+    return {"produces": produces, "depends": depends, "modules": modules}
 
 
 # ============================================================
@@ -239,6 +277,21 @@ def _find_cycle(nodes: List[str], prereq: Dict[str, List[str]]) -> Optional[List
     return None
 
 
+def _is_api_module(mod: dict) -> bool:
+    """判定一个子模块是不是「api 层」。
+
+    只看两个稳定特征：artifactId 以 ``-api`` 结尾，或模块目录末段就叫 ``api``
+    （真实工程两种写法都有，比如 ``foo-parent/api`` 产出 ``foo-parent-api``）。
+    packaging=pom 的聚合模块不算——它没有 jar 可装。
+    """
+    if (mod.get("packaging") or "jar") == "pom":
+        return False
+    art = (mod.get("a") or "").lower()
+    path = (mod.get("path") or "").replace("\\", "/").rstrip("/").lower()
+    last = path.rsplit("/", 1)[-1]
+    return art.endswith("-api") or last == "api"
+
+
 def derive_cross_project_edges(
     services: Dict[str, object],
     selected: List[str],
@@ -249,10 +302,14 @@ def derive_cross_project_edges(
     最后用合并了 depends_on 的整张图做一次循环检测——pom 依赖若与配置里
     手写的 depends_on 互相矛盾，分层将无法给出可行顺序，此时返回 cycle，
     由调用方告警并回退串行（自动边不可信，丢弃不参与分层）。
+
+    同时收集各工程的子模块清单与 api 模块：调用方可以先 ``-pl <api 模块>
+    -am`` 单独安装 api 层，再在整包构建时排除它们，让消费方不必等提供方的
+    service 模块。
     """
     selected_list = list(dict.fromkeys(selected))
 
-    infos: Dict[str, Dict[str, Set[Gav]]] = {}
+    infos: Dict[str, Dict[str, object]] = {}
     for name in selected_list:
         svc = services.get(name)
         project_dir = getattr(svc, "project_dir", None) if svc is not None else None
@@ -268,10 +325,29 @@ def derive_cross_project_edges(
         info = infos.get(name)
         if not info:
             continue
-        for gav in info["produces"]:
+        for gav in info["produces"]:  # type: ignore[index]
             if gav in producer and producer[gav] != name:
                 continue
             producer[gav] = name
+
+    api_modules: Dict[str, List[str]] = {}
+    all_modules: Dict[str, List[str]] = {}
+    api_gavs: Set[Gav] = set()
+    for name in selected_list:
+        info = infos.get(name)
+        if not info:
+            continue
+        mods: List[dict] = info.get("modules") or []  # type: ignore[assignment]
+        if not mods:
+            continue
+        all_modules[name] = [m["path"] for m in mods]
+        apis = [m for m in mods if _is_api_module(m)]
+        if not apis:
+            continue
+        api_modules[name] = [m["path"] for m in apis]
+        for m in apis:
+            if m.get("g") and m.get("a"):
+                api_gavs.add((m["g"], m["a"]))
 
     edges: Dict[str, List[str]] = {}
     matched: List[Tuple[str, str, str]] = []
@@ -280,7 +356,7 @@ def derive_cross_project_edges(
         if not info:
             continue
         providers: List[str] = []
-        for gav in sorted(info["depends"]):
+        for gav in sorted(info["depends"]):  # type: ignore[arg-type]
             provider = producer.get(gav)
             if not provider or provider == name:
                 continue
@@ -307,5 +383,11 @@ def derive_cross_project_edges(
 
     cycle = _find_cycle(selected_list, prereq)
     if cycle:
-        return EdgeResult(edges={}, matched=[], cycle=cycle)
-    return EdgeResult(edges=edges, matched=matched, cycle=None)
+        return EdgeResult(
+            edges={}, matched=[], cycle=cycle,
+            api_modules={}, modules={}, api_gavs=set(),
+        )
+    return EdgeResult(
+        edges=edges, matched=matched, cycle=None,
+        api_modules=api_modules, modules=all_modules, api_gavs=api_gavs,
+    )
