@@ -113,6 +113,7 @@ build.bat
 - `git.iteration_pattern`: 迭代分支匹配正则，正则表达式的最后一个捕获组用于版本比较排序。
 - `default_restart_script`: 默认远程重启脚本路径（相对于 `remote_dir`，模板默认 `bin/start.sh`）。
 - `backup_keep`: 历史备份保留份数，设为 `0` 表示不清理历史备份。
+- 服务级 `build_args`: 普通 Maven 参数即可；若自带 `-pl` / `--projects` / `-f` / `--file`，该服务会退回整包构建（不参与跨工程 api 层的两阶段构建）。
 - `environments.<env>.servers`: 命名服务器节点集合。
 - 服务节点通过 `server: <服务器名>` 引用指定服务器；若未指定则使用 `default_server`。
 - 服务器认证：`password` 与 `key`（私钥文件路径）必配其一，配置校验时强制。
