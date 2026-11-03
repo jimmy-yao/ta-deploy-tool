@@ -180,6 +180,66 @@ QPushButton#DangerButton:hover {
     background: #FEE2E2;
     color: #B91C1C;
 }
+
+/* 多服务任务状态表（TaskCard 内） */
+QFrame#ServiceRow {
+    background: transparent;
+    border: none;
+}
+QFrame#ServiceRow[running="true"] {
+    background: #EEF7EA;
+    border-radius: 4px;
+}
+QLabel#ServiceName {
+    color: #37443A;
+}
+QLabel#ServiceStatus {
+    color: #6B7A6D;
+}
+QLabel#ServiceStatus[state="done"] {
+    color: #3A7D4E;
+}
+QLabel#ServiceStatus[state="cancelled"],
+QLabel#ServiceStatus[state="cancelling"] {
+    color: #8AA18C;
+}
+QLabel#ServiceStatus[state="failed"] {
+    color: #DC2626;
+}
+QLabel#ServiceDot {
+    color: #A8B8A8;
+}
+QLabel#ServiceDot[state="building"] {
+    color: #2563EB;
+}
+QLabel#ServiceDot[state="deploying"] {
+    color: #7C3AED;
+}
+QLabel#ServiceDot[state="done"] {
+    color: #3A7D4E;
+}
+QLabel#ServiceDot[state="failed"] {
+    color: #DC2626;
+}
+QLabel#ServiceDot[state="cancelled"] {
+    color: #C7D6C4;
+}
+QPushButton#LinkButton {
+    background: transparent;
+    border: none;
+    color: #3A7D4E;
+    padding: 1px 8px;
+    font-weight: bold;
+}
+QPushButton#LinkButton:hover {
+    background: #E3EFDE;
+    border-radius: 4px;
+    color: #2E6440;
+}
+QPushButton#LinkButton:disabled {
+    color: #8AA18C;
+}
+
 QPushButton#PrimaryButton {
     background: #3A7D4E;
     color: #FFFFFF;
@@ -788,6 +848,66 @@ QPushButton#DangerButton:hover {
     background: #FEE2E2;
     color: #B91C1C;
 }
+
+/* 多服务任务状态表（TaskCard 内） */
+QFrame#ServiceRow {
+    background: transparent;
+    border: none;
+}
+QFrame#ServiceRow[running="true"] {
+    background: #F0EDE4;
+    border-radius: 4px;
+}
+QLabel#ServiceName {
+    color: #2B2621;
+}
+QLabel#ServiceStatus {
+    color: #8A7F70;
+}
+QLabel#ServiceStatus[state="done"] {
+    color: #047857;
+}
+QLabel#ServiceStatus[state="cancelled"],
+QLabel#ServiceStatus[state="cancelling"] {
+    color: #9B9385;
+}
+QLabel#ServiceStatus[state="failed"] {
+    color: #DC2626;
+}
+QLabel#ServiceDot {
+    color: #B8AE9F;
+}
+QLabel#ServiceDot[state="building"] {
+    color: #2563EB;
+}
+QLabel#ServiceDot[state="deploying"] {
+    color: #7C3AED;
+}
+QLabel#ServiceDot[state="done"] {
+    color: #047857;
+}
+QLabel#ServiceDot[state="failed"] {
+    color: #DC2626;
+}
+QLabel#ServiceDot[state="cancelled"] {
+    color: #D6CFC1;
+}
+QPushButton#LinkButton {
+    background: transparent;
+    border: none;
+    color: #047857;
+    padding: 1px 8px;
+    font-weight: bold;
+}
+QPushButton#LinkButton:hover {
+    background: #ECE7DC;
+    border-radius: 4px;
+    color: #065F46;
+}
+QPushButton#LinkButton:disabled {
+    color: #9B9385;
+}
+
 QPushButton#PrimaryButton {
     background: #2563EB;
     color: #FFFFFF;
@@ -1396,6 +1516,66 @@ QPushButton#DangerButton:hover {
     background: #881337;
     color: #FFFFFF;
 }
+
+/* 多服务任务状态表（TaskCard 内） */
+QFrame#ServiceRow {
+    background: transparent;
+    border: none;
+}
+QFrame#ServiceRow[running="true"] {
+    background: #1E2A3C;
+    border-radius: 4px;
+}
+QLabel#ServiceName {
+    color: #E2E8F0;
+}
+QLabel#ServiceStatus {
+    color: #94A3B8;
+}
+QLabel#ServiceStatus[state="done"] {
+    color: #34D399;
+}
+QLabel#ServiceStatus[state="cancelled"],
+QLabel#ServiceStatus[state="cancelling"] {
+    color: #64748B;
+}
+QLabel#ServiceStatus[state="failed"] {
+    color: #F87171;
+}
+QLabel#ServiceDot {
+    color: #64748B;
+}
+QLabel#ServiceDot[state="building"] {
+    color: #60A5FA;
+}
+QLabel#ServiceDot[state="deploying"] {
+    color: #A78BFA;
+}
+QLabel#ServiceDot[state="done"] {
+    color: #34D399;
+}
+QLabel#ServiceDot[state="failed"] {
+    color: #F87171;
+}
+QLabel#ServiceDot[state="cancelled"] {
+    color: #475569;
+}
+QPushButton#LinkButton {
+    background: transparent;
+    border: none;
+    color: #34D399;
+    padding: 1px 8px;
+    font-weight: bold;
+}
+QPushButton#LinkButton:hover {
+    background: #253349;
+    border-radius: 4px;
+    color: #6EE7B7;
+}
+QPushButton#LinkButton:disabled {
+    color: #475569;
+}
+
 QPushButton#PrimaryButton {
     background: #0284C7;
     color: #FFFFFF;
