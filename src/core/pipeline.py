@@ -48,6 +48,11 @@ class DeployPipeline:
         self._cancel_services = set()
         # run() 收尾时回填，供 GUI 在完成消息里说明「其中哪几个没做」
         self.cancelled_services: List[str] = []
+        # 部署阶段单个服务失败：不中断其余服务，收尾时汇总。失败是「这一步
+        # 没成」，不是「整批别做了」——远端权限/磁盘/重启脚本这类问题往往
+        # 只影响一个目标，停掉整批反而把其余服务留在半新半旧的状态。
+        self.failed_services: List[str] = []
+        self._failed_reasons: Dict[str, str] = {}
 
     def cancel(self):
         """整任务取消：三个阶段的循环都会停，并且外部还会 task.cancel()。"""
@@ -118,6 +123,19 @@ class DeployPipeline:
         self.log(f"[取消] {name} 已被取消，跳过后续阶段")
         step += UNITS_PER_STAGE
         self._emit(step, total_units, f"{name}: 已取消")
+        return step
+
+    def _skip_failed(self, name: str, step: int, total_units: int,
+                     reason: str) -> int:
+        """部署阶段某服务失败：记清单、推进它的进度配额并上报，返回新 step。
+
+        和 ``_skip_cancelled`` 同理——失败是「跳过这个服务」而不是「整批别做
+        了」；不推进配额，后续服务的进度基点会塌缩，收尾时还会回跳。
+        """
+        self.failed_services.append(name)
+        self._failed_reasons[name] = reason
+        step += UNITS_PER_STAGE
+        self._emit(step, total_units, f"{name}: 部署失败")
         return step
 
     def _emit(self, current: int, total: int, status: str = ""):
@@ -539,28 +557,30 @@ class DeployPipeline:
 
             # ---------- 阶段三：部署 ----------
             if has_deploy:
-                missing = []
+                # 本地 jar 缺失不提前中止整批：和运行时部署失败一样，只让
+                # 缺产物的服务记失败并跳过，其余能部署的照常部署。真正的
+                # 汇总与报错放到循环末尾统一做。
+                missing: Dict[str, str] = {}
                 for name in order:
                     if self.is_service_cancelled(name):
                         # 被取消的服务根本不会部署，不该再要求它的本地 jar
                         continue
                     svc = env.services[name]
                     if not svc.local_jar:
-                        missing.append((name, "(未识别，请先打包)"))
+                        missing[name] = "(未识别，请先打包)"
                         continue
                     local_jar = os.path.join(svc.project_dir, svc.local_jar)
                     if not os.path.isfile(local_jar):
-                        missing.append((name, local_jar))
+                        missing[name] = local_jar
                 if missing:
-                    msg = "以下服务的本地 jar 不存在，请先打包：\n" + "\n".join(
-                        f"  - {n}: {p}" for n, p in missing
+                    self.log(
+                        "以下服务的本地 jar 不存在，将跳过部署：\n"
+                        + "\n".join(f"  - {n}: {p}" for n, p in missing.items())
                     )
-                    self.log(msg)
-                    raise DeployExecuteError(msg)
 
                 self.log("--- 部署目标 ---")
                 for name in order:
-                    if self.is_service_cancelled(name):
+                    if self.is_service_cancelled(name) or name in missing:
                         continue
                     svc = env.services[name]
                     server = env.resolve_server(svc)
@@ -577,6 +597,11 @@ class DeployPipeline:
                         return
                     if self.is_service_cancelled(name):
                         step = self._skip_cancelled(name, step, total_units)
+                        continue
+                    if name in missing:
+                        reason = f"本地 jar 不存在: {missing[name]}"
+                        self.log(f"[错误] {name} 部署失败: {reason}")
+                        step = self._skip_failed(name, step, total_units, reason)
                         continue
                     svc = env.services[name]
                     server = env.resolve_server(svc)
@@ -659,9 +684,16 @@ class DeployPipeline:
                         step = self._skip_cancelled(name, step, total_units)
                         continue
                     except Exception as e:
-                        if not isinstance(e, asyncio.CancelledError):
-                            self.log(f"[错误] {name} 部署失败: {e}")
-                        raise
+                        if isinstance(e, asyncio.CancelledError):
+                            raise
+                        # 单个服务部署失败不拖累其余服务：远端权限、磁盘满、
+                        # 重启脚本退出码异常通常只影响这一个目标，停掉整批
+                        # 只会让其余服务停在半新半旧的状态。记下原因、把它的
+                        # 进度配额记上（否则后续服务的进度基点会塌缩），继续
+                        # 下一个；整批结束后统一汇总并报错。
+                        self.log(f"[错误] {name} 部署失败: {e}")
+                        step = self._skip_failed(name, step, total_units, str(e))
+                        continue
 
                     step += UNITS_PER_STAGE
                     self._emit(step, total_units, f"{name}: 部署完成")
@@ -669,6 +701,31 @@ class DeployPipeline:
             self.cancelled_services = [
                 n for n in order if self.is_service_cancelled(n)
             ]
+
+            if self.failed_services:
+                detail = "\n".join(
+                    f"  - {n}: {self._failed_reasons.get(n, '')}"
+                    for n in self.failed_services
+                )
+                msg = (
+                    f"以下 {len(self.failed_services)} 个服务部署失败，"
+                    f"其余服务已继续执行：\n{detail}"
+                )
+                self.log("[汇总] " + msg)
+                self.log(
+                    f"=== 完成，其中 {len(self.failed_services)} 个服务部署失败: "
+                    f"{', '.join(self.failed_services)} ==="
+                )
+                parts = []
+                if self.cancelled_services:
+                    parts.append(f"{len(self.cancelled_services)} 个已取消")
+                parts.append(f"{len(self.failed_services)} 个失败")
+                self._emit(
+                    total_units, total_units,
+                    "完成（" + "、".join(parts) + "）",
+                )
+                raise DeployExecuteError(msg)
+
             if self.cancelled_services:
                 n_cancel = len(self.cancelled_services)
                 self.log(

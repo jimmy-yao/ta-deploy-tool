@@ -883,13 +883,17 @@ class MainWindow(QMainWindow):
             # 置灰改文案——已打包完、正由另一个任务部署的服务，不该还在
             # 打包卡里挂着可点的取消
             if released:
-                self.action_card.mark_service_finished(
-                    task_id, released, cancelled="已取消" in status)
+                # 失败的行由卡片自己按状态文案置红并撤下按钮；这里再调
+                # mark_service_finished 会把「失败」改写回「已完成」。
+                if "失败" not in status:
+                    self.action_card.mark_service_finished(
+                        task_id, released, cancelled="已取消" in status)
             # 放最后：此刻徽章刚按打包任务收尾（Healthy + 摘除运行集），
             # 自动部署起起来后 _start_task 会把它重新写成「部署中」，
             # 不会被这里的终态判定中途抹掉。
-            # 被取消的服务不入队——用户刚说不要它
-            if released and "已取消" not in status:
+            # 被取消、部署失败的服务都不入队——前者用户刚说不要它，
+            # 后者自动再部署一次只会把同一个故障重演一遍。
+            if (released and "已取消" not in status and "失败" not in status):
                 self._maybe_auto_deploy(task_id, released)
 
     @staticmethod
@@ -1011,7 +1015,10 @@ class MainWindow(QMainWindow):
         if name not in pending:
             return None
         marker = "部署完成" if info.get("do_deploy") else "构建完成"
-        if marker in rest or "已取消" in rest:
+        # 「失败」也算本任务对该服务的终点：部署阶段单点失败已改成不中断
+        # 其余服务（见 pipeline），这里必须同时释放占用，否则失败的服务会
+        # 一直挂在 pending 里，用户连重试这一个服务都会被判「已在任务中」。
+        if marker in rest or "已取消" in rest or "失败" in rest:
             pending.discard(name)
             return name
         return None
