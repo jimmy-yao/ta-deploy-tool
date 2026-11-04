@@ -99,6 +99,13 @@ class ConfigEditorDialog(QDialog):
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
 
+    def done(self, r):
+        # exec() 弹出的配置窗是主窗口子对象，Qt 关窗只隐藏不销毁；不显式
+        # 排队销毁，每打开一次「设置」/「编辑服务配置」都会常驻一份。调用方
+        # 在 exec() 返回后还要读 saved，deleteLater 排队执行不会影响它。
+        super().done(r)
+        self.deleteLater()
+
     def _on_close(self):
         if self.saved:
             self.accept()

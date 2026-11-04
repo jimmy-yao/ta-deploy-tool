@@ -37,6 +37,13 @@ class ManualBranchDialog(QDialog):
         box.rejected.connect(self.reject)
         layout.addWidget(box)
 
+    def done(self, r):
+        # exec() 弹出的对话框是主窗口的子对象，Qt 只负责隐藏不负责销毁；
+        # 不在这里 deleteLater，右键一次「手动指定分支」就常驻一份实例。
+        # 排队销毁，exec() 返回后调用方仍可同步读 branch()。
+        super().done(r)
+        self.deleteLater()
+
     def branch(self) -> str:
         return self.edit.text().strip()
 
