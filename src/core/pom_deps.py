@@ -295,6 +295,7 @@ def _is_api_module(mod: dict) -> bool:
 def derive_cross_project_edges(
     services: Dict[str, object],
     selected: List[str],
+    project_dirs: Optional[Dict[str, str]] = None,
 ) -> EdgeResult:
     """推导选中服务之间“先构建谁”的跨工程边。
 
@@ -303,16 +304,23 @@ def derive_cross_project_edges(
     手写的 depends_on 互相矛盾，分层将无法给出可行顺序，此时返回 cycle，
     由调用方告警并回退串行（自动边不可信，丢弃不参与分层）。
 
+    ``project_dirs`` 是本次实际用于构建的目录映射（worktree 模式下是
+    worktree 内的路径）。不传则回退 ``svc.project_dir``；worktree 模式必须
+    传，否则读到的是旧分支的 pom，推导出的边与本次构建内容不一致。
+
     同时收集各工程的子模块清单与 api 模块：调用方可以先 ``-pl <api 模块>
     -am`` 单独安装 api 层，再在整包构建时排除它们，让消费方不必等提供方的
     service 模块。
     """
     selected_list = list(dict.fromkeys(selected))
+    overrides = project_dirs or {}
 
     infos: Dict[str, Dict[str, object]] = {}
     for name in selected_list:
         svc = services.get(name)
-        project_dir = getattr(svc, "project_dir", None) if svc is not None else None
+        project_dir = overrides.get(name) or (
+            getattr(svc, "project_dir", None) if svc is not None else None
+        )
         if project_dir:
             info = scan_project(project_dir)
             if info:

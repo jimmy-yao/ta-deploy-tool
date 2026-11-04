@@ -3,7 +3,10 @@ import asyncio
 import os
 from typing import Callable, List, Dict, Optional
 
-from src.core.builder import build_service, module_selection_conflict, prepare_repo
+from src.core.builder import (
+    build_service, module_selection_conflict, prepare_repo, prepare_worktree,
+)
+from src.core.git_ops import cleanup_worktrees, remove_worktree
 from src.core.pom_deps import derive_cross_project_edges
 from src.models.config import AppConfig, topo_sort, topo_sort_layers, persist_service_fields
 from src.core.deployer import deploy_service
@@ -53,6 +56,11 @@ class DeployPipeline:
         # 只影响一个目标，停掉整批反而把其余服务留在半新半旧的状态。
         self.failed_services: List[str] = []
         self._failed_reasons: Dict[str, str] = {}
+        # worktree：服务 -> 本次实际用于构建的目录 / worktree 根
+        self._build_dirs: Dict[str, str] = {}
+        self._worktrees: Dict[str, str] = {}
+        # 仓库根 -> 本次用到的 worktree 路径，收尾时按保留策略清理
+        self._worktree_repos: Dict[str, List[str]] = {}
 
     def cancel(self):
         """整任务取消：三个阶段的循环都会停，并且外部还会 task.cancel()。"""
@@ -141,6 +149,49 @@ class DeployPipeline:
     def _emit(self, current: int, total: int, status: str = ""):
         self.on_progress(current, total, status)
 
+    def _build_kwargs(self, name: str, svc) -> Dict[str, object]:
+        """worktree 服务的构建参数：cwd 指向检出目录，产物回拷 project_dir。
+
+        回拷后 ``discovered_jars`` 里拿到的是 project_dir 下的路径，后续
+        local_jar 写回、部署读取、备份/回滚全部沿用原有逻辑。
+        """
+        if name not in self._worktrees:
+            return {}
+        return {
+            "cwd": self._build_dirs.get(name),
+            "copy_to": svc.project_dir,
+        }
+
+    async def _prune_worktrees(self):
+        """按保留数清理旧 worktree；本次任务正在用的目录受保护。"""
+        keep = max(0, self.cfg.git.worktree_keep)
+        root = self.cfg.effective_worktree_root
+        for repo, paths in self._worktree_repos.items():
+            try:
+                await cleanup_worktrees(
+                    repo, root, keep, protect=paths,
+                    log=self.log, encoding=self.cfg.log_encoding,
+                )
+            except Exception as e:
+                self.log(f"[worktree] 清理旧目录失败（忽略）: {e}")
+
+    async def _finalize_worktrees(self):
+        """keep=0 表示用完即删；keep>0 留给后续复用，按 mtime 轮转。"""
+        try:
+            if self._worktrees and max(0, self.cfg.git.worktree_keep) == 0:
+                for repo, paths in self._worktree_repos.items():
+                    for path in paths:
+                        try:
+                            await remove_worktree(
+                                repo, path, self.log, self.cfg.log_encoding,
+                            )
+                        except Exception as e:
+                            self.log(f"[worktree] 删除失败（忽略）: {path}: {e}")
+        finally:
+            self._worktrees.clear()
+            self._build_dirs.clear()
+            self._worktree_repos.clear()
+
     async def _build_api_layer(
         self,
         env,
@@ -189,6 +240,7 @@ class DeployPipeline:
                             java_home=java_home,
                             modules=mods,
                             is_cancelled=lambda: self.is_service_cancelled(name),
+                            **self._build_kwargs(name, svc),
                         ),
                     )
                 except ServiceCancelled:
@@ -266,6 +318,12 @@ class DeployPipeline:
             has_build = self.do_build
             has_deploy = self.do_deploy
 
+            if has_build and not has_git and self.cfg.git.worktree_enabled:
+                self.log(
+                    "[worktree] 本次 git 阶段被跳过，将直接在 project_dir 构建"
+                    "（worktree 需要 fetch/解析 commit）"
+                )
+
             stages_per_svc = int(has_git) + int(has_build) + int(has_deploy)
             if stages_per_svc == 0:
                 self.log("没有需要执行的任务")
@@ -288,21 +346,43 @@ class DeployPipeline:
                         continue
                     svc = env.services[name]
                     override = self.branch_overrides.get(name)
+                    use_wt = svc.worktree_enabled(self.cfg.git.worktree_enabled)
 
                     self._emit(step, total_units, f"{name}: 更新分支中")
 
                     try:
-                        # 分支在此处实时解析（iteration 模式现查远程最新分支），
-                        # 不使用界面上的预解析缓存，保证拿到打包瞬间的最新分支。
-                        branch, _commit = await self._run_cancellable(
-                            name,
-                            prepare_repo(
-                                svc, self.cfg.git, self.log,
-                                self.cfg.log_encoding,
-                                enable_git=self.cfg.git.enabled,
-                                branch_override=override,
-                            ),
-                        )
+                        if use_wt:
+                            # worktree 模式：源工作区只 fetch，不 checkout/reset；
+                            # 构建在 detached 检出里做，用户当前分支不受影响。
+                            info = await self._run_cancellable(
+                                name,
+                                prepare_worktree(
+                                    svc, self.cfg.git,
+                                    self.cfg.effective_worktree_root,
+                                    self.log, self.cfg.log_encoding,
+                                    branch_override=override,
+                                ),
+                            )
+                            branch = info.branch
+                            self._build_dirs[name] = info.build_dir
+                            self._worktrees[name] = info.worktree
+                            used = self._worktree_repos.setdefault(
+                                info.repo_root, []
+                            )
+                            if info.worktree not in used:
+                                used.append(info.worktree)
+                        else:
+                            # 分支在此处实时解析（iteration 模式现查远程最新分支），
+                            # 不使用界面上的预解析缓存，保证拿到打包瞬间的最新分支。
+                            branch, _commit = await self._run_cancellable(
+                                name,
+                                prepare_repo(
+                                    svc, self.cfg.git, self.log,
+                                    self.cfg.log_encoding,
+                                    enable_git=self.cfg.git.enabled,
+                                    branch_override=override,
+                                ),
+                            )
                     except ServiceCancelled:
                         step = self._skip_cancelled(name, step, total_units)
                         continue
@@ -312,7 +392,14 @@ class DeployPipeline:
                         raise
 
                     step += UNITS_PER_STAGE
-                    self._emit(step, total_units, f"{name}: 分支 {branch} 更新完成")
+                    suffix = "（worktree）" if use_wt else ""
+                    self._emit(
+                        step, total_units,
+                        f"{name}: 分支 {branch} 更新完成{suffix}",
+                    )
+
+                if self._worktrees and self.cfg.git.worktree_keep > 0:
+                    await self._prune_worktrees()
 
             # ---------- 阶段二：构建 ----------
             discovered_jars: Dict[str, str] = {}
@@ -338,7 +425,10 @@ class DeployPipeline:
                 # 表现为 corrupted zip（多选失败、单选成功）。若推导出的边与
                 # 手写 depends_on 打架成环，分层给不出可行顺序，就丢弃这些
                 # 自动边并整轮串行——顺序可以不最优，但绝不能出竞态。
-                auto = derive_cross_project_edges(env.services, self.selected)
+                auto = derive_cross_project_edges(
+                    env.services, self.selected,
+                    project_dirs=self._build_dirs,
+                )
                 if auto.cycle:
                     self.log(
                         f"[警告] pom 推导的跨工程依赖存在循环: "
@@ -492,6 +582,7 @@ class DeployPipeline:
                                         # 不能让别的服务的构建跟着一起停
                                         is_cancelled=lambda: self.is_service_cancelled(name),
                                         exclude_modules=api_exclude.get(name),
+                                        **self._build_kwargs(name, svc),
                                     ),
                                 )
                                 if jar_abs:
@@ -744,6 +835,13 @@ class DeployPipeline:
             self.log("[取消] 任务已停止并取消")
             self._emit(step, total_units, "已取消")
             raise
+        finally:
+            # 无论成功/失败/取消，都按保留策略收尾 worktree。
+            # 清理失败只记日志，绝不能盖掉原本的构建/部署异常。
+            try:
+                await self._finalize_worktrees()
+            except BaseException:
+                pass
 
     # ============================================================
     # 自动识别结果回写

@@ -2,13 +2,23 @@
 import asyncio
 import os
 import shlex
+import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
 from src.models.config import ServiceConfig, GitConfig
 from src.models.exceptions import BuildError
-from src.core.git_ops import resolve_latest_iteration_branch, update_repo
+from src.core.git_ops import (
+    ensure_worktree,
+    fetch_branch,
+    git_toplevel,
+    map_project_subdir,
+    resolve_commit,
+    resolve_latest_iteration_branch,
+    update_repo,
+)
 
 LogFn = Callable[[str], None]
 
@@ -197,6 +207,118 @@ async def prepare_repo(
     return branch, commit
 
 
+# worktree 检出是完整仓库，Windows 上路径比普通目录更深，给足超时余量
+_WORKTREE_TIMEOUT = 600
+
+
+@dataclass
+class WorktreeInfo:
+    """一次 worktree 准备的产物，供 pipeline 记录构建目录与清理清单。"""
+    branch: str
+    commit: str
+    repo_root: str
+    worktree: str
+    build_dir: str
+    created: bool
+
+
+def _is_safe_rel_path(rel: str) -> bool:
+    norm = os.path.normpath(rel)
+    return (
+        bool(rel)
+        and not os.path.isabs(rel)
+        and norm != os.pardir
+        and not norm.startswith(os.pardir + os.sep)
+    )
+
+
+def copy_worktree_files(
+    svc: ServiceConfig,
+    build_dir: str,
+    log: LogFn,
+) -> int:
+    """把 ``worktree_copy`` 白名单里的未入库文件从原工作区复制到 worktree。
+
+    worktree 是干净检出，``.env`` / 本地 ``settings.xml`` 这类没入库的文件
+    不会出现；不复制的话这类工程会在构建阶段才报“文件不存在”。只复制
+    白名单，不做整目录同步——``target/``、``.idea/`` 等生成物不该带过去。
+    返回成功复制的条目数。
+    """
+    copied = 0
+    for rel in svc.worktree_copy:
+        if not _is_safe_rel_path(rel):
+            log(f"[worktree] 跳过非法路径（必须是 project_dir 内相对路径）: {rel!r}")
+            continue
+        src = os.path.join(svc.project_dir, rel)
+        if not os.path.exists(src):
+            log(f"[worktree] 白名单文件不存在，跳过: {src}")
+            continue
+        dst = os.path.join(build_dir, rel)
+        try:
+            if os.path.isdir(src):
+                os.makedirs(dst, exist_ok=True)
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                os.makedirs(os.path.dirname(dst) or build_dir, exist_ok=True)
+                shutil.copy2(src, dst)
+            copied += 1
+            log(f"[worktree] 已复制未入库文件: {rel}")
+        except OSError as e:
+            log(f"[worktree] 复制 {rel} 失败: {e}")
+    return copied
+
+
+async def prepare_worktree(
+    svc: ServiceConfig,
+    git_cfg: GitConfig,
+    root: str,
+    log: LogFn,
+    encoding: str = "utf-8",
+    branch_override: Optional[str] = None,
+) -> WorktreeInfo:
+    """为构建准备一个 detached worktree，源工作区保持当前分支不动。
+
+    与 ``prepare_repo`` 的区别：只 fetch + 解析 commit，不 checkout/reset。
+    返回的 ``build_dir`` 已经把「project_dir 可能是仓库子目录」映射进
+    worktree，构建直接用它当 cwd。
+    """
+    if branch_override:
+        branch = branch_override
+        log(f"[git] {svc.name} 使用指定分支: {branch}")
+    else:
+        branch = await resolve_branch(svc, git_cfg, log, encoding)
+
+    log(f"=== [Git/worktree] {svc.name} -> {branch} ===")
+
+    repo_root = await git_toplevel(svc.project_dir, encoding)
+    await fetch_branch(
+        repo_root, git_cfg.remote, branch, log, encoding,
+        timeout=git_cfg.fetch_timeout,
+    )
+    commit = await resolve_commit(
+        repo_root, f"{git_cfg.remote}/{branch}", encoding,
+        timeout=git_cfg.ls_remote_timeout,
+    )
+
+    worktree, created = await ensure_worktree(
+        repo_root, commit, root, log, encoding,
+        reuse=git_cfg.worktree_reuse,
+        submodules=git_cfg.worktree_submodules,
+        timeout=_WORKTREE_TIMEOUT,
+    )
+    build_dir = map_project_subdir(worktree, repo_root, svc.project_dir)
+    copy_worktree_files(svc, build_dir, log)
+    log(f"[worktree] {svc.name} 构建目录: {build_dir}")
+    return WorktreeInfo(
+        branch=branch,
+        commit=commit,
+        repo_root=repo_root,
+        worktree=worktree,
+        build_dir=build_dir,
+        created=created,
+    )
+
+
 def _pick_deployable_jar(
     svc_name: str,
     jars: List[str],
@@ -251,6 +373,8 @@ async def build_service(
     is_cancelled: Optional[Callable[[], bool]] = None,
     modules: Optional[List[str]] = None,
     exclude_modules: Optional[List[str]] = None,
+    cwd: Optional[str] = None,
+    copy_to: Optional[str] = None,
 ) -> Optional[str]:
     """构建一个服务，返回识别到的可部署 jar（没有则 None）。
 
@@ -258,8 +382,14 @@ async def build_service(
     （阶段一安装 api 层用）。
     ``exclude_modules``：整包构建时排除这些子模块（阶段二用，此时不能
     同时给 ``-am``——它会把被排除的模块又拉回来）。
+    ``cwd``：Maven 工作目录，默认 ``svc.project_dir``；worktree 模式传
+    worktree 内的映射目录。
+    ``copy_to``：构建成功后把产物按「相对 cwd 的路径」回拷到该目录，
+    并返回回拷后的路径。部署链路只认 ``project_dir/local_jar``，回拷后
+    不必再维护「上次构建用的 worktree」这类跨任务状态。
     """
     log(f"=== [构建] {svc.name} ===")
+    work_dir = cwd or svc.project_dir
 
     env = os.environ.copy()
     if java_home:
@@ -320,7 +450,7 @@ async def build_service(
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
-            cwd=svc.project_dir,
+            cwd=work_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=env,
@@ -333,7 +463,7 @@ async def build_service(
         # list2cmdline 只按空格/引号决定加不加引号，挡不住这一层。
         proc = await asyncio.create_subprocess_shell(
             " ".join(_cmd_quote(a) for a in args),
-            cwd=svc.project_dir,
+            cwd=work_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=env,
@@ -404,4 +534,22 @@ async def build_service(
         return None
 
     log(f"[识别] {svc.name} 构建产物: {chosen}")
+
+    if copy_to:
+        src = chosen if os.path.isabs(chosen) else os.path.join(work_dir, chosen)
+        rel = os.path.relpath(src, work_dir)
+        if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+            # Maven 把产物写到 cwd 之外时无法按相对位置映射，退回文件名
+            rel = os.path.basename(src)
+        dst = os.path.join(copy_to, rel)
+        try:
+            os.makedirs(os.path.dirname(dst) or copy_to, exist_ok=True)
+            shutil.copy2(src, dst)
+        except OSError as e:
+            raise BuildError(
+                f"{svc.name} 构建产物回拷失败: {src} -> {dst}: {e}"
+            ) from e
+        log(f"[worktree] 构建产物已回拷: {dst}")
+        return dst
+
     return chosen
