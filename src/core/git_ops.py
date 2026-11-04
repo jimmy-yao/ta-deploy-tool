@@ -1,7 +1,9 @@
 # git_ops.py
 import asyncio
+import hashlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 from typing import Callable, Optional, Tuple, List
@@ -264,3 +266,269 @@ async def update_repo(
     commit_id = commit.strip()
     _l(f"[git] 当前 commit: {commit_id}")
     return commit_id
+
+
+# ============================================================
+# git worktree：构建用的临时检出
+# ============================================================
+# 目标：源仓库保持用户当前分支不动，构建在独立的 detached 检出里做。
+# 同一仓库可同时存在多个 worktree（不同 commit），互不切分支、互不 reset。
+
+def _norm_path(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _is_under(root: str, path: str) -> bool:
+    root_n, path_n = _norm_path(root), _norm_path(path)
+    try:
+        return os.path.commonpath([root_n, path_n]) == root_n
+    except ValueError:
+        # Windows 跨盘符：commonpath 抛 ValueError，视为不在其下
+        return False
+
+
+def worktree_path(root: str, repo_dir: str, commit: str) -> str:
+    """按 (仓库, commit) 生成稳定目录名。
+
+    加仓库路径哈希，避免两个同名的不同仓库（如两个 `backend`）撞目录；
+    commit 取前 12 位，既够区分又不会把 Windows 路径撑长。
+    """
+    if not commit:
+        raise ValueError("worktree 目录需要 commit")
+    name = os.path.basename(os.path.normpath(repo_dir)) or "repo"
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:24].strip("._") or "repo"
+    key = hashlib.sha1(
+        _norm_path(repo_dir).encode("utf-8", errors="replace")
+    ).hexdigest()[:8]
+    return os.path.join(root, f"{safe}-{key}-{commit[:12].lower()}")
+
+
+def map_project_subdir(worktree_root: str, repo_root: str,
+                       project_dir: str) -> str:
+    """把原 project_dir 映射到 worktree 内的同位置。
+
+    project_dir 可能就是仓库根（最常见），也可能是仓库下的子目录；构建
+    必须落在 worktree 里的对应子目录，否则 pom 相对路径会指错地方。
+    """
+    rel = os.path.relpath(project_dir, repo_root)
+    if rel == os.curdir:
+        return worktree_root
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        raise ValueError(
+            f"project_dir 不在仓库根 {repo_root} 之内: {project_dir}"
+        )
+    return os.path.join(worktree_root, rel)
+
+
+async def git_toplevel(project_dir: str, encoding: str = "utf-8") -> str:
+    """返回 project_dir 所属仓库的根目录（非 git 仓库抛 GitError）。"""
+    if not os.path.isdir(project_dir):
+        raise GitError(f"项目目录不存在: {project_dir}")
+    code, out = await _run_git(
+        ["rev-parse", "--show-toplevel"],
+        project_dir, log=None, encoding=encoding, silent=True,
+    )
+    top = out.strip().splitlines()[-1].strip() if out.strip() else ""
+    if code != 0 or not top:
+        raise GitError(f"非 git 仓库: {project_dir}")
+    return os.path.normpath(top)
+
+
+async def fetch_branch(repo_dir: str, remote: str, branch: str,
+                       log: Optional[LogFn] = None,
+                       encoding: str = "utf-8",
+                       timeout: int = 180) -> None:
+    """只 fetch，不 checkout——worktree 模式下源工作区必须保持原样。"""
+    _l = log or (lambda s: None)
+    _l(f"[git] fetch {remote} {branch}...")
+    code, _ = await _run_git(
+        ["fetch", remote, branch], repo_dir, _l, encoding, timeout=timeout,
+    )
+    if code != 0:
+        raise GitError(f"git fetch {remote} {branch} 失败")
+
+
+async def resolve_commit(repo_dir: str, rev: str,
+                         encoding: str = "utf-8",
+                         timeout: int = 60) -> str:
+    """把分支/ref 解析成完整 commit SHA；解析失败不返回错误文本。"""
+    code, out = await _run_git(
+        ["rev-parse", rev], repo_dir, log=None, encoding=encoding,
+        silent=True, timeout=timeout,
+    )
+    sha = out.strip().splitlines()[-1].strip() if out.strip() else ""
+    if code != 0 or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", sha):
+        raise GitError(
+            f"git rev-parse {rev} 失败 (exit={code}): {sha or '无输出'}"
+        )
+    return sha.lower()
+
+
+async def list_worktrees(repo_dir: str,
+                         encoding: str = "utf-8") -> List[dict]:
+    """解析 `git worktree list --porcelain`，返回 [{path, head, detached}]。"""
+    code, out = await _run_git(
+        ["worktree", "list", "--porcelain"], repo_dir, log=None,
+        encoding=encoding, silent=True,
+    )
+    if code != 0:
+        raise GitError("git worktree list 失败")
+
+    entries: List[dict] = []
+    cur: dict = {}
+    for line in out.splitlines():
+        line = line.rstrip()
+        if not line:
+            if cur:
+                entries.append(cur)
+                cur = {}
+            continue
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            # _run_git 会丢掉空行，porcelain 的条目分隔不可依赖；
+            # 每个 "worktree <path>" 行本身就是新条目的起点。
+            if cur:
+                entries.append(cur)
+            cur = {"path": os.path.normpath(value)}
+        elif key == "HEAD":
+            cur["head"] = value.strip().lower()
+        elif key == "detached":
+            cur["detached"] = True
+    if cur:
+        entries.append(cur)
+    return entries
+
+
+async def prune_worktrees(repo_dir: str,
+                          log: Optional[LogFn] = None,
+                          encoding: str = "utf-8") -> None:
+    """清理目录已不存在的 worktree 元数据（被杀毒/手动删目录后常见）。"""
+    _l = log or (lambda s: None)
+    code, _ = await _run_git(
+        ["worktree", "prune"], repo_dir, _l, encoding, silent=True,
+    )
+    if code != 0:
+        _l("[worktree] prune 失败（忽略，继续）")
+
+
+async def remove_worktree(repo_dir: str, path: str,
+                          log: Optional[LogFn] = None,
+                          encoding: str = "utf-8") -> bool:
+    """删除一个 worktree；`git worktree remove` 失败时退化为强删目录 + prune。
+
+    Windows 上 Maven 未退干净、杀毒扫描文件时 remove 会失败；此时目录留着
+    只会越积越多，强删 + prune 至少保证下次能重建。
+    """
+    _l = log or (lambda s: None)
+    if not os.path.exists(path):
+        await prune_worktrees(repo_dir, log, encoding)
+        return True
+
+    _l(f"[worktree] 删除 {path}")
+    code, out = await _run_git(
+        ["worktree", "remove", "--force", path], repo_dir, _l, encoding,
+    )
+    if code != 0:
+        _l(f"[worktree] remove 失败，改为强删目录: {out.strip() or code}")
+        shutil.rmtree(path, ignore_errors=True)
+        await prune_worktrees(repo_dir, log, encoding)
+    return not os.path.exists(path)
+
+
+async def ensure_worktree(repo_dir: str, commit: str, root: str,
+                          log: Optional[LogFn] = None,
+                          encoding: str = "utf-8",
+                          reuse: bool = True,
+                          submodules: bool = True,
+                          timeout: int = 600) -> Tuple[str, bool]:
+    """确保 (repo, commit) 有一个可用 worktree，返回 (路径, 是否新建)。
+
+    用 `--detach` 而不是 `checkout <branch>`：同一个分支在 Git 里只能被一个
+    worktree 检出，而两个服务可能要在同分支的不同 commit 上同时构建。
+    """
+    _l = log or (lambda s: None)
+    if not commit:
+        raise ValueError("ensure_worktree 需要 commit")
+    if not os.path.isdir(repo_dir):
+        raise GitError(f"仓库目录不存在: {repo_dir}")
+
+    os.makedirs(root, exist_ok=True)
+    path = worktree_path(root, repo_dir, commit)
+
+    if os.path.isdir(path):
+        code, head = await _run_git(
+            ["rev-parse", "HEAD"], path, log=None, encoding=encoding,
+            silent=True, timeout=timeout,
+        )
+        same = code == 0 and head.strip().lower() == commit.lower()
+        if same and reuse:
+            _l(f"[worktree] 复用 {path}（{commit[:12]}）")
+            return path, False
+        _l(f"[worktree] 已存在的目录不可用，重建 {path}")
+        await remove_worktree(repo_dir, path, log, encoding)
+
+    # 目录被外部删掉时元数据还挂在 .git/worktrees 下，先 prune 再 add
+    await prune_worktrees(repo_dir, log, encoding)
+
+    _l(f"[worktree] 创建 {path} @ {commit[:12]}")
+    code, out = await _run_git(
+        ["worktree", "add", "--detach", path, commit],
+        repo_dir, _l, encoding, timeout=timeout,
+    )
+    if code != 0:
+        raise GitError(
+            f"git worktree add 失败 (exit={code}): {out.strip() or '无输出'}"
+        )
+
+    if submodules and os.path.isfile(os.path.join(path, ".gitmodules")):
+        _l(f"[worktree] 初始化子模块 {path}")
+        code, out = await _run_git(
+            ["submodule", "update", "--init", "--recursive"],
+            path, _l, encoding, timeout=timeout,
+        )
+        if code != 0:
+            raise GitError(
+                f"子模块初始化失败 (exit={code}): {out.strip() or '无输出'}"
+            )
+
+    return path, True
+
+
+async def cleanup_worktrees(repo_dir: str, root: str, keep: int,
+                            protect: Optional[List[str]] = None,
+                            log: Optional[LogFn] = None,
+                            encoding: str = "utf-8") -> List[str]:
+    """按保留数清理 root 下的 worktree，返回被删除的路径列表。
+
+    keep=0 表示“只保留 protect 里的” —— 构建完即删；protect 用来避免把
+    当前任务正在使用的目录删掉。按目录 mtime 保留最新的 N 个。
+    """
+    _l = log or (lambda s: None)
+    protected = {_norm_path(p) for p in (protect or []) if p}
+    try:
+        entries = await list_worktrees(repo_dir, encoding)
+    except GitError:
+        return []
+
+    candidates = []
+    for entry in entries:
+        path = entry.get("path")
+        if not path or not _is_under(root, path):
+            continue
+        if _norm_path(path) in protected:
+            continue
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0
+        candidates.append((mtime, path))
+
+    candidates.sort(reverse=True)
+    stale = [path for _, path in candidates[max(0, keep):]]
+    removed = []
+    for path in stale:
+        if await remove_worktree(repo_dir, path, log, encoding):
+            removed.append(path)
+    if removed:
+        _l(f"[worktree] 已清理 {len(removed)} 个旧目录（保留 {keep} 个）")
+    return removed

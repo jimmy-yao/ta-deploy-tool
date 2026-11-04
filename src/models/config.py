@@ -36,6 +36,12 @@ class GitConfig:
     strategy: str = "reset"
     fetch_timeout: int = 180
     ls_remote_timeout: int = 60
+    # 构建用 git worktree：默认关闭，保持“直接在 project_dir 构建”的旧行为。
+    worktree_enabled: bool = False
+    worktree_root: str = ""       # 空 = <workspace>/worktrees，再空 = 系统临时目录
+    worktree_keep: int = 3        # 每个仓库保留最近 N 个 commit 的 worktree；0 = 用完即删
+    worktree_reuse: bool = True   # 同 commit 复用，避免重复检出
+    worktree_submodules: bool = True  # 有 .gitmodules 时自动 init 子模块
 
 
 @dataclass
@@ -61,6 +67,14 @@ class ServiceConfig:
     git_branch: Optional[str] = None
     server: Optional[str] = None
     log_path: Optional[str] = None
+    # None = 继承 git.worktree.enabled；服务级可强制 on/off
+    use_worktree: Optional[bool] = None
+    # worktree 是干净检出，未入库的本地文件需按白名单从原 project_dir 复制
+    worktree_copy: List[str] = field(default_factory=list)
+
+    def worktree_enabled(self, default: bool = False) -> bool:
+        """服务级开关未设置时继承全局配置。"""
+        return default if self.use_worktree is None else bool(self.use_worktree)
 
 
 @dataclass
@@ -117,6 +131,20 @@ class AppConfig:
     detected_java_home: str = ""
 
     @property
+    def effective_worktree_root(self) -> str:
+        """worktree 根目录：显式配置 > workspace/worktrees > 系统临时目录。
+
+        放在 workspace 下便于统一清理；不落在仓库内部，避免被 git status
+        当成未跟踪目录、也避免 Windows 深层路径叠加。
+        """
+        if self.git.worktree_root:
+            return _expand(self.git.worktree_root)
+        if self.workspace:
+            return os.path.join(_expand(self.workspace), "worktrees")
+        import tempfile
+        return os.path.join(tempfile.gettempdir(), "ta-deploy-worktrees")
+
+    @property
     def effective_maven(self) -> str:
         """构建时实际使用的 Maven：配置值有效则用配置值，否则回退到检测值。"""
         if self.maven and os.path.exists(self.maven):
@@ -158,6 +186,26 @@ def _parse_restart_cmd(raw_value):
     if isinstance(raw_value, str) and raw_value.strip() == "":
         return ""
     return str(raw_value)
+
+
+def _parse_optional_bool(raw_value) -> Optional[bool]:
+    """三态布尔：None/''/inherit → None；true/false 及其常见写法 → bool。
+
+    服务级 worktree 开关要能表达「继承全局」，所以不能用 bool()——
+    bool("false") 是 True，配置写成字符串时会静默反向。
+    """
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, bool):
+        return raw_value
+    text = str(raw_value).strip().lower()
+    if text in ("", "inherit", "auto", "default"):
+        return None
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return None
 
 
 def detect_java_home() -> str:
@@ -310,6 +358,7 @@ def load_config(path: str) -> AppConfig:
         raw = yaml.safe_load(f) or {}
 
     git_raw = raw.get("git", {}) or {}
+    wt_raw = git_raw.get("worktree") or {}
     git_cfg = GitConfig(
         enabled=bool(git_raw.get("enabled", True)),
         branch_mode=git_raw.get("branch_mode", "fixed"),
@@ -321,6 +370,11 @@ def load_config(path: str) -> AppConfig:
         strategy=git_raw.get("strategy", "reset"),
         fetch_timeout=int(git_raw.get("fetch_timeout", 180)),
         ls_remote_timeout=int(git_raw.get("ls_remote_timeout", 60)),
+        worktree_enabled=bool(wt_raw.get("enabled", False)),
+        worktree_root=_expand(wt_raw.get("root", "") or ""),
+        worktree_keep=int(wt_raw.get("keep", 3)),
+        worktree_reuse=bool(wt_raw.get("reuse", True)),
+        worktree_submodules=bool(wt_raw.get("submodules", True)),
     )
 
     # 保留用户在配置文件里写的真实值；检测值单独存放，仅作运行时兜底。
@@ -379,6 +433,10 @@ def load_config(path: str) -> AppConfig:
                 git_branch=svc_raw.get("git_branch") or None,
                 server=svc_raw.get("server") or None,
                 log_path=svc_raw.get("log_path") or None,
+                use_worktree=_parse_optional_bool(svc_raw.get("worktree")),
+                worktree_copy=[
+                    str(p) for p in (svc_raw.get("worktree_copy") or [])
+                ],
             )
 
         cfg.environments[env_name] = EnvironmentConfig(
@@ -869,6 +927,13 @@ def save_config(cfg: AppConfig, path: str):
             "strategy": cfg.git.strategy,
             "fetch_timeout": cfg.git.fetch_timeout,
             "ls_remote_timeout": cfg.git.ls_remote_timeout,
+            "worktree": {
+                "enabled": cfg.git.worktree_enabled,
+                "root": cfg.git.worktree_root,
+                "keep": cfg.git.worktree_keep,
+                "reuse": cfg.git.worktree_reuse,
+                "submodules": cfg.git.worktree_submodules,
+            },
         },
         "environments": {},
     }
@@ -892,6 +957,10 @@ def save_config(cfg: AppConfig, path: str):
                 svc_data["git_branch"] = svc.git_branch
             if svc.log_path:
                 svc_data["log_path"] = svc.log_path
+            if svc.use_worktree is not None:
+                svc_data["worktree"] = svc.use_worktree
+            if svc.worktree_copy:
+                svc_data["worktree_copy"] = list(svc.worktree_copy)
             services[svc_name] = svc_data
 
         env_data = {
@@ -948,6 +1017,11 @@ def validate_config(cfg: AppConfig) -> list:
 
     if not cfg.environments:
         errors.append("至少需要配置一个环境")
+
+    if cfg.git.worktree_keep < 0:
+        errors.append(
+            f"git.worktree.keep 不能为负数（{cfg.git.worktree_keep}）"
+        )
 
     for env_name, env in cfg.environments.items():
         if not env_name:
@@ -1010,6 +1084,15 @@ def validate_config(cfg: AppConfig) -> list:
                     errors.append(
                         f"环境 {env_name} / 服务 {svc_name}: "
                         f"depends_on 引用了不存在的服务 '{dep}'"
+                    )
+            for rel in svc.worktree_copy:
+                norm = os.path.normpath(rel)
+                if os.path.isabs(rel) or norm == ".." or norm.startswith(
+                    ".." + os.sep
+                ):
+                    errors.append(
+                        f"环境 {env_name} / 服务 {svc_name}: "
+                        f"worktree_copy 必须是 project_dir 内的相对路径: '{rel}'"
                     )
 
         # 循环依赖：环上的服务无法确定先后顺序，必须在保存配置时就拦住，
