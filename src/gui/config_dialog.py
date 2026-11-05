@@ -7,7 +7,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QTabWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QSpinBox, QComboBox, QCheckBox, QPushButton,
-    QListWidget, QTableWidget, QTableWidgetItem,
+    QListWidget, QTableWidget, QTableWidgetItem, QPlainTextEdit,
     QHeaderView, QMessageBox, QLabel, QWidget, QGroupBox,
     QFileDialog, QSplitter, QInputDialog, QScrollArea,
     QSizePolicy, QApplication,
@@ -36,7 +36,7 @@ class ConfigEditorDialog(QDialog):
         "svc_server_combo", "svc_project_dir", "svc_local_jar",
         "svc_remote_dir", "svc_remote_name", "svc_build_args",
         "svc_restart_cmd", "svc_depends_on", "svc_git_branch",
-        "svc_log_path",
+        "svc_log_path", "svc_worktree_combo", "svc_worktree_copy",
     )
 
     def _drop_attrs(self, names):
@@ -236,6 +236,43 @@ class ConfigEditorDialog(QDialog):
         self.ls_remote_timeout_spin.setRange(10, 3600)
         form.addRow("ls-remote 超时(秒):", self.ls_remote_timeout_spin)
 
+        form.addRow(QLabel("—— 构建用 worktree（默认关闭，关闭时行为不变）——"))
+
+        self.worktree_enabled_check = QCheckBox(
+            "构建使用临时 git worktree（源工作区不再 checkout/reset）"
+        )
+        form.addRow("启用:", self.worktree_enabled_check)
+
+        wt_root_row = QHBoxLayout()
+        wt_root_row.setSpacing(6)
+        self.worktree_root_edit = QLineEdit()
+        self.worktree_root_edit.setPlaceholderText(
+            "留空 = <workspace>/worktrees；workspace 也为空则用系统临时目录"
+        )
+        wt_root_row.addWidget(self.worktree_root_edit, 1)
+        wt_browse_btn = QPushButton("浏览...")
+        wt_browse_btn.setMinimumWidth(80)
+        wt_browse_btn.clicked.connect(self._on_browse_worktree_root)
+        wt_root_row.addWidget(wt_browse_btn)
+        wt_root_wrap = QWidget()
+        wt_root_wrap.setLayout(wt_root_row)
+        form.addRow("根目录:", wt_root_wrap)
+
+        self.worktree_keep_spin = QSpinBox()
+        self.worktree_keep_spin.setRange(0, 100)
+        self.worktree_keep_spin.setToolTip(
+            "每个仓库保留最近 N 个 commit 的 worktree；0 = 构建完立即删除"
+        )
+        form.addRow("保留数:", self.worktree_keep_spin)
+
+        self.worktree_reuse_check = QCheckBox("同 commit 复用已有 worktree")
+        form.addRow("复用:", self.worktree_reuse_check)
+
+        self.worktree_submodules_check = QCheckBox(
+            "有 .gitmodules 时自动初始化子模块"
+        )
+        form.addRow("子模块:", self.worktree_submodules_check)
+
         return w
 
     def _build_env_tab(self):
@@ -307,6 +344,13 @@ class ConfigEditorDialog(QDialog):
         self.strategy_combo.setCurrentText(self.cfg.git.strategy)
         self.fetch_timeout_spin.setValue(self.cfg.git.fetch_timeout)
         self.ls_remote_timeout_spin.setValue(self.cfg.git.ls_remote_timeout)
+        self.worktree_enabled_check.setChecked(self.cfg.git.worktree_enabled)
+        self.worktree_root_edit.setText(self.cfg.git.worktree_root)
+        self.worktree_keep_spin.setValue(self.cfg.git.worktree_keep)
+        self.worktree_reuse_check.setChecked(self.cfg.git.worktree_reuse)
+        self.worktree_submodules_check.setChecked(
+            self.cfg.git.worktree_submodules
+        )
 
         self.env_list.clear()
         for name in self.cfg.environments.keys():
@@ -625,6 +669,30 @@ class ConfigEditorDialog(QDialog):
         self.svc_git_branch.setPlaceholderText("留空 = 自动解析或默认分支")
         form.addRow("git_branch:", self.svc_git_branch)
 
+        self.svc_worktree_combo = QComboBox()
+        self.svc_worktree_combo.addItem("继承全局", "inherit")
+        self.svc_worktree_combo.addItem("启用", "on")
+        self.svc_worktree_combo.addItem("禁用", "off")
+        wt_state = (
+            "inherit" if svc.use_worktree is None
+            else ("on" if svc.use_worktree else "off")
+        )
+        wt_idx = self.svc_worktree_combo.findData(wt_state)
+        if wt_idx >= 0:
+            self.svc_worktree_combo.setCurrentIndex(wt_idx)
+        self.svc_worktree_combo.setToolTip(
+            "inherit 跟随全局开关；on 强制启用；off 直接在 project_dir 构建"
+        )
+        form.addRow("worktree:", self.svc_worktree_combo)
+
+        self.svc_worktree_copy = QPlainTextEdit("\n".join(svc.worktree_copy))
+        self.svc_worktree_copy.setPlaceholderText(
+            "每行一个相对 project_dir 的未入库文件/目录，如:\n"
+            ".env\nconfig/local.yml"
+        )
+        self.svc_worktree_copy.setFixedHeight(72)
+        form.addRow("worktree_copy:", self.svc_worktree_copy)
+
         self.svc_log_path = QLineEdit(svc.log_path or "")
         self.svc_log_path.setPlaceholderText("远程日志路径，如: /data/deploy/envs/tgfw-xc/logs/sys.log；留空自动推导")
         form.addRow("log_path:", self.svc_log_path)
@@ -685,6 +753,17 @@ class ConfigEditorDialog(QDialog):
             svc.depends_on = [s.strip() for s in raw.split(",") if s.strip()]
         if hasattr(self, "svc_git_branch"):
             svc.git_branch = self.svc_git_branch.text().strip() or None
+        if hasattr(self, "svc_worktree_combo"):
+            state = self.svc_worktree_combo.currentData()
+            if state == "inherit":
+                svc.use_worktree = None
+            else:
+                svc.use_worktree = state == "on"
+        if hasattr(self, "svc_worktree_copy"):
+            raw = self.svc_worktree_copy.toPlainText()
+            svc.worktree_copy = [
+                line.strip() for line in raw.splitlines() if line.strip()
+            ]
         if hasattr(self, "svc_log_path"):
             svc.log_path = self.svc_log_path.text().strip() or None
 
@@ -984,6 +1063,13 @@ class ConfigEditorDialog(QDialog):
         self.cfg.git.strategy = self.strategy_combo.currentText()
         self.cfg.git.fetch_timeout = self.fetch_timeout_spin.value()
         self.cfg.git.ls_remote_timeout = self.ls_remote_timeout_spin.value()
+        self.cfg.git.worktree_enabled = self.worktree_enabled_check.isChecked()
+        self.cfg.git.worktree_root = self.worktree_root_edit.text().strip()
+        self.cfg.git.worktree_keep = self.worktree_keep_spin.value()
+        self.cfg.git.worktree_reuse = self.worktree_reuse_check.isChecked()
+        self.cfg.git.worktree_submodules = (
+            self.worktree_submodules_check.isChecked()
+        )
 
     def _sync_current_env(self):
         if self._current_env_name is None:
@@ -1132,3 +1218,17 @@ class ConfigEditorDialog(QDialog):
         )
         if path:
             self.workspace_edit.setText(path.replace("\\", "/"))
+
+    def _on_browse_worktree_root(self):
+        current = self.worktree_root_edit.text().strip()
+        if not current:
+            ws = self.workspace_edit.text().strip()
+            current = os.path.join(ws, "worktrees") if ws else str(os.path.expanduser("~"))
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "选择 worktree 根目录",
+            current,
+            QFileDialog.ShowDirsOnly,
+        )
+        if path:
+            self.worktree_root_edit.setText(path.replace("\\", "/"))

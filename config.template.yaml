@@ -25,6 +25,18 @@ git:
   strategy: reset
   fetch_timeout: 180
   ls_remote_timeout: 60
+  # 构建用临时 git worktree：默认关闭，关闭时完全沿用原来的
+  # 「在 project_dir 里 checkout/reset 后构建」行为。
+  worktree:
+    enabled: false
+    # 留空 = <workspace>/worktrees；workspace 也为空则用系统临时目录
+    root: ""
+    # 每个仓库保留最近 N 个 commit 的 worktree；0 = 构建完立即删除
+    keep: 3
+    # 同 commit 复用已有目录，避免重复检出
+    reuse: true
+    # 有 .gitmodules 时自动初始化子模块
+    submodules: true
 
 environments:
   dev:
@@ -42,3 +54,8 @@ environments:
         remote_dir: /data/deploy/envs/tgfw-xc/example-service
         remote_name: ""
         depends_on: []
+        # worktree 是干净检出，未入库的本地文件不会自动出现。
+        # worktree: inherit       # inherit(默认) / on / off
+        # worktree_copy:          # 按白名单从 project_dir 复制（相对路径）
+        #   - .env
+        #   - config/local.yml
