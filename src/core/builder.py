@@ -10,6 +10,7 @@ from typing import Callable, List, Optional, Tuple
 
 from src.models.config import ServiceConfig, GitConfig
 from src.models.exceptions import BuildError
+from src.core import proc_guard
 from src.core.git_ops import (
     ensure_worktree,
     fetch_branch,
@@ -126,21 +127,30 @@ async def _await_with_cancel_poll(fut: "asyncio.Future", is_cancelled: Optional[
 
 
 async def _kill_process_tree(proc: asyncio.subprocess.Process):
+    """杀掉外部命令的整棵进程树。
+
+    Windows 上 mvn.cmd 会再拉起 cmd.exe/java，只 ``proc.kill()`` 会留下
+    子进程；优先 taskkill /T。万一 taskkill 失败，再退回 kill 根进程，
+    并保持登记在 proc_guard 里，交给关窗/atexit 兜底。
+    """
     if proc.returncode is not None:
+        proc_guard.untrack(proc)
         return
     try:
-        if sys.platform == "win32":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
-            )
-        else:
-            proc.kill()
-        await proc.wait()
-    except Exception:
-        pass
+        proc_guard.kill_tree(proc.pid)
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except Exception:
+            pass
+    finally:
+        # 只有确认进程真的退出才注销；否则留给 atexit / 关窗兜底
+        if proc.returncode is not None:
+            proc_guard.untrack(proc)
 
 
 async def resolve_branch(
@@ -471,6 +481,7 @@ async def build_service(
         )
 
     assert proc.stdout is not None
+    proc_guard.track(proc)
     building_jars: List[str] = []
 
     async def _drain_stdout():
@@ -506,6 +517,7 @@ async def build_service(
         await _await_with_cancel_poll(reader, is_cancelled)
         waiter = asyncio.ensure_future(proc.wait())
         code = await _await_with_cancel_poll(waiter, is_cancelled)
+        proc_guard.untrack(proc)
     except asyncio.CancelledError:
         log(f"[取消] 终止服务 {svc.name} 的构建进程...")
         _discard(reader)

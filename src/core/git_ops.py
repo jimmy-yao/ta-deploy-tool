@@ -9,6 +9,7 @@ import sys
 from typing import Callable, Optional, Tuple, List
 
 from src.models.exceptions import GitError
+from src.core import proc_guard
 
 
 LogFn = Callable[[str], None]
@@ -16,20 +17,22 @@ LogFn = Callable[[str], None]
 
 async def _kill_process_tree(proc: asyncio.subprocess.Process):
     if proc.returncode is not None:
+        proc_guard.untrack(proc)
         return
     try:
-        if sys.platform == "win32":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
-            )
-        else:
-            proc.kill()
-        await proc.wait()
-    except Exception:
-        pass
+        proc_guard.kill_tree(proc.pid)
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except Exception:
+            pass
+    finally:
+        if proc.returncode is not None:
+            proc_guard.untrack(proc)
 
 
 async def _run_git(
@@ -70,6 +73,7 @@ async def _run_git(
         )
 
     assert proc.stdout is not None
+    proc_guard.track(proc)
     lines: List[str] = []
 
     async def _consume():
@@ -96,6 +100,7 @@ async def _run_git(
         await _kill_process_tree(proc)
         raise
 
+    proc_guard.untrack(proc)
     return code, "\n".join(lines)
 
 

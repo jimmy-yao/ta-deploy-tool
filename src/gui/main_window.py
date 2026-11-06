@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.builder import resolve_branch
+from src.core import proc_guard
 from src.models.config import load_config, group_services_by_server
 from src.gui.config_dialog import ConfigEditorDialog
 from src.core.deployer import rollback_service
@@ -1681,6 +1682,13 @@ class MainWindow(QMainWindow):
                 task.cancel()
         if self._branch_task and not self._branch_task.done():
             self._branch_task.cancel()
+        # 关窗后 qasync 会立刻关闭事件循环，task.cancel() 的异步清理
+        # （等待进程退出）来不及执行。这里同步杀掉仍在跟踪的外部命令
+        # 进程树，避免关闭程序后 Maven / java 残留。
+        try:
+            proc_guard.kill_all()
+        except Exception:
+            pass
         # 还开着的远程日志窗逐个 close：走它们自己的 closeEvent 取消 tail
         # 任务（子窗随主窗销毁不会触发 closeEvent，tail 会变成孤儿任务）
         for dlg in list(self._log_dialogs):
