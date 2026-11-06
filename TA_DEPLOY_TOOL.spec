@@ -40,9 +40,28 @@ unwanted_keywords = [
     'qpdf', 'qtvirtualkeyboard', 'qicns', 'qtiff', 'qwebp', 'qtga'
 ]
 
+
+def _dest(item):
+    return item[0].replace('\\', '/').lower()
+
+
 a.binaries = [
     item for item in a.binaries
     if not any(kw.lower() in item[0].lower() or kw.lower() in item[1].lower() for kw in unwanted_keywords)
+    # 纯 Widgets 应用用不到「软件 OpenGL 兜底」和 Direct2D 平台插件
+    and 'opengl32sw.dll' not in _dest(item)
+    and 'plugins/platforms/qdirect2d.dll' not in _dest(item)
+    # 只保留 .ico 解码器，去掉未使用的图片格式插件
+    and not (
+        _dest(item).startswith('pyside6/plugins/imageformats/')
+        and not _dest(item).endswith('/qico.dll')
+    )
+]
+
+# Qt 自带的 .qm 界面翻译不会被加载（项目中没有 QTranslator），全部剔除
+a.datas = [
+    item for item in a.datas
+    if not _dest(item).startswith('pyside6/translations/')
 ]
 
 pyz = PYZ(a.pure)
