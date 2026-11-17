@@ -1258,6 +1258,12 @@ class MainWindow(QMainWindow):
         支持并行：服务与运行中任务不重叠即可同时开跑（打包按钮不再因为
         有任务在跑而拒绝/禁用），真正冲突时明确列出冲突项并拒绝。
 
+        侧边栏勾选入口会自动跳过「已被运行中任务占用」的勾选项：勾选状态
+        是常驻的，服务启动打包/部署后不会自己取消勾选。「先勾 A 打包，再勾
+        B 打包」会把还在跑的 A 一起带上，若按整批判冲突就会把 B 也一起拒掉
+        （右键单服务因为显式传 [B] 不受影响，表现成两套行为）。这里只跑
+        真正空闲的勾选项，冲突项记日志说明。
+
         auto=True 表示这是「打包完自动部署」队列派生的任务：冲突不再弹框
         （调用方已做过静默预检）。返回是否真正启动。
         """
@@ -1270,6 +1276,30 @@ class MainWindow(QMainWindow):
         if not selected:
             QMessageBox.warning(self, "提示", "请至少选择一个服务")
             return False
+
+        if services is None:
+            # 逐个判冲突：能跑的继续，跑不了的（占用中 / 同 project_dir 有
+            # 构建在跑）让出。全被占用时 selected 保持原样，交给下面的冲突
+            # 分支弹窗——那种情况用户确实需要知道为什么一个都起不来。
+            runnable = []
+            blocked = []
+            for n in selected:
+                reasons = self._task_conflicts([n], do_build, env_name)
+                if reasons:
+                    blocked.append((n, reasons))
+                else:
+                    runnable.append(n)
+            if runnable:
+                if blocked:
+                    names = ", ".join(n for n, _ in blocked)
+                    # 每条只取首个原因：服务本身在跑时，同一服务还会重复命中
+                    # 「project_dir 与运行中构建相同」，两条并排只会看晕
+                    detail = "；".join(reasons[0] for _, reasons in blocked)
+                    self._append_log(
+                        f"[任务] 已跳过与运行中任务冲突的勾选服务: {names}"
+                        f"（{detail}）"
+                    )
+                selected = runnable
 
         conflicts = self._task_conflicts(selected, do_build, env_name)
         if conflicts:
