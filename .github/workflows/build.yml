@@ -1,6 +1,18 @@
 name: Build EXE (win / mac / linux)
 
 # ───────────────────────────────────────────────────────────────
+# artifact 配额（失败信息见下）：
+#   Failed to CreateArtifact: Artifact storage quota has been hit.
+# 私有仓库的 Actions 存储配额很小，三平台 PyInstaller + Nuitka 一轮
+# 就约 180MB；历史运行攒下来的 artifact 很快把配额顶满，构建本身没
+# 问题，却卡在最后一步 Upload artifact。
+#
+# 因此每次运行先跑 prune-artifacts，把**其它运行**留下的 artifact 全
+# 删掉，只保留本次运行的产物，占用稳定在单轮体积；upload 上的
+# retention-days 只是兜底（长期没有新推送时自动过期）。
+# ───────────────────────────────────────────────────────────────
+
+# ───────────────────────────────────────────────────────────────
 # 三平台产物矩阵（私有仓库计费：ubuntu 1x / windows 2x / macos 10x）
 #
 #   PyInstaller · linux    1x   dist/TA_DEPLOY_TOOL        → .tar.gz
@@ -31,8 +43,41 @@ name: Build EXE (win / mac / linux)
   workflow_dispatch:
 
 jobs:
+  # 先清历史产物再构建：配额是账户级的，删不动就等于后面所有 upload 全失败。
+  # 只保留本次运行（KEEP_RUN）的 artifact，历史运行的一律删除。
+  prune-artifacts:
+    name: Prune old artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: 删除历史产物（只保留本次运行）
+        shell: bash
+        # 清理失败不应连坐构建：配额没清掉时 upload 会自己报错，比直接
+        # 卡在 needs 上更容易看出根因
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          KEEP_RUN: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # 先收集完再删：边翻页边删会让 Link 头里的分页位置失效，漏删旧产物
+          ids=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" |
+            jq -r --argjson keep "$KEEP_RUN" \
+              '.artifacts[] | select(.workflow_run.id != $keep) | .id')
+          while read -r id; do
+            [ -n "$id" ] || continue
+            if gh api -X DELETE "repos/$REPO/actions/artifacts/$id" >/dev/null 2>&1; then
+              echo "deleted artifact $id"
+            else
+              echo "::warning::删除 artifact $id 失败（忽略，不影响构建）"
+            fi
+          done <<< "$ids"
+
   pyinstaller:
     name: PyInstaller · ${{ matrix.name }}
+    needs: prune-artifacts
     runs-on: ${{ matrix.os }}
     strategy:
       # 一台挂了不要连坐取消另外两台 —— 三个平台的失败原因通常互不相干
@@ -97,11 +142,14 @@ jobs:
           name: TA-DEPLOY-TOOL-pyinstaller-${{ matrix.name }}
           path: ${{ matrix.upload }}
           if-no-files-found: error
+          # 兜底：长期没有新推送时自动过期，避免产物一直占配额
+          retention-days: 7
 
   # ── Nuitka 只跑 Windows（Linux/macOS 上 PySide6 onefile 编译极慢，
   #    且 macOS 还要额外处理签名/工具链），按你的决定保留为 Windows 备选产物。──
   nuitka:
     name: Nuitka · windows
+    needs: prune-artifacts
     runs-on: windows-latest
     steps:
       - name: Checkout code
@@ -148,3 +196,4 @@ jobs:
           name: TA-DEPLOY-TOOL-nuitka-windows
           path: TA-DEPLOY-TOOL.exe
           if-no-files-found: error
+          retention-days: 7
