@@ -10,6 +10,10 @@ name: Build EXE (win / mac / linux)
 # 因此每次运行先跑 prune-artifacts，把**其它运行**留下的 artifact 全
 # 删掉，只保留本次运行的产物，占用稳定在单轮体积；upload 上的
 # retention-days 只是兜底（长期没有新推送时自动过期）。
+#
+# 上传失败不连坐构建：配额用量重算是 6–12 小时级别的延迟，删完也可能
+# 暂时传不上去。普通推送里 Upload artifact 失败只算告警，构建/自检
+# 通过即为绿；打 v* tag 发版时仍按失败处理，避免发布缺产物。
 # ───────────────────────────────────────────────────────────────
 
 # ───────────────────────────────────────────────────────────────
@@ -138,6 +142,10 @@ jobs:
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
+        # 配额是账户级的，用量重算有 6–12 小时延迟。普通推送里构建和自检
+        # 通过就说明代码没问题，不该因为上传配额让整轮变红；只有打 tag
+        # 发版时产物缺失才算真失败。
+        continue-on-error: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         with:
           name: TA-DEPLOY-TOOL-pyinstaller-${{ matrix.name }}
           path: ${{ matrix.upload }}
@@ -192,6 +200,8 @@ jobs:
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
+        # 同 PyInstaller：非 tag 推送时上传失败只告警，不让整轮构建变红
+        continue-on-error: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         with:
           name: TA-DEPLOY-TOOL-nuitka-windows
           path: TA-DEPLOY-TOOL.exe
