@@ -1,12 +1,13 @@
 # pipeline.py
 import asyncio
 import os
+import time
 from typing import Callable, List, Dict, Optional
 
 from src.core.builder import (
     build_service, module_selection_conflict, prepare_repo, prepare_worktree,
 )
-from src.core.git_ops import cleanup_worktrees, remove_worktree
+from src.core.git_ops import cleanup_worktrees, git_toplevel, remove_worktree
 from src.core.pom_deps import derive_cross_project_edges
 from src.models.config import AppConfig, topo_sort, topo_sort_layers, persist_service_fields
 from src.core.deployer import deploy_service
@@ -19,6 +20,20 @@ ProgressFn = Callable[[int, int, str], None]
 
 UNITS_PER_STAGE = 100
 UPLOAD_SHARE = 90
+
+# 仓库根 -> (事件循环, 锁)。非 worktree 模式下同一仓库的任何两个构建
+# 任务都会共用一份工作区，必须串行；worktree 模式不参与（各构建有独立目录）。
+_REPO_LOCKS: Dict[str, tuple] = {}
+
+
+def _repo_lock(repo_root: str) -> asyncio.Lock:
+    """取仓库级进程内锁；换了事件循环（如测试）就重建，避免跨 loop 复用。"""
+    loop = asyncio.get_running_loop()
+    entry = _REPO_LOCKS.get(repo_root)
+    if entry is None or entry[0] is not loop:
+        entry = (loop, asyncio.Lock())
+        _REPO_LOCKS[repo_root] = entry
+    return entry[1]
 
 
 class DeployPipeline:
@@ -61,6 +76,12 @@ class DeployPipeline:
         self._worktrees: Dict[str, str] = {}
         # 仓库根 -> 本次用到的 worktree 路径，收尾时按保留策略清理
         self._worktree_repos: Dict[str, List[str]] = {}
+        # 非 worktree 模式下：仓库根 -> (首个使用它的服务, 分支)。
+        # 同一仓库的所有服务共用一份工作区，分支不一致时后一个的
+        # checkout/reset 会覆盖前一个（两个服务最终都构建同一分支）。
+        self._repo_usage: Dict[str, tuple] = {}
+        # 本次任务已持有的仓库级锁，收尾时统一释放
+        self._repo_locks: List[tuple] = []
 
     def cancel(self):
         """整任务取消：三个阶段的循环都会停，并且外部还会 task.cancel()。"""
@@ -333,6 +354,12 @@ class DeployPipeline:
             step = 0
             self._emit(0, total_units, "准备中...")
 
+            # 非 worktree 构建直接使用 project_dir：同一仓库的并行任务必须
+            # 串行，否则后启动的任务会在前一个构建途中切分支/清 target，
+            # 前一个任务就会"构建了别人的代码"（且没有任何报错）。
+            if has_build:
+                await self._acquire_repo_locks(env, order)
+
             # ---------- 阶段一：git 更新 ----------
             if has_git:
                 for name in order:
@@ -383,6 +410,11 @@ class DeployPipeline:
                                     branch_override=override,
                                 ),
                             )
+                            # 非 worktree 模式直接在工作区构建，同一仓库的多个
+                            # 服务共用一份目录：不同分支会互相 reset 覆盖。
+                            # 到构建阶段两个服务都停在最后一个分支上，其中一方
+                            # 必然"没拉取到自己的最新代码"，且不会有任何报错。
+                            await self._check_repo_reuse(svc, branch)
                     except ServiceCancelled:
                         step = self._skip_cancelled(name, step, total_units)
                         continue
@@ -587,6 +619,16 @@ class DeployPipeline:
                                 )
                                 if jar_abs:
                                     discovered_jars[name] = jar_abs
+                                else:
+                                    # Maven 成功但没识别到新 jar：部署阶段会
+                                    # 退回配置里的 local_jar，那很可能就是上次
+                                    # 的旧产物。必须显式提醒，否则表现就是
+                                    # "构建成功了，但部署上去还是旧代码"。
+                                    stale = svc.local_jar or "(未配置)"
+                                    self.log(
+                                        f"[警告] {name} 构建成功但未识别到新的 jar，"
+                                        f"部署将使用配置的 local_jar（可能是旧产物）: {stale}"
+                                    )
                                 step += UNITS_PER_STAGE
                                 self._emit(step, total_units, f"{name}: 构建完成")
                             except ServiceCancelled:
@@ -646,6 +688,10 @@ class DeployPipeline:
                 if discovered_jars:
                     self._persist_discovered_jars(env, discovered_jars)
 
+            # 构建结束后立即放开仓库锁：部署只读本地 jar，不再需要独占
+            # 工作区。finally 里会再兜一次（取消/异常路径）。
+            self._release_repo_locks()
+
             # ---------- 阶段三：部署 ----------
             if has_deploy:
                 # 本地 jar 缺失不提前中止整批：和运行时部署失败一样，只让
@@ -697,6 +743,17 @@ class DeployPipeline:
                     svc = env.services[name]
                     server = env.resolve_server(svc)
                     local_jar = os.path.join(svc.project_dir, svc.local_jar)
+                    # 打出发送产物的身份信息：部署到旧代码时，这一行能立刻
+                    # 区分「构建阶段没产出新 jar」和「上传/远端替换出错」。
+                    try:
+                        st = os.stat(local_jar)
+                        self.log(
+                            f"[部署] {name} 本地 jar: {local_jar} "
+                            f"({st.st_size} bytes, 修改于 "
+                            f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(st.st_mtime))})"
+                        )
+                    except OSError:
+                        pass
 
                     base_units = step
                     last_reported = {"v": 0}
@@ -842,6 +899,89 @@ class DeployPipeline:
                 await self._finalize_worktrees()
             except BaseException:
                 pass
+            # 兜底释放仓库锁（正常路径在构建结束时就已释放）
+            self._release_repo_locks()
+
+    # ============================================================
+    # 同一个仓库被多个服务 / 多个任务共用
+    # ============================================================
+    async def _acquire_repo_locks(self, env, order):
+        """非 worktree 模式下，按仓库根加进程内互斥锁。
+
+        锁覆盖「git 更新 + 构建」两个阶段（部署不碰仓库，构建结束即可放）：
+        同一仓库同一时刻只允许一个任务改工作区/跑 Maven。不同任务若先用
+        各自的 commit 覆盖，再交错构建，最终部署的版本与日志里显示的
+        commit 就会对不上——这类问题偶发且极难排查，串行是最稳的解法。
+        """
+        roots: List[str] = []
+        for name in order:
+            svc = env.services[name]
+            if svc.worktree_enabled(self.cfg.git.worktree_enabled):
+                continue  # worktree 各自独立，不需要串行
+            try:
+                root = await git_toplevel(svc.project_dir, self.cfg.log_encoding)
+            except Exception:
+                continue
+            if root not in roots:
+                roots.append(root)
+
+        # 固定顺序取锁，避免两个任务各持一把互相等（死锁）
+        for root in sorted(roots):
+            lock = _repo_lock(root)
+            if lock.locked():
+                self.log(f"[等待] 仓库正被其他任务使用，排队等待: {root}")
+            await lock.acquire()
+            self._repo_locks.append((root, lock))
+            self.log(f"[仓库] 已锁定 {root}（构建完成后释放）")
+
+    def _release_repo_locks(self):
+        for root, lock in self._repo_locks:
+            try:
+                lock.release()
+            except RuntimeError:
+                pass
+        self._repo_locks.clear()
+
+    async def _check_repo_reuse(self, svc, branch: str):
+        """非 worktree 模式下，防止同仓库不同分支互相覆盖。
+
+        构建用的是 ``project_dir`` 本身，同一仓库的所有服务都落在同一份
+        工作区里。git 阶段是串行的：A 服务 reset 到分支 X，B 服务随后
+        reset 到分支 Y，最终构建阶段 A、B 都在分支 Y 上构建——A 的服务
+        永远拿不到 X 的最新代码，日志却完全正常。这里直接报错，比让它
+        "成功"打包出错误代码更安全。
+
+        同仓库同分支时仍允许，但并发 Maven 会互踩 target/（尤其
+        ``clean``），所以给出一次明确告警，建议启用 worktree。
+        """
+        try:
+            repo_root = await git_toplevel(svc.project_dir, self.cfg.log_encoding)
+        except Exception:
+            # 解析失败不阻断：prepare_repo 已经成功说明仓库可读，
+            # 这里只是个额外保护，退回 project_dir 做近似判断。
+            repo_root = svc.project_dir
+
+        prev = self._repo_usage.get(repo_root)
+        if prev is None:
+            self._repo_usage[repo_root] = (svc.name, branch)
+            return
+
+        prev_name, prev_branch = prev
+        if prev_branch != branch:
+            raise BuildError(
+                f"{svc.name} 与 {prev_name} 共用同一个 Git 仓库 {repo_root}，"
+                f"但本次要求的分支不同（{prev_name}: {prev_branch}，"
+                f"{svc.name}: {branch}）。非 worktree 模式下两者共用一份工作区，"
+                f"后一个的分支切换会覆盖前一个，必然有一个服务构建到错误分支。"
+                f"请：① 让它们使用同一分支；② 或启用 git.worktree.enabled；"
+                f"③ 或拆成两个独立任务分别打包。"
+            )
+
+        self.log(
+            f"[警告] {svc.name} 与 {prev_name} 共用仓库 {repo_root}（分支 {branch}），"
+            f"会在同一工作区并发构建，可能互踩 target/；"
+            f"建议启用 git.worktree.enabled"
+        )
 
     # ============================================================
     # 自动识别结果回写

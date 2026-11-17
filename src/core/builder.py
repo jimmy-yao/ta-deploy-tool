@@ -5,6 +5,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
@@ -18,6 +19,7 @@ from src.core.git_ops import (
     map_project_subdir,
     resolve_commit,
     resolve_latest_iteration_branch,
+    tracking_ref,
     update_repo,
 )
 
@@ -301,14 +303,18 @@ async def prepare_worktree(
     log(f"=== [Git/worktree] {svc.name} -> {branch} ===")
 
     repo_root = await git_toplevel(svc.project_dir, encoding)
-    await fetch_branch(
+    # fetch_branch 返回的就是本次更新后的远程跟踪 ref，直接用它解析
+    # commit：不再拼 "{remote}/{branch}" 简写，避免命中同名 tag/本地 ref，
+    # 也避免远程跟踪 ref 因仓库 refspec 配置而未被更新的情况。
+    ref = await fetch_branch(
         repo_root, git_cfg.remote, branch, log, encoding,
         timeout=git_cfg.fetch_timeout,
     )
     commit = await resolve_commit(
-        repo_root, f"{git_cfg.remote}/{branch}", encoding,
+        repo_root, ref or tracking_ref(git_cfg.remote, branch), encoding,
         timeout=git_cfg.ls_remote_timeout,
     )
+    log(f"[git] {svc.name} 构建 commit: {branch} @ {commit[:12]}")
 
     worktree, created = await ensure_worktree(
         repo_root, commit, root, log, encoding,
@@ -327,6 +333,35 @@ async def prepare_worktree(
         build_dir=build_dir,
         created=created,
     )
+
+
+def _fallback_config_jar(
+    svc: ServiceConfig,
+    work_dir: str,
+    started_at: float,
+    log: LogFn,
+) -> Optional[str]:
+    """Maven 输出里没识别到 jar 时的兜底：配置的 local_jar 本次被重写过。
+
+    只有在文件 mtime 落在本次构建期间才认：否则拿到的就是上一次的旧产物，
+    部署上去会出现「构建成功但代码没变」——宁可返回 None 让上层明确告警。
+    """
+    rel = (svc.local_jar or "").strip()
+    if not rel:
+        return None
+    path = rel if os.path.isabs(rel) else os.path.join(work_dir, rel)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    # 宽容 1 秒：部分文件系统 mtime 精度较粗
+    if st.st_size <= 0 or st.st_mtime < started_at - 1:
+        return None
+    log(
+        f"[识别] 未从 Maven 输出识别到 jar，但配置的 local_jar "
+        f"本次构建已更新，改用: {path}"
+    )
+    return path
 
 
 def _pick_deployable_jar(
@@ -457,6 +492,10 @@ async def build_service(
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
+    # 记录构建开始时间：用于「Maven 输出里没识别到 jar」时判断配置里的
+    # local_jar 是否确实被本次构建重写过（见 _fallback_config_jar）。
+    started_at = time.time()
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
@@ -536,13 +575,14 @@ async def build_service(
 
     log(f"=== [构建完成] {svc.name} ===")
 
-    if not building_jars:
-        log(f"[识别] {svc.name} 未从 Maven 输出中识别到 jar")
-        return None
-
-    chosen = _pick_deployable_jar(svc.name, building_jars)
+    chosen = _pick_deployable_jar(svc.name, building_jars) if building_jars else None
     if not chosen:
-        log(f"[识别] {svc.name} 未能挑选出可部署 jar")
+        if building_jars:
+            log(f"[识别] {svc.name} 未能挑选出可部署 jar")
+        else:
+            log(f"[识别] {svc.name} 未从 Maven 输出中识别到 jar")
+        chosen = _fallback_config_jar(svc, work_dir, started_at, log)
+    if not chosen:
         return None
 
     log(f"[识别] {svc.name} 构建产物: {chosen}")

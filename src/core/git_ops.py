@@ -199,6 +199,67 @@ async def resolve_latest_iteration_branch(
     return latest_branch
 
 
+def tracking_ref(remote: str, branch: str) -> str:
+    """远程分支在本地对应的完整 ref（不含 ``refs/remotes/`` 的简写歧义）。
+
+    用全名而不是 ``origin/xxx`` 简写：简写会先按 ``refs/<name>``、
+    ``refs/tags/<name>``…… 依次尝试，万一仓库里恰好有同名 tag / 本地 ref，
+    就会解析到非远程跟踪分支上，构建出的代码与刚 fetch 的内容不一致。
+    """
+    return f"refs/remotes/{remote}/{branch}"
+
+
+async def _fetch_branch_ref(
+    repo_dir: str,
+    remote: str,
+    branch: str,
+    log: Optional[LogFn],
+    encoding: str,
+    timeout: int,
+) -> str:
+    """fetch 指定远程分支，并**确保**本地远程跟踪 ref 被更新。
+
+    不能只靠 ``git fetch <remote> <branch>``：这种写法是否更新
+    ``refs/remotes/<remote>/<branch>`` 取决于 ``remote.<remote>.fetch``
+    是否覆盖该分支。仓库曾被 ``--single-branch`` 克隆、执行过
+    ``git remote set-branches``、或手工改过 refspec 时，fetch 会成功
+    （退出码 0，FETCH_HEAD 也是新的），但远程跟踪 ref 原地不动——
+    随后 ``checkout/reset`` 到旧 ref，就会出现「打包了旧代码」而且
+    日志里毫无异常。
+
+    显式写目标 refspec 后，更新与否不再依赖仓库配置：失败就报错，
+    成功就一定是最新。也刻意不用 ``FETCH_HEAD``：同一仓库多个任务
+    并发 fetch 时 FETCH_HEAD 会被互相覆盖。
+
+    返回更新后的完整 ref 名。
+    """
+    ref = tracking_ref(remote, branch)
+    _l = log or (lambda s: None)
+    _l(f"[git] fetch {remote} {branch}...")
+    code, out = await _run_git(
+        ["fetch", remote, f"+refs/heads/{branch}:{ref}"],
+        repo_dir, _l, encoding, timeout=timeout,
+    )
+    if code != 0:
+        detail = (out or "").strip().splitlines()
+        hint = f": {detail[-1]}" if detail else ""
+        raise GitError(f"git fetch {remote} {branch} 失败{hint}")
+
+    # fetch 成功但 ref 没动过（分支已被删除、远端拒绝更新等）时，
+    # 说明拿到的不可能是「最新」，宁可失败也不要静默构建旧代码。
+    code, sha = await _run_git(
+        ["rev-parse", "--verify", "--quiet", ref],
+        repo_dir, log=None, encoding=encoding, silent=True,
+    )
+    resolved = sha.strip() if code == 0 else ""
+    if not resolved:
+        raise GitError(
+            f"git fetch 后找不到远程跟踪分支 {ref}，无法确认代码已更新"
+        )
+    _l(f"[git] {remote}/{branch} -> {resolved[:12]}")
+    return ref
+
+
 async def update_repo(
     project_dir: str,
     branch: str,
@@ -217,26 +278,22 @@ async def update_repo(
     if not os.path.exists(dot_git):
         raise GitError(f"非 git 仓库: {project_dir}")
 
-    _l(f"[git] fetch {remote} {branch}...")
-    code, _ = await _run_git(
-        ["fetch", remote, branch],
-        project_dir, _l, encoding, timeout=fetch_timeout,
+    ref = await _fetch_branch_ref(
+        project_dir, remote, branch, _l, encoding, fetch_timeout,
     )
-    if code != 0:
-        raise GitError(f"git fetch {remote} {branch} 失败")
 
     if strategy == "reset":
-        _l(f"[git] checkout -B {branch} {remote}/{branch} --force")
+        _l(f"[git] checkout -B {branch} {ref} --force")
         code, _ = await _run_git(
-            ["checkout", "-B", branch, f"{remote}/{branch}", "--force"],
+            ["checkout", "-B", branch, ref, "--force"],
             project_dir, _l, encoding,
         )
         if code != 0:
             raise GitError(f"git checkout -B {branch} 失败")
 
-        _l(f"[git] reset --hard {remote}/{branch}")
+        _l(f"[git] reset --hard {ref}")
         code, _ = await _run_git(
-            ["reset", "--hard", f"{remote}/{branch}"],
+            ["reset", "--hard", ref],
             project_dir, _l, encoding,
         )
         if code != 0:
@@ -269,7 +326,34 @@ async def update_repo(
             f"{commit.strip() or '无输出'}"
         )
     commit_id = commit.strip()
-    _l(f"[git] 当前 commit: {commit_id}")
+
+    # 最后一道自检：HEAD 必须包含刚 fetch 到的远程提交。reset 策略下
+    # HEAD 就是该提交；merge/rebase 策略下应是它的后代。都不满足说明
+    # 工作区被别的操作改回去了（并行的另一任务、手工 checkout 等），
+    # 此时构建的代码与「刚拉取的最新代码」不符，必须显式告警。
+    code, ref_sha = await _run_git(
+        ["rev-parse", "--verify", "--quiet", ref],
+        project_dir, log=None, encoding=encoding, silent=True,
+    )
+    ref_sha = ref_sha.strip()
+    if code == 0 and ref_sha:
+        code, head_sha = await _run_git(
+            ["rev-parse", "HEAD"],
+            project_dir, log=None, encoding=encoding, silent=True,
+        )
+        head_sha = head_sha.strip()
+        if head_sha and head_sha != ref_sha:
+            code, _ = await _run_git(
+                ["merge-base", "--is-ancestor", ref_sha, "HEAD"],
+                project_dir, log=None, encoding=encoding, silent=True,
+            )
+            if code != 0:
+                _l(
+                    f"[警告] 当前 HEAD ({head_sha[:12]}) 不包含刚拉取的 "
+                    f"{remote}/{branch} ({ref_sha[:12]})，本次构建可能不是最新代码"
+                )
+
+    _l(f"[git] 当前分支/commit: {branch} / {commit_id}")
     return commit_id
 
 
@@ -342,15 +426,14 @@ async def git_toplevel(project_dir: str, encoding: str = "utf-8") -> str:
 async def fetch_branch(repo_dir: str, remote: str, branch: str,
                        log: Optional[LogFn] = None,
                        encoding: str = "utf-8",
-                       timeout: int = 180) -> None:
-    """只 fetch，不 checkout——worktree 模式下源工作区必须保持原样。"""
-    _l = log or (lambda s: None)
-    _l(f"[git] fetch {remote} {branch}...")
-    code, _ = await _run_git(
-        ["fetch", remote, branch], repo_dir, _l, encoding, timeout=timeout,
+                       timeout: int = 180) -> str:
+    """只 fetch，不 checkout——worktree 模式下源工作区必须保持原样。
+
+    返回刚更新的远程跟踪 ref 全名（见 ``_fetch_branch_ref``）。
+    """
+    return await _fetch_branch_ref(
+        repo_dir, remote, branch, log, encoding, timeout,
     )
-    if code != 0:
-        raise GitError(f"git fetch {remote} {branch} 失败")
 
 
 async def resolve_commit(repo_dir: str, rev: str,

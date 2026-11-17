@@ -28,6 +28,11 @@ REMOTE_CMD_TIMEOUT = 300  # 单条远程命令（如重启脚本）最长执行�
 # 用来保证启动脚本末尾 nohup 后台化那几行输出不被 sshd 关通道丢掉。
 REMOTE_CMD_TAIL_WAIT = 1
 
+# 取消/失败后清理远端 .tmp 半成品的最长等待时间（秒）。
+# 清理是「最佳努力」：这次删不掉（比如连接已断）也不该卡住任务收尾，
+# 残留文件会在下次上传时被 sftp.put 直接覆盖。
+TMP_CLEANUP_TIMEOUT = 30
+
 # 含通配符的日志路径必须原样交给 shell 展开，无法整体加引号，
 # 因此只放行无需转义的字符（空格、引号、; & | $ ` 等一律拒绝）。
 # 结尾用 \Z 而不是 $：Python 的 $ 会放行“单个尾换行”，换行在 shell 里
@@ -226,6 +231,30 @@ async def _restore_backup(sftp, backup_path: str, remote_final: str, log: LogFn)
         )
 
 
+async def _remove_tmp_quietly(sftp, remote_tmp: str, log: LogFn) -> None:
+    """删除未完成上传的 `.tmp` 半成品（最佳努力）。
+
+    取消（``CancelledError``）和普通异常都会走到这里，所以只在确实删除成功
+    时打一行日志：文件本来就不存在（rename 已经完成）时保持安静，避免每次
+    取消都刷一条无意义的失败。
+    """
+    try:
+        await asyncio.wait_for(
+            sftp.remove(remote_tmp), timeout=TMP_CLEANUP_TIMEOUT
+        )
+    except asyncssh.SFTPNoSuchFile:
+        return
+    except asyncio.CancelledError:
+        # 收尾阶段又收到一次取消：清理没能做完，只能留给下次部署覆盖
+        log(f"[警告] 清理未完成的上传文件被中断，可能残留: {remote_tmp}")
+        raise
+    except Exception as e:
+        log(f"[警告] 删除未完成的上传文件失败 {remote_tmp}: {e}")
+        return
+
+    log(f"[清理] 已删除未完成的上传临时文件: {remote_tmp}")
+
+
 async def _upload_jar(
     conn,
     local_jar: str,
@@ -248,33 +277,41 @@ async def _upload_jar(
         size = os.path.getsize(local_jar)
         log(f"上传 {local_jar} ({size} bytes) -> {remote_final}")
 
-        if progress_cb is not None:
-            def handler(_src, _dst, copied, total):
-                try:
-                    progress_cb(int(copied), int(total))
-                except Exception:
-                    pass
-
-            await sftp.put(local_jar, remote_tmp, progress_handler=handler)
-        else:
-            await sftp.put(local_jar, remote_tmp)
-
-        # “旧文件是否存在”与“备份是否成功”必须分开判断：
-        # stat 失败 = 没有旧文件（正常首传）；rename 失败 = 有旧文件却备不上，
-        # 若此时继续覆盖就是“无备份裸奔”，必须中止上传。
-        old_exists = True
+        # 上传阶段是取消最常落在的位置：必须接 BaseException 把半成品 .tmp
+        # 删掉，否则服务器上会残留一个几十上百 MB 的 xxx.jar.tmp。
+        # 注意 CancelledError 继承自 BaseException，单服务取消 / 整任务取消
+        # 都是从这里穿过去的。
+        #
+        # 收尾覆盖“上传开始之后”的所有异常，包括 put 之后、rename 之前的
+        # stat / 备份 rename：那些位置被取消同样会留下完整的 .tmp。
+        candidate_backup: Optional[str] = None
         try:
-            await sftp.stat(remote_final)
-        except asyncssh.SFTPError:
-            old_exists = False
+            if progress_cb is not None:
+                def handler(_src, _dst, copied, total):
+                    try:
+                        progress_cb(int(copied), int(total))
+                    except Exception:
+                        pass
 
-        candidate_backup = (
-            f"{remote_dir}/{remote_name}.bak.{_timestamp_ms()}"
-            if old_exists
-            else None
-        )
+                await sftp.put(local_jar, remote_tmp, progress_handler=handler)
+            else:
+                await sftp.put(local_jar, remote_tmp)
 
-        try:
+            # “旧文件是否存在”与“备份是否成功”必须分开判断：
+            # stat 失败 = 没有旧文件（正常首传）；rename 失败 = 有旧文件却备不上，
+            # 若此时继续覆盖就是“无备份裸奔”，必须中止上传。
+            old_exists = True
+            try:
+                await sftp.stat(remote_final)
+            except asyncssh.SFTPError:
+                old_exists = False
+
+            candidate_backup = (
+                f"{remote_dir}/{remote_name}.bak.{_timestamp_ms()}"
+                if old_exists
+                else None
+            )
+
             if candidate_backup:
                 try:
                     await sftp.rename(remote_final, candidate_backup)
@@ -289,8 +326,14 @@ async def _upload_jar(
             # 必须接 BaseException：CancelledError（用户点取消）继承自它。
             # 只接 Exception 的话，取消恰好落在 rename 上时，
             # “备份已建/可能已建、新文件未就位”的线上 jar 缺失状态永远无人恢复。
-            if candidate_backup:
-                await _restore_backup(sftp, candidate_backup, remote_final, log)
+            try:
+                if candidate_backup:
+                    await _restore_backup(sftp, candidate_backup, remote_final, log)
+            finally:
+                # 新文件没能就位：`.tmp` 留在服务器上没有任何作用（服务不会
+                # 读它、下次上传也会覆盖它），顺手删掉，别攒出大文件。
+                # 已经 rename 成功的情况这里只会得到 SFTPNoSuchFile，静默跳过。
+                await _remove_tmp_quietly(sftp, remote_tmp, log)
             raise
 
         log(f"上传完成: {remote_final}")
